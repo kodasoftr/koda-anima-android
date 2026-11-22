@@ -4,8 +4,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -151,34 +151,34 @@ fun ColorPickerDialog(
                         modifier = Modifier
                             .size(wheelSizeDp)
                             .pointerInput(Unit) {
-                                detectTapGestures { offset ->
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
                                     val center = Offset(size.width / 2f, size.height / 2f)
-                                    val dx = offset.x - center.x
-                                    val dy = offset.y - center.y
-                                    val dist = hypot(dx, dy)
-                                    val radius = size.width / 2f
-                                    val innerRadius = radius * 0.72f
-
-                                    if (dist in (innerRadius - 10f)..(radius + 10f)) {
-                                        var angle = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
-                                        if (angle < 0) angle += 360f
-                                        hue = angle
-                                    }
-                                }
-                            }
-                            .pointerInput(Unit) {
-                                detectDragGestures { change, _ ->
-                                    val center = Offset(size.width / 2f, size.height / 2f)
-                                    val dx = change.position.x - center.x
-                                    val dy = change.position.y - center.y
-                                    val dist = hypot(dx, dy)
+                                    val dx0 = down.position.x - center.x
+                                    val dy0 = down.position.y - center.y
+                                    val dist0 = hypot(dx0, dy0)
                                     val radius = size.width / 2f
                                     val innerRadius = radius * 0.70f
 
-                                    if (dist in (innerRadius - 15f)..(radius + 20f)) {
-                                        var angle = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
-                                        if (angle < 0) angle += 360f
-                                        hue = angle
+                                    if (dist0 in (innerRadius - 18f)..(radius + 24f)) {
+                                        down.consume()
+                                        fun updateHue(pos: Offset) {
+                                            val dx = pos.x - center.x
+                                            val dy = pos.y - center.y
+                                            var angle = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
+                                            if (angle < 0f) angle += 360f
+                                            hue = angle
+                                            val rgbInt = android.graphics.Color.HSVToColor(floatArrayOf(hue, saturation, value))
+                                            onColorSelected(0xFF000000L or (rgbInt.toLong() and 0xFFFFFFL))
+                                        }
+                                        updateHue(down.position)
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                            if (!change.pressed) break
+                                            change.consume()
+                                            updateHue(change.position)
+                                        }
                                     }
                                 }
                             }
@@ -228,188 +228,202 @@ fun ColorPickerDialog(
                             modifier = Modifier
                                 .size(innerBoxSize)
                                 .pointerInput(Unit) {
-                                    detectTapGestures { offset ->
-                                        saturation = (offset.x / size.width).coerceIn(0f, 1f)
-                                        value = (1f - offset.y / size.height).coerceIn(0f, 1f)
-                                    }
-                                }
-                                .pointerInput(Unit) {
-                                    detectDragGestures { change, _ ->
-                                        saturation = (change.position.x / size.width).coerceIn(0f, 1f)
-                                        value = (1f - change.position.y / size.height).coerceIn(0f, 1f)
+                                    awaitEachGesture {
+                                        val down = awaitFirstDown(requireUnconsumed = false)
+                                        down.consume()
+                                        fun updateSv(pos: Offset) {
+                                            saturation = (pos.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+                                            value = (1f - pos.y / size.height.coerceAtLeast(1)).coerceIn(0f, 1f)
+                                            val rgbInt = android.graphics.Color.HSVToColor(floatArrayOf(hue, saturation, value))
+                                            onColorSelected(0xFF000000L or (rgbInt.toLong() and 0xFFFFFFL))
+                                        }
+                                        updateSv(down.position)
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                            if (!change.pressed) break
+                                            change.consume()
+                                            updateSv(change.position)
+                                        }
                                     }
                                 }
                         ) {
-                            val pureHueColor = Color(android.graphics.Color.HSVToColor(floatArrayOf(hue, 1f, 1f)))
+                                    val pureHueColor = Color(android.graphics.Color.HSVToColor(floatArrayOf(hue, 1f, 1f)))
 
-                            // Horizontal gradient: White -> Pure Hue
-                            drawRect(
-                                brush = Brush.horizontalGradient(listOf(Color.White, pureHueColor))
-                            )
-                            // Vertical gradient: Transparent -> Black
-                            drawRect(
-                                brush = Brush.verticalGradient(listOf(Color.Transparent, Color.Black))
-                            )
+                                    // Horizontal gradient: White -> Pure Hue
+                                    drawRect(
+                                        brush = Brush.horizontalGradient(listOf(Color.White, pureHueColor))
+                                    )
+                                    // Vertical gradient: Transparent -> Black
+                                    drawRect(
+                                        brush = Brush.verticalGradient(listOf(Color.Transparent, Color.Black))
+                                    )
 
-                            // Cursor indicator
-                            val cursorX = saturation * size.width
-                            val cursorY = (1f - value) * size.height
+                                    // Cursor indicator
+                                    val cursorX = saturation * size.width
+                                    val cursorY = (1f - value) * size.height
 
-                            drawCircle(
-                                color = Color.White,
-                                radius = 7.dp.toPx(),
-                                center = Offset(cursorX, cursorY),
-                                style = Stroke(width = 2.dp.toPx())
-                            )
-                            drawCircle(
-                                color = Color(currentColorLong),
-                                radius = 5.dp.toPx(),
-                                center = Offset(cursorX, cursorY)
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Color Preview & Hex Display
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(Color(currentColorLong))
-                                .border(1.5.dp, Color.White.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column {
-                            Text(
-                                text = "Cor Atual",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = "#${java.lang.Long.toHexString(currentColorLong).uppercase().takeLast(6)}",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                    }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        TextButton(onClick = onDismiss) { Text("Cancelar") }
-                        Surface(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .clickable {
-                                    onColorSelected(currentColorLong)
+                                    drawCircle(
+                                        color = Color.White,
+                                        radius = 7.dp.toPx(),
+                                        center = Offset(cursorX, cursorY),
+                                        style = Stroke(width = 2.dp.toPx())
+                                    )
+                                    drawCircle(
+                                        color = Color(currentColorLong),
+                                        radius = 5.dp.toPx(),
+                                        center = Offset(cursorX, cursorY)
+                                    )
                                 }
-                                .background(MaterialTheme.colorScheme.primary)
-                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Live Color Preview & Hex Display (instant apply — no Cancel/Select buttons)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text("Selecionar", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Complementary & Harmonic Colors (Desktop Windows / Krita Harmonies)
-                Text(
-                    text = "Cores Complementares & Harmonias (Windows Kodanima)",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
-                    modifier = Modifier.align(Alignment.Start)
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    HarmonicColorChip("Complementar", directComplement) {
-                        val hsv = FloatArray(3)
-                        android.graphics.Color.colorToHSV(it.toInt(), hsv)
-                        hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
-                    }
-                    HarmonicColorChip("Análoga 1", analogLeft) {
-                        val hsv = FloatArray(3)
-                        android.graphics.Color.colorToHSV(it.toInt(), hsv)
-                        hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
-                    }
-                    HarmonicColorChip("Análoga 2", analogRight) {
-                        val hsv = FloatArray(3)
-                        android.graphics.Color.colorToHSV(it.toInt(), hsv)
-                        hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
-                    }
-                    HarmonicColorChip("Tríade 1", triad1) {
-                        val hsv = FloatArray(3)
-                        android.graphics.Color.colorToHSV(it.toInt(), hsv)
-                        hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
-                    }
-                    HarmonicColorChip("Tríade 2", triad2) {
-                        val hsv = FloatArray(3)
-                        android.graphics.Color.colorToHSV(it.toInt(), hsv)
-                        hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
-                    }
-                    HarmonicColorChip("Dividida 1", splitComp1) {
-                        val hsv = FloatArray(3)
-                        android.graphics.Color.colorToHSV(it.toInt(), hsv)
-                        hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
-                    }
-                    HarmonicColorChip("Dividida 2", splitComp2) {
-                        val hsv = FloatArray(3)
-                        android.graphics.Color.colorToHSV(it.toInt(), hsv)
-                        hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Recent colors
-                Text(
-                    text = "Cores Recentes",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
-                    modifier = Modifier.align(Alignment.Start)
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    recentColors.forEach { c ->
-                        Box(
-                            modifier = Modifier
-                                .size(28.dp)
-                                .clip(CircleShape)
-                                .background(Color(c))
-                                .border(1.dp, Color.White.copy(alpha = 0.4f), CircleShape)
-                                .clickable {
-                                    val hsv = FloatArray(3)
-                                    android.graphics.Color.colorToHSV(c.toInt(), hsv)
-                                    hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color(currentColorLong))
+                                        .border(1.5.dp, Color.White.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = "Cor Ativa no Pincel",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = "#${java.lang.Long.toHexString(currentColorLong).uppercase().takeLast(6)}",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
                                 }
+                            }
+
+                            Surface(
+                                shape = RoundedCornerShape(999.dp),
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                            ) {
+                                Text(
+                                    text = "Aplicação instantânea",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Complementary & Harmonic Colors (Desktop Windows / Krita Harmonies)
+                        Text(
+                            text = "Cores Complementares & Harmonias",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+                            modifier = Modifier.align(Alignment.Start)
                         )
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            HarmonicColorChip("Complementar", directComplement) {
+                                val hsv = FloatArray(3)
+                                android.graphics.Color.colorToHSV(it.toInt(), hsv)
+                                hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                                onColorSelected(it)
+                            }
+                            HarmonicColorChip("Análoga 1", analogLeft) {
+                                val hsv = FloatArray(3)
+                                android.graphics.Color.colorToHSV(it.toInt(), hsv)
+                                hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                                onColorSelected(it)
+                            }
+                            HarmonicColorChip("Análoga 2", analogRight) {
+                                val hsv = FloatArray(3)
+                                android.graphics.Color.colorToHSV(it.toInt(), hsv)
+                                hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                                onColorSelected(it)
+                            }
+                            HarmonicColorChip("Tríade 1", triad1) {
+                                val hsv = FloatArray(3)
+                                android.graphics.Color.colorToHSV(it.toInt(), hsv)
+                                hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                                onColorSelected(it)
+                            }
+                            HarmonicColorChip("Tríade 2", triad2) {
+                                val hsv = FloatArray(3)
+                                android.graphics.Color.colorToHSV(it.toInt(), hsv)
+                                hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                                onColorSelected(it)
+                            }
+                            HarmonicColorChip("Dividida 1", splitComp1) {
+                                val hsv = FloatArray(3)
+                                android.graphics.Color.colorToHSV(it.toInt(), hsv)
+                                hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                                onColorSelected(it)
+                            }
+                            HarmonicColorChip("Dividida 2", splitComp2) {
+                                val hsv = FloatArray(3)
+                                android.graphics.Color.colorToHSV(it.toInt(), hsv)
+                                hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                                onColorSelected(it)
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Recent colors
+                        Text(
+                            text = "Cores Recentes",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+                            modifier = Modifier.align(Alignment.Start)
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            recentColors.forEach { c ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(28.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(c))
+                                        .border(1.dp, Color.White.copy(alpha = 0.4f), CircleShape)
+                                        .clickable {
+                                            val hsv = FloatArray(3)
+                                            android.graphics.Color.colorToHSV(c.toInt(), hsv)
+                                            hue = hsv[0]; saturation = hsv[1]; value = hsv[2]
+                                            onColorSelected(c)
+                                        }
+                                )
+                            }
+                        }
                     }
                 }
             }
-        }
-    }
 }
 
 @Composable

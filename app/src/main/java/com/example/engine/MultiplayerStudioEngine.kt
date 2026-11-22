@@ -130,6 +130,7 @@ class MultiplayerStudioEngine(
     var onRemoteUndoRedoOpReceived: ((opType: String, authorId: String, frameIndex: Int, layerIndex: Int, strokeIds: List<String>, strokes: List<DrawingStroke>, isLocalLayer: Boolean) -> Unit)? = null
     var onPeerCursorIconUpdated: ((peerId: String, customCursorBase64: String?) -> Unit)? = null
     var onBrushDefinitionReceived: ((senderId: String, senderName: String, preset: BrushPreset) -> Unit)? = null
+    var onMoveLayerReceived: ((fromIndex: Int, toIndex: Int) -> Unit)? = null
 
     private data class PendingClient(
         val reader: BufferedReader,
@@ -1479,6 +1480,16 @@ class MultiplayerStudioEngine(
                         }
                         broadcastToOtherPeers(connId, line)
                     }
+                    "MOVE_LAYER" -> {
+                        val fromIndex = packet.optInt("fromIndex", -1)
+                        val toIndex = packet.optInt("toIndex", -1)
+                        if (fromIndex >= 0 && toIndex >= 0) {
+                            withContext(Dispatchers.Main) {
+                                onMoveLayerReceived?.invoke(fromIndex, toIndex)
+                            }
+                            broadcastToOtherPeers(connId, line)
+                        }
+                    }
                     "SYNC_FRAME_LOCAL_LAYERS" -> {
                         val frameIndex = packet.optInt("frameIndex", 0)
                         val arr = packet.optJSONArray("localLayers")
@@ -1852,6 +1863,15 @@ class MultiplayerStudioEngine(
                                     onAddLayerReceived?.invoke(layerName)
                                 }
                             }
+                            "MOVE_LAYER" -> {
+                                val fromIndex = packet.optInt("fromIndex", -1)
+                                val toIndex = packet.optInt("toIndex", -1)
+                                if (fromIndex >= 0 && toIndex >= 0) {
+                                    withContext(Dispatchers.Main) {
+                                        onMoveLayerReceived?.invoke(fromIndex, toIndex)
+                                    }
+                                }
+                            }
                             "SYNC_FRAME_LOCAL_LAYERS" -> {
                                 val frameIndex = packet.optInt("frameIndex", 0)
                                 val arr = packet.optJSONArray("localLayers")
@@ -2099,6 +2119,15 @@ class MultiplayerStudioEngine(
         broadcastSessionPacket(packet, "ADD_LAYER")
     }
 
+    fun sendMoveLayer(fromIndex: Int, toIndex: Int) {
+        val packet = JSONObject().apply {
+            put("type", "MOVE_LAYER")
+            put("fromIndex", fromIndex)
+            put("toIndex", toIndex)
+        }.toString()
+        broadcastSessionPacket(packet, "MOVE_LAYER")
+    }
+
     fun sendSyncFrameLocalLayers(frameIndex: Int, localLayers: List<Layer>) {
         if (clientWriter == null && hostClientWriters.isEmpty()) return
         val arr = JSONArray()
@@ -2331,6 +2360,11 @@ class MultiplayerStudioEngine(
                     clipArr.put(((cp.y * 1000f).roundToInt()) / 1000.0)
                 }
                 put("clip", clipArr)
+                if (stroke.clipInverted) {
+                    put("clipInverted", true)
+                    put("clipBoundsWidth", stroke.clipBoundsWidth.toDouble())
+                    put("clipBoundsHeight", stroke.clipBoundsHeight.toDouble())
+                }
             }
         }
     }
@@ -2403,6 +2437,9 @@ class MultiplayerStudioEngine(
             brushPresetId = obj.optInt("brushPresetId", 1),
             customBrushParams = customParams,
             clipPolygon = clipPoly,
+            clipInverted = obj.optBoolean("clipInverted", false),
+            clipBoundsWidth = obj.optDouble("clipBoundsWidth", 0.0).toFloat(),
+            clipBoundsHeight = obj.optDouble("clipBoundsHeight", 0.0).toFloat(),
             isFilled = obj.optBoolean("isFilled", false),
             points = points,
             minX = minX,

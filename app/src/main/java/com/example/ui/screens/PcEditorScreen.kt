@@ -18,6 +18,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -25,6 +26,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -45,10 +47,13 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Brush
+import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Circle
 import androidx.compose.material.icons.filled.ColorLens
 import androidx.compose.material.icons.filled.Colorize
+import androidx.compose.material.icons.filled.CompareArrows
+import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
@@ -57,6 +62,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FormatPaint
 import com.example.model.BrushPreset
 import androidx.compose.material.icons.filled.Gesture
+import androidx.compose.material.icons.filled.HorizontalRule
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -79,6 +85,7 @@ import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -124,6 +131,7 @@ import androidx.compose.ui.unit.sp
 import com.example.engine.MediaAssetManager
 import com.example.model.AppScreen
 import com.example.model.AppUiMode
+import com.example.model.CameraMode
 import com.example.model.DrawingStroke
 import com.example.model.KodanimaTheme
 import com.example.model.Layer
@@ -132,18 +140,25 @@ import com.example.model.TimelineLayoutMode
 import com.example.model.ToolType
 import com.example.ui.components.BrushPresetsBar
 import com.example.ui.components.BrushStudioDrawer
+import com.example.ui.components.BucketConfigPopover
+import com.example.ui.components.CameraSideToolbar
+import com.example.ui.components.CameraTimelinePanel
 import com.example.ui.components.CanvasView
 import com.example.ui.components.CollaboratorHorizontalStrip
+import com.example.ui.components.ColorPaletteTrayModal
 import com.example.ui.components.ColorPickerDialog
+import com.example.ui.components.EraserVectorIcon
 import com.example.ui.components.ExportDialog
 import com.example.ui.components.ExtraToolsFloatingMenu
 import com.example.ui.components.FloatingReferenceControlsBar
-import com.example.ui.components.FloatingReferenceImageSurface
 import com.example.ui.components.FrameLayersFloatingPanel
 import com.example.ui.components.FriendBrushOfferBanner
+import com.example.ui.components.InlineNumericPxInput
+import com.example.ui.components.LassoVectorIcon
 import com.example.ui.components.LayersBottomSheet
 import com.example.ui.components.ProjectSettingsDialog
 import com.example.ui.components.QuickCopyPasteGestureMenu
+import com.example.ui.components.QuickPaletteFloatingWindow
 import com.example.ui.components.ReferenceImageChoiceDialog
 import com.example.ui.components.ThreeWheelsIcon
 import com.example.ui.components.TimelineLayerImageTransformHud
@@ -155,8 +170,12 @@ import com.example.ui.theme.DarkSurfaceVariant
 import com.example.ui.theme.NeonGreen
 import com.example.ui.theme.NeonPink
 import com.example.ui.theme.OrangeAccent
+import androidx.compose.foundation.layout.BoxScope
 import com.example.viewmodel.EditorDialog
+import com.example.viewmodel.EditorUiState
 import com.example.viewmodel.KodanimaViewModel
+import android.content.Context
+import kotlinx.coroutines.CoroutineScope
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -234,9 +253,6 @@ fun PcEditorScreen(
     var showDurationDialog by remember { mutableStateOf(false) }
     var showMediaImportChoice by remember { mutableStateOf(false) }
     var showThemeMenu by remember { mutableStateOf(false) }
-    var draggingFrameIdx by remember { mutableStateOf<Int?>(null) }
-    var snapHoverTick by remember { mutableStateOf<Int?>(null) }
-    var liveDraggingHold by remember { mutableStateOf<Int?>(null) }
 
     val kritaBrushPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -296,21 +312,6 @@ fun PcEditorScreen(
                 }
             }
     ) {
-        if (isFloatingRefBelow) {
-            FloatingReferenceImageSurface(
-                refState = uiState.referenceImage,
-                theme = currentTheme,
-                onTransformDelta = { dx, dy, zoomDelta, rotDelta ->
-                    viewModel.updateFloatingReferenceOffset(dx, dy)
-                    if (abs(zoomDelta - 1f) > 0.002f) {
-                        viewModel.updateFloatingReferenceScale(uiState.referenceImage.scale * zoomDelta)
-                    }
-                    if (abs(rotDelta) > 0.1f) {
-                        viewModel.rotateFloatingReference(rotDelta)
-                    }
-                }
-            )
-        }
 
         // 1. Viewport Canvas (Draw & Multi-touch, Hardware Acceleration, Stylus & Virtual Cursor)
         CanvasView(
@@ -344,8 +345,7 @@ fun PcEditorScreen(
                 viewModel.addStrokeToCurrentLayer(stroke)
             },
             onEyedropperColorPicked = { pickedColor ->
-                viewModel.setColor(pickedColor)
-                viewModel.selectTool(ToolType.PENCIL)
+                viewModel.completeEyedropperColorPick(pickedColor)
                 Toast.makeText(context, "Cor capturada!", Toast.LENGTH_SHORT).show()
             },
             onBucketFill = { x, y ->
@@ -402,24 +402,30 @@ fun PcEditorScreen(
                 viewModel.executeMultiFingerGesture(gesture)
             },
             isFloatingRefBelowCanvas = isFloatingRefBelow,
+            eraserSize = uiState.eraserSize,
+            referenceImage = uiState.referenceImage,
+            onFloatingRefTransformDelta = { dx, dy, zoomDelta, rotDelta ->
+                viewModel.updateFloatingReferenceOffset(dx, dy)
+                if (abs(zoomDelta - 1f) > 0.002f) {
+                    viewModel.updateFloatingReferenceScale(uiState.referenceImage.scale * zoomDelta)
+                }
+                if (abs(rotDelta) > 0.1f) {
+                    viewModel.rotateFloatingReference(rotDelta)
+                }
+            },
+            isCameraSideView3D = uiState.isCameraSideView3D,
+            isCameraModeActive = uiState.isCameraTimelineOpen,
+            cameraToolAction = uiState.cameraToolAction,
+            onCameraTransformDelta = { dx, dy, zoomFactor, rotDelta, fovDelta, dYaw, dPitch ->
+                if (abs(dx) > 0.01f || abs(dy) > 0.01f) viewModel.nudgeCameraPan(dx, dy)
+                if (abs(zoomFactor - 1f) > 0.001f) viewModel.zoomCameraBy(zoomFactor)
+                if (abs(rotDelta) > 0.01f) viewModel.rotateCameraBy(rotDelta)
+                if (abs(fovDelta) > 0.01f) viewModel.adjustCameraFov(fovDelta)
+                if (abs(dYaw) > 0.01f || abs(dPitch) > 0.01f) viewModel.tiltOrbitCameraBy(dYaw, dPitch)
+            },
+            theme = currentTheme,
             modifier = Modifier.fillMaxSize()
         )
-
-        if (uiState.referenceImage.isVisible && uiState.referenceImage.renderAboveCanvas) {
-            FloatingReferenceImageSurface(
-                refState = uiState.referenceImage,
-                theme = currentTheme,
-                onTransformDelta = { dx, dy, zoomDelta, rotDelta ->
-                    viewModel.updateFloatingReferenceOffset(dx, dy)
-                    if (abs(zoomDelta - 1f) > 0.002f) {
-                        viewModel.updateFloatingReferenceScale(uiState.referenceImage.scale * zoomDelta)
-                    }
-                    if (abs(rotDelta) > 0.1f) {
-                        viewModel.rotateFloatingReference(rotDelta)
-                    }
-                }
-            )
-        }
 
         // 2. Unobstructed Top HUD Column (Top Header removed -> Krita Brush Bar positioned cleanly at top)
         Column(
@@ -440,6 +446,9 @@ fun PcEditorScreen(
                     importedBrushes = uiState.importedKritaBrushes,
                     onRequestImportKrita = { kritaBrushPicker.launch(arrayOf("*/*")) },
                     onDeleteImportedBrush = { viewModel.deleteImportedKritaBrush(context, it) },
+                    onOpenBrushStudio = { viewModel.toggleBrushStudio() },
+                    selectedTool = uiState.selectedTool,
+                    onSelectTool = { viewModel.selectTool(it) },
                     isCompact = false,
                     modifier = Modifier
                         .padding(start = 68.dp, end = 12.dp)
@@ -449,25 +458,27 @@ fun PcEditorScreen(
             }
 
             // Banner de oferta de brush importado por amigo diretamente abaixo da barra de brush
-            FriendBrushOfferBanner(
-                offer = uiState.pendingFriendBrushOffer,
-                theme = currentTheme,
-                onAccept = {
-                    viewModel.acceptFriendBrushOffer(context)
-                    Toast.makeText(context, "Brush baixado para seus Importados!", Toast.LENGTH_SHORT).show()
-                },
-                onDecline = { viewModel.declineFriendBrushOffer() },
-                modifier = Modifier.padding(start = 68.dp, end = 12.dp)
-            )
+            if (!uiState.isZenModeActive) {
+                FriendBrushOfferBanner(
+                    offer = uiState.pendingFriendBrushOffer,
+                    theme = currentTheme,
+                    onAccept = {
+                        viewModel.acceptFriendBrushOffer(context)
+                        Toast.makeText(context, "Brush baixado para seus Importados!", Toast.LENGTH_SHORT).show()
+                    },
+                    onDecline = { viewModel.declineFriendBrushOffer() },
+                    modifier = Modifier.padding(start = 68.dp, end = 12.dp)
+                )
 
-            // 2c. Unobstructed Compact Horizontal Collaborators Strip (Hideable via Configurações)
-            CollaboratorHorizontalStrip(
-                connectedFriends = uiState.connectedFriends,
-                showHud = uiState.preferences.showCanvasCollaboratorsHud,
-                fallbackPingMs = uiState.currentPingMs,
-                theme = currentTheme,
-                modifier = Modifier.padding(start = 68.dp, end = 12.dp)
-            )
+                // 2c. Unobstructed Compact Horizontal Collaborators Strip (Hideable via Configurações)
+                CollaboratorHorizontalStrip(
+                    connectedFriends = uiState.connectedFriends,
+                    showHud = uiState.preferences.showCanvasCollaboratorsHud,
+                    fallbackPingMs = uiState.currentPingMs,
+                    theme = currentTheme,
+                    modifier = Modifier.padding(start = 68.dp, end = 12.dp)
+                )
+            }
 
             // 2d. Minimalist Fine Eraser Bar (pequena, fina e minimalista)
             if (uiState.selectedTool == ToolType.ERASER && (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideToolbar)) {
@@ -487,9 +498,7 @@ fun PcEditorScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Icon(
-                            Icons.Default.Clear,
-                            contentDescription = "Borracha",
+                        EraserVectorIcon(
                             tint = NeonPink,
                             modifier = Modifier.size(13.dp)
                         )
@@ -523,15 +532,19 @@ fun PcEditorScreen(
                             }
                         }
 
-                        Text(
-                            text = "${uiState.brushSize.toInt()}px",
-                            fontSize = 9.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = themeText
+                        InlineNumericPxInput(
+                            valuePx = uiState.eraserSize,
+                            minPx = 2f,
+                            maxPx = 120f,
+                            accentColor = adaptivePink,
+                            textColor = themeText,
+                            panelBgColor = Color(currentTheme.panel),
+                            testTag = "pc_eraser_px_input",
+                            onCommitValue = { viewModel.setEraserSize(it) }
                         )
                         Slider(
-                            value = uiState.brushSize,
-                            onValueChange = { viewModel.setBrushSize(it) },
+                            value = uiState.eraserSize,
+                            onValueChange = { viewModel.setEraserSize(it) },
                             valueRange = 2f..80f,
                             modifier = Modifier
                                 .width(60.dp)
@@ -688,7 +701,7 @@ fun PcEditorScreen(
             }
 
             // Floating FlipaClip-style Selection Actions Toolbar (when Lasso/MagicWand selection is active)
-            if (uiState.activeSelection.isActive) {
+            if (uiState.activeSelection.isActive && !uiState.isZenModeActive) {
                 Surface(
                     modifier = Modifier
                         .shadow(12.dp, RoundedCornerShape(20.dp))
@@ -698,10 +711,43 @@ fun PcEditorScreen(
                     color = Color(currentTheme.panel).copy(alpha = 0.96f)
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { viewModel.invertSelection() }
+                                .border(
+                                    1.dp,
+                                    if (uiState.activeSelection.isInverted) adaptiveOrange else themeBorder,
+                                    RoundedCornerShape(8.dp)
+                                )
+                                .testTag("pc_invert_selection_btn"),
+                            color = if (uiState.activeSelection.isInverted) adaptiveOrange.copy(alpha = 0.25f) else Color.Transparent
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.CompareArrows,
+                                    contentDescription = "Inverter Seleção",
+                                    tint = if (uiState.activeSelection.isInverted) adaptiveOrange else Color(currentTheme.text),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "Inverter",
+                                    fontSize = 9.5.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (uiState.activeSelection.isInverted) adaptiveOrange else Color(currentTheme.text)
+                                )
+                            }
+                        }
                         IconButton(onClick = { viewModel.flipSelectionH() }, modifier = Modifier.size(30.dp)) {
                             Icon(Icons.Default.SwapHoriz, contentDescription = "Espelhar H", tint = Color(currentTheme.text), modifier = Modifier.size(16.dp))
                         }
@@ -747,7 +793,7 @@ fun PcEditorScreen(
 
             // Floating Video Transform HUD (when Transformar Vídeo mode is active)
             val activeVideoAsset = uiState.project.mediaAssets.firstOrNull { it.type == "video" || it.type == "gif" }
-            if (uiState.isVideoTransformMode && activeVideoAsset != null) {
+            if (uiState.isVideoTransformMode && activeVideoAsset != null && !uiState.isZenModeActive) {
                 Surface(
                     modifier = Modifier
                         .shadow(10.dp, RoundedCornerShape(16.dp))
@@ -813,7 +859,7 @@ fun PcEditorScreen(
                 uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers?.getOrNull(uiState.activeLayerIndex)
             } else null
             val activeLayerImgAttachmentPc = activeLayerImageTargetPc?.imageAttachment
-            if (activeLayerImageTargetPc != null && activeLayerImgAttachmentPc != null) {
+            if (activeLayerImageTargetPc != null && activeLayerImgAttachmentPc != null && !uiState.isZenModeActive) {
                 TimelineLayerImageTransformHud(
                     layerName = activeLayerImageTargetPc.name,
                     attachment = activeLayerImgAttachmentPc,
@@ -836,7 +882,7 @@ fun PcEditorScreen(
                 )
             }
 
-            if (uiState.referenceImage.isVisible) {
+            if (uiState.referenceImage.isVisible && !uiState.isZenModeActive) {
                 FloatingReferenceControlsBar(
                     refState = uiState.referenceImage,
                     theme = currentTheme,
@@ -847,139 +893,177 @@ fun PcEditorScreen(
                         viewModel.updateFloatingReferenceScale(uiState.referenceImage.scale + step)
                     },
                     onRotateStep = { deg -> viewModel.rotateFloatingReference(deg) },
+                    onScaleChange = { viewModel.setFloatingReferenceScaleDirect(it) },
+                    onRotationChange = { viewModel.setFloatingReferenceRotationDirect(it) },
                     onResetTransform = { viewModel.resetFloatingReferenceTransform() },
                     onDeleteWindow = { viewModel.clearReferenceImage() }
                 )
             }
         }
 
-        // 3. Floating Left Vertical Toolbar (Reformulated PC Tools + 3-Overlapping-Wheels Extra Tools Button)
+        // 3. Floating Left Vertical Toolbar OR Camera Mode Dedicated Toolbar
         if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideToolbar) {
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .padding(start = 12.dp)
-                    .shadow(12.dp, RoundedCornerShape(12.dp))
-                    .clip(RoundedCornerShape(12.dp))
-                    .border(1.5.dp, Color(currentTheme.accent).copy(alpha = 0.5f), RoundedCornerShape(12.dp))
-                    .testTag("pc_floating_toolbar"),
-                color = Color(currentTheme.panel).copy(alpha = 0.95f),
-                tonalElevation = 8.dp
-            ) {
-                Column(
-                    modifier = Modifier.padding(4.dp),
-                    verticalArrangement = Arrangement.spacedBy(3.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+            if (uiState.isCameraTimelineOpen) {
+                CameraSideToolbar(
+                    selectedAction = uiState.cameraToolAction,
+                    is3DMode = uiState.project.camera3D.cameraMode == CameraMode.MODE_3D,
+                    isSideView3D = uiState.isCameraSideView3D,
+                    showCaptureFrame = uiState.project.camera3D.showCaptureFrame,
+                    theme = currentTheme,
+                    onSelectAction = { viewModel.setCameraToolAction(it) },
+                    onAddOrUpdateKeyframe = { viewModel.addOrUpdateCameraKeyframeAtCurrentFrame(null) },
+                    onConnectTwoKeyframes = { viewModel.connectTwoCameraKeyframes() },
+                    onToggleCaptureFrame = { viewModel.toggleCameraShowCaptureFrame() },
+                    onToggleSideView3D = { viewModel.toggleCameraSideView3D() },
+                    onResetCurrentKeyframe = { viewModel.resetCameraAtCurrentFrame() },
+                    onCloseCameraMode = { viewModel.closeCameraTimeline() },
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(start = 12.dp)
+                )
+            } else {
+                BoxWithConstraints(
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(start = 12.dp)
                 ) {
-                    DesktopToolButton(
-                        icon = Icons.Default.Edit,
-                        tooltip = "Lápis (P)",
-                        isSelected = uiState.selectedTool == ToolType.PENCIL || uiState.selectedTool == ToolType.PEN,
-                        accentColor = Color(currentTheme.accent),
-                        defaultTint = themeText,
-                        onClick = { viewModel.selectTool(ToolType.PENCIL) }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.Timeline,
-                        tooltip = "Caneta Vetorial Bézier",
-                        isSelected = uiState.selectedTool == ToolType.BEZIER_PEN,
-                        accentColor = adaptiveCyan,
-                        defaultTint = themeText,
-                        onClick = { viewModel.selectTool(ToolType.BEZIER_PEN) }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.Brush,
-                        tooltip = "Estúdio de Pincéis (B)",
-                        isSelected = uiState.isBrushStudioOpen || uiState.selectedTool == ToolType.BRUSH,
-                        accentColor = Color(currentTheme.accent),
-                        defaultTint = themeText,
-                        onClick = { viewModel.toggleBrushStudio() }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.Clear,
-                        tooltip = "Borracha (E)",
-                        isSelected = uiState.selectedTool == ToolType.ERASER,
-                        accentColor = adaptivePink,
-                        defaultTint = themeText,
-                        onClick = { viewModel.selectTool(ToolType.ERASER) }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.FormatPaint,
-                        tooltip = "Balde de Tinta (G)",
-                        isSelected = uiState.selectedTool == ToolType.BUCKET,
-                        accentColor = adaptiveCyan,
-                        defaultTint = themeText,
-                        onClick = { viewModel.selectTool(ToolType.BUCKET) }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.AutoFixHigh,
-                        tooltip = "Varinha Mágica (W)",
-                        isSelected = uiState.selectedTool == ToolType.MAGIC_WAND,
-                        accentColor = Color(currentTheme.accent),
-                        defaultTint = themeText,
-                        onClick = { viewModel.selectTool(ToolType.MAGIC_WAND) }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.Speed,
-                        tooltip = "Laço de Seleção (S)",
-                        isSelected = uiState.selectedTool == ToolType.LASSO,
-                        accentColor = adaptiveOrange,
-                        defaultTint = themeText,
-                        onClick = { viewModel.selectTool(ToolType.LASSO) }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.ColorLens,
-                        tooltip = "Roda de Cores",
-                        isSelected = false,
-                        accentColor = Color(uiState.currentColor),
-                        defaultTint = themeText,
-                        onClick = { viewModel.openDialog(EditorDialog.COLOR_PICKER) }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.Colorize,
-                        tooltip = "Conta-Gotas (I)",
-                        isSelected = uiState.selectedTool == ToolType.EYEDROPPER,
-                        accentColor = adaptiveGreen,
-                        defaultTint = themeText,
-                        onClick = { viewModel.selectTool(ToolType.EYEDROPPER) }
-                    )
-
-                    DesktopToolButton(
-                        icon = Icons.Default.Movie,
-                        tooltip = "Renderizar / Exportar (F12)",
-                        isSelected = false,
-                        accentColor = Color(currentTheme.accent),
-                        defaultTint = themeText,
-                        onClick = { viewModel.openDialog(EditorDialog.EXPORT) }
-                    )
-
-                    // End of PC Sidebar: 3 Overlapping Wheels button -> opens extra tools + migrated header menu
+                    val maxToolbarH = (maxHeight - 16.dp).coerceAtLeast(180.dp)
                     Surface(
                         modifier = Modifier
-                            .size(36.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { showExtraToolsMenu = !showExtraToolsMenu }
-                            .testTag("pc_three_wheels_tools_button"),
-                        color = if (showExtraToolsMenu) Color(currentTheme.accent).copy(alpha = 0.35f) else Color.Transparent,
-                        border = androidx.compose.foundation.BorderStroke(
-                            width = if (showExtraToolsMenu) 1.5.dp else 1.dp,
-                            color = if (showExtraToolsMenu) Color(currentTheme.accent) else Color(currentTheme.accent).copy(alpha = 0.45f)
-                        )
+                            .heightIn(max = maxToolbarH)
+                            .shadow(12.dp, RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.5.dp, Color(currentTheme.accent).copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                            .testTag("pc_floating_toolbar"),
+                        color = Color(currentTheme.panel).copy(alpha = 0.95f),
+                        tonalElevation = 8.dp
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            ThreeWheelsIcon(
-                                tint = Color(currentTheme.text),
+                        Column(
+                            modifier = Modifier
+                                .padding(4.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(3.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            DesktopToolButton(
+                                icon = Icons.Default.Edit,
+                                tooltip = "Lápis (P)",
+                                isSelected = uiState.selectedTool == ToolType.PENCIL || uiState.selectedTool == ToolType.PEN || uiState.selectedTool == ToolType.BRUSH,
                                 accentColor = Color(currentTheme.accent),
-                                size = 20.dp
+                                defaultTint = themeText,
+                                onClick = { viewModel.selectTool(ToolType.PENCIL) }
                             )
+
+                            val activeStrokePx = if (uiState.selectedTool == ToolType.ERASER) uiState.eraserSize else uiState.brushSize
+                            InlineNumericPxInput(
+                                valuePx = activeStrokePx,
+                                minPx = 1f,
+                                maxPx = 120f,
+                                accentColor = if (uiState.selectedTool == ToolType.ERASER) adaptivePink else Color(currentTheme.accent),
+                                textColor = themeText,
+                                panelBgColor = Color(currentTheme.panel),
+                                testTag = "pc_inline_px_input",
+                                onCommitValue = { px ->
+                                    if (uiState.selectedTool == ToolType.ERASER) viewModel.setEraserSize(px)
+                                    else viewModel.setBrushSize(px)
+                                }
+                            )
+
+                            DesktopToolButton(
+                                icon = Icons.Default.Timeline,
+                                tooltip = "Caneta Vetorial Bézier",
+                                isSelected = uiState.selectedTool == ToolType.BEZIER_PEN,
+                                accentColor = adaptiveCyan,
+                                defaultTint = themeText,
+                                onClick = { viewModel.selectTool(ToolType.BEZIER_PEN) }
+                            )
+
+                            DesktopCustomToolButton(
+                                tooltip = "Borracha (E)",
+                                isSelected = uiState.selectedTool == ToolType.ERASER,
+                                accentColor = adaptivePink,
+                                defaultTint = themeText,
+                                onClick = { viewModel.selectTool(ToolType.ERASER) }
+                            ) { tint ->
+                                EraserVectorIcon(tint = tint, modifier = Modifier.size(18.dp))
+                            }
+
+                            DesktopToolButton(
+                                icon = Icons.Default.FormatPaint,
+                                tooltip = "Balde de Tinta (G) - toque novamente para Config. Balde",
+                                isSelected = uiState.selectedTool == ToolType.BUCKET,
+                                accentColor = adaptiveCyan,
+                                defaultTint = themeText,
+                                onClick = { viewModel.selectTool(ToolType.BUCKET) }
+                            )
+
+                            DesktopToolButton(
+                                icon = Icons.Default.AutoFixHigh,
+                                tooltip = "Varinha Mágica (W)",
+                                isSelected = uiState.selectedTool == ToolType.MAGIC_WAND,
+                                accentColor = Color(currentTheme.accent),
+                                defaultTint = themeText,
+                                onClick = { viewModel.selectTool(ToolType.MAGIC_WAND) }
+                            )
+
+                            DesktopCustomToolButton(
+                                tooltip = "Laço de Seleção (S)",
+                                isSelected = uiState.selectedTool == ToolType.LASSO,
+                                accentColor = adaptiveOrange,
+                                defaultTint = themeText,
+                                onClick = { viewModel.selectTool(ToolType.LASSO) }
+                            ) { tint ->
+                                LassoVectorIcon(tint = tint, modifier = Modifier.size(18.dp))
+                            }
+
+                            DesktopToolButton(
+                                icon = Icons.Default.ColorLens,
+                                tooltip = "Roda de Cores",
+                                isSelected = false,
+                                accentColor = Color(uiState.currentColor),
+                                defaultTint = themeText,
+                                onClick = { viewModel.openDialog(EditorDialog.COLOR_PICKER) }
+                            )
+
+                            DesktopToolButton(
+                                icon = Icons.Default.Colorize,
+                                tooltip = "Conta-Gotas (I)",
+                                isSelected = uiState.selectedTool == ToolType.EYEDROPPER,
+                                accentColor = adaptiveGreen,
+                                defaultTint = themeText,
+                                onClick = { viewModel.selectTool(ToolType.EYEDROPPER) }
+                            )
+
+                            DesktopToolButton(
+                                icon = Icons.Default.Movie,
+                                tooltip = "Renderizar / Exportar (F12)",
+                                isSelected = false,
+                                accentColor = Color(currentTheme.accent),
+                                defaultTint = themeText,
+                                onClick = { viewModel.openDialog(EditorDialog.EXPORT) }
+                            )
+
+                            // End of PC Sidebar: 3 Overlapping Wheels button -> opens extra tools + migrated header menu
+                            Surface(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { showExtraToolsMenu = !showExtraToolsMenu }
+                                    .testTag("pc_three_wheels_tools_button"),
+                                color = if (showExtraToolsMenu) Color(currentTheme.accent).copy(alpha = 0.35f) else Color.Transparent,
+                                border = androidx.compose.foundation.BorderStroke(
+                                    width = if (showExtraToolsMenu) 1.5.dp else 1.dp,
+                                    color = if (showExtraToolsMenu) Color(currentTheme.accent) else Color(currentTheme.accent).copy(alpha = 0.45f)
+                                )
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    ThreeWheelsIcon(
+                                        tint = Color(currentTheme.text),
+                                        accentColor = Color(currentTheme.accent),
+                                        size = 20.dp
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -989,7 +1073,7 @@ fun PcEditorScreen(
 
             // Floating Brush Studio Configurator Drawer (Nativos / Importados + Loupe Search + Sliders + Save/Reset)
             BrushStudioDrawer(
-                visible = uiState.isBrushStudioOpen && !showExtraToolsMenu,
+                visible = uiState.isBrushStudioOpen && !showExtraToolsMenu && !uiState.isZenModeActive,
                 activePreset = uiState.activeBrushPreset,
                 nativePresets = uiState.nativeBrushPresets,
                 importedPresets = uiState.importedKritaBrushes,
@@ -1054,22 +1138,269 @@ fun PcEditorScreen(
                 onUpdatePerspectiveRulerSettings = { viewModel.updatePerspectiveRulerSettings(it) },
                 onionSkinOpacity = uiState.project.onionSkin.opacity,
                 onChangeOnionSkinOpacity = { viewModel.setOnionSkinOpacity(it) },
+                onOpenPaletteTray = { viewModel.openPaletteTray() },
+                isQuickPaletteOpen = uiState.isQuickPaletteOpen,
+                onToggleQuickPalette = { viewModel.toggleQuickPalette() },
+                onOpenCameraTimeline = { viewModel.toggleCameraTimeline() },
+                isCameraTimelineOpen = uiState.isCameraTimelineOpen,
                 modifier = Modifier
                     .align(Alignment.CenterStart)
                     .padding(start = 62.dp)
             )
+
+            // Popover Config. Balde (Expandir px + Pintar por baixo + Camadas Referência)
+            if (uiState.showBucketConfig && !uiState.isZenModeActive) {
+                val currFrameBucketPc = uiState.project.frames.getOrNull(uiState.currentFrameIndex)
+                BucketConfigPopover(
+                    config = uiState.bucketConfig,
+                    frameLayers = currFrameBucketPc?.layers ?: emptyList(),
+                    localLayers = currFrameBucketPc?.localLayers ?: emptyList(),
+                    panelColor = Color(currentTheme.panel),
+                    accentColor = Color(currentTheme.accent),
+                    textColor = themeText,
+                    onUpdateConfig = { viewModel.updateBucketConfig(it) },
+                    onToggleTimelineLayerReference = { viewModel.toggleTimelineLayerBucketReference(it) },
+                    onToggleLocalLayerReference = { viewModel.toggleFrameLocalLayerBucketReference(it) },
+                    onCreateBucketLayer = { viewModel.addBucketLayer(insertBelowActive = true) },
+                    onSelectBucketTargetLayer = { viewModel.setActiveBucketTargetLayer(it) },
+                    onDismiss = { viewModel.closeBucketConfig() },
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(start = 62.dp)
+                )
+            }
         }
 
-        // 4. Timeline at Bottom (Heritage Junior vs Heritage Profissional)
-        if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideTimeline) {
-            val isProf = uiState.preferences.timelineLayoutMode == TimelineLayoutMode.HERITAGE_PROFISSIONAL
-            val totalSecs = (uiState.project.frames.size / uiState.project.fps.toFloat()).coerceAtLeast(0.041f)
-            val audioAsset = uiState.project.mediaAssets.firstOrNull { it.type == "audio" }
-            val videoAsset = uiState.project.mediaAssets.firstOrNull { it.type == "video" || it.type == "gif" }
+        // Janela Flutuante de Palheta Rápida (Já Escolhida, Arrastável e com Cadeado, atalho Q)
+        if (uiState.isQuickPaletteOpen && !uiState.isZenModeActive) {
+            QuickPaletteFloatingWindow(
+                swatches = uiState.preferences.colorPalette.swatches,
+                currentColor = uiState.currentColor,
+                isLocked = uiState.isQuickPaletteLocked,
+                panelColor = Color(currentTheme.panel),
+                accentColor = Color(currentTheme.accent),
+                textColor = themeText,
+                onSelectColor = { viewModel.setColor(it) },
+                onOpenFullPaletteTray = { viewModel.openPaletteTray() },
+                onToggleLock = { viewModel.toggleQuickPaletteLock() },
+                onClose = { viewModel.closeQuickPalette() },
+                modifier = Modifier.align(Alignment.TopEnd)
+            )
+        }
 
-            Box(
+        // 4. Timeline at Bottom (Heritage Junior vs Heritage Profissional OR 3D Camera Timeline)
+        if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideTimeline) {
+            PcEditorBottomTimelineSection(
+                uiState = uiState,
+                viewModel = viewModel,
+                context = context,
+                currentTheme = currentTheme,
+                themeText = themeText,
+                themeMuted = themeMuted,
+                themeBorder = themeBorder,
+                adaptiveCyan = adaptiveCyan,
+                adaptiveGreen = adaptiveGreen,
+                adaptivePink = adaptivePink,
+                adaptiveOrange = adaptiveOrange,
+                coroutineScope = coroutineScope,
+                activeFocusZone = activeFocusZone,
+                onFocusZoneChange = { activeFocusZone = it },
+                onShowThemeMenu = { showThemeMenu = true },
+                onShowOnionOpacityDialog = { showOnionOpacityDialog = true },
+                onShowMediaImportChoice = { showMediaImportChoice = true },
+                onShowDurationDialog = { showDurationDialog = true },
+                onShowFpsDialog = { showFpsDialog = true },
+                onLaunchAudioPicker = { audioPicker.launch("audio/*") },
+                onLaunchVideoPicker = { videoPicker.launch("video/*") }
+            )
+        }
+
+        // Painel Flutuante de Subcamadas Isoladas por Quadro ("Camadas do Quadro")
+        val currFramePc = uiState.project.frames.getOrNull(uiState.currentFrameIndex)
+        val activeTimelineLayerNamePc = currFramePc?.layers?.getOrNull(uiState.activeLayerIndex)?.name ?: "Camada Principal"
+        FrameLayersFloatingPanel(
+            visible = uiState.isFrameLayersPanelOpen && !uiState.isZenModeActive,
+            currentFrameIndex = uiState.currentFrameIndex,
+            localLayers = currFramePc?.localLayers ?: emptyList(),
+            activeLocalLayerIndex = uiState.activeLocalLayerIndex,
+            activeTargetIsFrameLocalLayer = uiState.activeTargetIsFrameLocalLayer,
+            activeTimelineLayerName = activeTimelineLayerNamePc,
+            theme = currentTheme,
+            onClose = { viewModel.closeFrameLayersPanel() },
+            onSelectLocalLayer = { viewModel.selectFrameLocalLayer(it) },
+            onUseTimelineLayerTarget = { viewModel.useTimelineLayerTarget() },
+            onAddLocalLayer = { viewModel.addFrameLocalLayer() },
+            onDeleteLocalLayer = { viewModel.deleteFrameLocalLayer(it) },
+            onRenameLocalLayer = { idx, newName -> viewModel.renameFrameLocalLayer(idx, newName) },
+            onMoveLocalLayerUp = { viewModel.moveFrameLocalLayerUp(it) },
+            onMoveLocalLayerDown = { viewModel.moveFrameLocalLayerDown(it) },
+            onToggleVisibility = { viewModel.toggleFrameLocalLayerVisibility(it) },
+            onToggleLock = { viewModel.toggleFrameLocalLayerLock(it) },
+            onChangeOpacity = { idx, op -> viewModel.setFrameLocalLayerOpacity(idx, op) },
+            onChangeBlendEffect = { idx, eff -> viewModel.setFrameLocalLayerBlendEffect(idx, eff) },
+            onToggleClippingMask = { viewModel.toggleFrameLocalLayerClippingMask(it) },
+            onAddBucketLayer = { viewModel.addFrameLocalBucketLayer() },
+            onToggleBucketReference = { viewModel.toggleFrameLocalLayerBucketReference(it) },
+            onSelectBucketTargetLayer = { viewModel.setActiveBucketTargetLayer(it) },
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 16.dp)
+        )
+
+        // Floating Zen Mode Exit Pill (when bars are hidden, tap to restore)
+        if (uiState.isZenModeActive) {
+            Surface(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
+                    .align(Alignment.TopEnd)
+                    .padding(12.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .clickable { viewModel.setZenModeActive(false) }
+                    .border(1.dp, adaptiveCyan, RoundedCornerShape(20.dp))
+                    .shadow(8.dp, RoundedCornerShape(20.dp))
+                    .testTag("pc_exit_zen_btn"),
+                color = Color(currentTheme.panel).copy(alpha = 0.92f)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        Icons.Default.FullscreenExit,
+                        contentDescription = "Sair do Modo Foco",
+                        tint = adaptiveCyan,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        text = "Sair do Foco (TAB)",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = adaptiveCyan
+                    )
+                }
+            }
+        }
+
+        PcEditorDialogsAndModals(
+            uiState = uiState,
+            viewModel = viewModel,
+            context = context,
+            currentTheme = currentTheme,
+            themeMuted = themeMuted,
+            themeBorder = themeBorder,
+            showThemeMenu = showThemeMenu,
+            onDismissThemeMenu = { showThemeMenu = false },
+            showMediaImportChoice = showMediaImportChoice,
+            onDismissMediaImportChoice = { showMediaImportChoice = false },
+            showOnionOpacityDialog = showOnionOpacityDialog,
+            onDismissOnionOpacityDialog = { showOnionOpacityDialog = false },
+            showFpsDialog = showFpsDialog,
+            onDismissFpsDialog = { showFpsDialog = false },
+            showDurationDialog = showDurationDialog,
+            onDismissDurationDialog = { showDurationDialog = false },
+            onLaunchAudioPicker = { audioPicker.launch("audio/*") },
+            onLaunchVideoPicker = { videoPicker.launch("video/*") }
+        )
+    }
+}
+
+@Composable
+private fun BoxScope.PcEditorBottomTimelineSection(
+    uiState: EditorUiState,
+    viewModel: KodanimaViewModel,
+    context: Context,
+    currentTheme: KodanimaTheme,
+    themeText: Color,
+    themeMuted: Color,
+    themeBorder: Color,
+    adaptiveCyan: Color,
+    adaptiveGreen: Color,
+    adaptivePink: Color,
+    adaptiveOrange: Color,
+    coroutineScope: CoroutineScope,
+    activeFocusZone: StudioFocusZone,
+    onFocusZoneChange: (StudioFocusZone) -> Unit,
+    onShowThemeMenu: () -> Unit,
+    onShowOnionOpacityDialog: () -> Unit,
+    onShowMediaImportChoice: () -> Unit,
+    onShowDurationDialog: () -> Unit,
+    onShowFpsDialog: () -> Unit,
+    onLaunchAudioPicker: () -> Unit,
+    onLaunchVideoPicker: () -> Unit
+) {
+    var draggingFrameIdx by remember { mutableStateOf<Int?>(null) }
+    var snapHoverTick by remember { mutableStateOf<Int?>(null) }
+    var liveDraggingHold by remember { mutableStateOf<Int?>(null) }
+
+    val isProf = uiState.preferences.timelineLayoutMode == TimelineLayoutMode.HERITAGE_PROFISSIONAL
+    if (uiState.isCameraTimelineOpen) {
+        CameraTimelinePanel(
+            cameraSettings = uiState.project.camera3D,
+            currentFrameIndex = uiState.currentFrameIndex,
+            totalFrames = uiState.project.frames.size,
+            isPlaying = uiState.isPlaying,
+            isSideView3D = uiState.isCameraSideView3D,
+            savedTemplates = uiState.preferences.savedCameraTemplates,
+            theme = currentTheme,
+            onSelectFrame = { viewModel.goToFrame(it) },
+            onTogglePlay = { viewModel.togglePlayback() },
+            onToggleCameraEnabled = { viewModel.toggleCameraEnabled() },
+            onToggleSideView3D = { viewModel.toggleCameraSideView3D() },
+            onToggleAutoInterpolate = { viewModel.toggleCameraAutoInterpolate() },
+            onToggleCaptureFrameOverlay = { viewModel.toggleCameraShowCaptureFrame() },
+            onUpdateCurrentCamera = { viewModel.updateCameraAtCurrentFrame(it) },
+            onAddOrUpdateKeyframe = { viewModel.addOrUpdateCameraKeyframeAtCurrentFrame(it) },
+            onDeleteKeyframeAt = { viewModel.deleteCameraKeyframeAt(it) },
+            onResetKeyframes = { viewModel.resetCameraKeyframesToDefault() },
+            onSetCameraResolution = { w, h -> viewModel.setCameraResolution(w, h) },
+            onSetLayerDepthSpacing = { viewModel.setCameraLayerDepthSpacing(it) },
+            onApplyBuiltInEffect = { viewModel.applyCameraBuiltInEffect(it) },
+            onSaveTemplateToFolder = { viewModel.saveCameraTemplateToFolder(it) },
+            onApplyTemplateFromFolder = { viewModel.applyCameraTemplateFromFolder(it) },
+            onDeleteTemplate = { viewModel.deleteCameraTemplate(it) },
+            onUpdatePostEffects = { viewModel.updateCameraPostEffects(it) },
+            onResetPostEffects = { viewModel.resetCameraPostEffects() },
+            onCloseCameraTimeline = { viewModel.closeCameraTimeline() },
+            onSetCameraMode = { viewModel.setCameraMode(it) },
+            onUpdateBezierHandles = { fIdx, p1x, p1y, p2x, p2y ->
+                viewModel.updateKeyframeBezierHandles(fIdx, p1x, p1y, p2x, p2y)
+            },
+            onApplyEffectInRange = { eff, sf, ef, inten ->
+                viewModel.applyCameraEffectInRange(eff, sf, ef, inten)
+            },
+            onRemoveEffectSpan = { viewModel.removeCameraEffectSpan(it) },
+            canvasBackground = uiState.project.canvasBackground,
+            onUpdateCanvasBackground = { viewModel.updateCanvasBackground(it) },
+            onConnectTwoKeyframes = { viewModel.connectTwoCameraKeyframes() },
+            onPrevKeyframe = { viewModel.jumpToPrevCameraKeyframe() },
+            onNextKeyframe = { viewModel.jumpToNextCameraKeyframe() },
+            onResetCurrentKeyframe = { viewModel.resetCameraAtCurrentFrame() },
+            onSetCameraFov = { viewModel.setCameraFov(it) },
+            onNudgeCameraPan = { dx, dy -> viewModel.nudgeCameraPan(dx, dy) },
+            onZoomCameraBy = { viewModel.zoomCameraBy(it) },
+            onRotateCameraBy = { viewModel.rotateCameraBy(it) },
+            onTiltOrbitCameraBy = { dYaw, dPitch -> viewModel.tiltOrbitCameraBy(dYaw, dPitch) },
+            onAddFrame = { viewModel.addFrame() },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .then(
+                    if (isProf) {
+                        Modifier.fillMaxWidth()
+                    } else {
+                        Modifier
+                            .padding(horizontal = 16.dp, vertical = 8.dp)
+                            .fillMaxWidth(0.85f)
+                    }
+                )
+        )
+    } else {
+        val fps = uiState.project.fps.coerceAtLeast(1)
+        val audioAsset = uiState.project.mediaAssets.firstOrNull { it.type == "audio" }
+        val videoAsset = uiState.project.mediaAssets.firstOrNull { it.type == "video" || it.type == "gif" }
+
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
                 .then(
                     if (isProf) {
                         Modifier.fillMaxWidth()
@@ -1089,7 +1420,6 @@ fun PcEditorScreen(
                 .background(Color(currentTheme.panel).copy(alpha = 0.98f))
         ) {
             Column(modifier = Modifier.fillMaxWidth()) {
-                // Timeline Top Ribbon Toolbar (Layer buttons, Onion skin, Play/Loop, Frame ops, Media)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1099,27 +1429,18 @@ fun PcEditorScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    // [+] Add Layer
                     TimelineIconButton(icon = Icons.Default.Add, tooltip = "Nova camada", tint = themeText) {
                         viewModel.addLayer()
                     }
-
-                    // [🗑] Delete Layer
                     TimelineIconButton(icon = Icons.Default.Delete, tooltip = "Excluir camada", tint = themeText) {
                         viewModel.deleteLayer(uiState.activeLayerIndex)
                     }
-
-                    // [↑] Move Up
                     TimelineIconButton(icon = Icons.Default.KeyboardArrowUp, tooltip = "Subir camada", tint = themeText) {
                         viewModel.moveLayerUp(uiState.activeLayerIndex)
                     }
-
-                    // [↓] Move Down
                     TimelineIconButton(icon = Icons.Default.KeyboardArrowDown, tooltip = "Descer camada", tint = themeText) {
                         viewModel.moveLayerDown(uiState.activeLayerIndex)
                     }
-
-                    // [👁] Visibility Toggle
                     val currLayer = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers?.getOrNull(uiState.activeLayerIndex)
                     val isVis = currLayer?.isVisible ?: true
                     TimelineIconButton(
@@ -1129,13 +1450,9 @@ fun PcEditorScreen(
                     ) {
                         viewModel.toggleLayerVisibility(uiState.activeLayerIndex)
                     }
-
-                    // [🎨] Theme quick switch
                     TimelineIconButton(icon = Icons.Default.ColorLens, tooltip = "Mudar Tema", tint = themeText) {
-                        showThemeMenu = true
+                        onShowThemeMenu()
                     }
-
-                    // [●] Color dot preview
                     Box(
                         modifier = Modifier
                             .size(18.dp)
@@ -1147,7 +1464,6 @@ fun PcEditorScreen(
 
                     Spacer(modifier = Modifier.width(6.dp))
 
-                    // Onion Skin icon & % value
                     val onionActive = uiState.onionSkinEnabled && uiState.project.onionSkin.isEnabled
                     Row(
                         modifier = Modifier
@@ -1170,13 +1486,12 @@ fun PcEditorScreen(
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = if (onionActive) Color(currentTheme.accent) else themeMuted,
-                            modifier = Modifier.clickable { showOnionOpacityDialog = true }
+                            modifier = Modifier.clickable { onShowOnionOpacityDialog() }
                         )
                     }
 
                     Spacer(modifier = Modifier.width(6.dp))
 
-                    // [▶ / ⏸] Play / Pause
                     TimelineIconButton(
                         icon = if (uiState.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                         tooltip = if (uiState.isPlaying) "Pausar" else "Reproduzir",
@@ -1184,8 +1499,6 @@ fun PcEditorScreen(
                     ) {
                         viewModel.togglePlayback()
                     }
-
-                    // [🔁] Loop toggle
                     TimelineIconButton(
                         icon = Icons.Default.Repeat,
                         tooltip = "Repetição contínua (Loop)",
@@ -1193,47 +1506,36 @@ fun PcEditorScreen(
                     ) {
                         viewModel.toggleLoop()
                     }
-
-                    // [+ Quadro] Add Frame
                     TimelineTextButton(text = "+ Quadro", tooltip = "Adicionar quadro no final", textColor = themeText) {
                         viewModel.addNewFrame()
                     }
-
-                    // [Inserir] Insert Frame
                     TimelineTextButton(text = "Inserir", tooltip = "Inserir quadro nesta posição", textColor = themeText) {
                         viewModel.insertFrameAtCurrentPosition()
                     }
-
-                    // [✕] Delete Frame
                     TimelineTextButton(text = "✕", tooltip = "Excluir quadro atual", textColor = adaptivePink) {
                         viewModel.deleteCurrentFrame()
                     }
-
-                    // [📥] Import media
                     TimelineIconButton(icon = Icons.Default.Download, tooltip = "Importar Áudio / Vídeo", tint = themeText) {
-                        showMediaImportChoice = true
+                        onShowMediaImportChoice()
                     }
 
-                    // [🔊] Audio Scrub toggle
                     val hasAudio = uiState.project.mediaAssets.any { it.type == "audio" }
                     TimelineIconButton(
                         icon = if (hasAudio) {
-                            androidx.compose.material.icons.Icons.AutoMirrored.Filled.VolumeUp
+                            Icons.AutoMirrored.Filled.VolumeUp
                         } else {
-                            androidx.compose.material.icons.Icons.AutoMirrored.Filled.VolumeMute
+                            Icons.AutoMirrored.Filled.VolumeMute
                         },
                         tooltip = "Áudio da Timeline",
                         tint = if (hasAudio) adaptiveGreen else themeMuted
                     ) {
                         if (!hasAudio) {
-                            audioPicker.launch("audio/*")
+                            onLaunchAudioPicker()
                         } else {
                             Toast.makeText(context, "Áudio já carregado na timeline", Toast.LENGTH_SHORT).show()
                         }
                     }
 
-                    // Dur. 0.641 (Matching Windows Kodanima screenshot)
-                    val fps = uiState.project.fps.coerceAtLeast(1)
                     val activeHold = if (draggingFrameIdx != null && liveDraggingHold != null) {
                         liveDraggingHold!!
                     } else {
@@ -1246,25 +1548,23 @@ fun PcEditorScreen(
                         fontWeight = FontWeight.SemiBold,
                         color = if (draggingFrameIdx != null) adaptiveCyan else themeText.copy(alpha = 0.88f),
                         modifier = Modifier
-                            .clickable { showDurationDialog = true }
+                            .clickable { onShowDurationDialog() }
                             .padding(horizontal = 4.dp)
                             .testTag("timeline_frame_dur_btn")
                     )
 
-                    // FPS: 24
                     Text(
                         text = "FPS ${uiState.project.fps}",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
                         color = Color(currentTheme.accent),
                         modifier = Modifier
-                            .clickable { showFpsDialog = true }
+                            .clickable { onShowFpsDialog() }
                             .padding(horizontal = 4.dp)
                     )
 
                     Spacer(modifier = Modifier.width(6.dp))
 
-                    // Snap Assistant Toggle (Assistente de Encaixe por Bolinhas)
                     val isSnapActive = uiState.preferences.timelineSnapAssistant
                     TimelineIconButton(
                         icon = Icons.Default.AutoFixHigh,
@@ -1279,9 +1579,16 @@ fun PcEditorScreen(
                         ).show()
                     }
 
+                    TimelineIconButton(
+                        icon = Icons.Default.Videocam,
+                        tooltip = "Câmera 3D & Pós-Efeitos",
+                        tint = if (uiState.project.camera3D.isEnabled) adaptiveOrange else themeText
+                    ) {
+                        viewModel.toggleCameraTimeline()
+                    }
+
                     Spacer(modifier = Modifier.weight(1f))
 
-                    // Total count text: "Total: 8 quadros | 1.375 s"
                     val totalTicks = uiState.project.frames.sumOf { it.holdFrames.coerceAtLeast(1) }
                     val totalSecs = totalTicks.toDouble() / fps
                     Text(
@@ -1293,7 +1600,6 @@ fun PcEditorScreen(
 
                     Spacer(modifier = Modifier.width(6.dp))
 
-                    // Compact migrated workspace controls directly in Timeline Ribbon (Top Bar removed)
                     TimelineIconButton(
                         icon = Icons.AutoMirrored.Filled.Undo,
                         tooltip = "Desfazer (Ctrl+Z)",
@@ -1372,7 +1678,6 @@ fun PcEditorScreen(
                     ) {
                         viewModel.setUiMode(AppUiMode.MOBILE)
                     }
-
                     TimelineIconButton(
                         icon = Icons.Default.Language,
                         tooltip = "Online & Servidor Local",
@@ -1380,7 +1685,6 @@ fun PcEditorScreen(
                     ) {
                         viewModel.navigateTo(AppScreen.NETWORK_STUDIO)
                     }
-
                     TimelineIconButton(
                         icon = Icons.Default.Settings,
                         tooltip = "Configurações do App",
@@ -1388,7 +1692,6 @@ fun PcEditorScreen(
                     ) {
                         viewModel.navigateTo(AppScreen.SETTINGS)
                     }
-
                     TimelineIconButton(
                         icon = Icons.Default.Fullscreen,
                         tooltip = "Modo Foco / Zen (TAB)",
@@ -1396,7 +1699,6 @@ fun PcEditorScreen(
                     ) {
                         viewModel.toggleZenMode()
                     }
-
                     TimelineIconButton(
                         icon = Icons.AutoMirrored.Filled.ArrowBack,
                         tooltip = "Voltar aos Projetos",
@@ -1411,7 +1713,6 @@ fun PcEditorScreen(
                     }
                 }
 
-                // Stacked Multi-Layer Timeline Rows (Mirroring Windows Kodanima 2D)
                 val projectLayers = uiState.project.frames.firstOrNull()?.layers ?: listOf(Layer(name = "Camada 1"))
                 val timelineBodyHeight = (24 + (projectLayers.size * 26) + 48).coerceIn(120, 220).dp
 
@@ -1422,7 +1723,6 @@ fun PcEditorScreen(
                 ) {
                     val layersScrollState = rememberScrollState()
 
-                    // Left Column (Camadas stacked vertically + Música + Vídeo)
                     Column(
                         modifier = Modifier
                             .width(135.dp)
@@ -1435,10 +1735,10 @@ fun PcEditorScreen(
                                         val event = awaitPointerEvent()
                                         when (event.type) {
                                             PointerEventType.Move, PointerEventType.Enter -> {
-                                                activeFocusZone = StudioFocusZone.LAYERS_ORDER
+                                                onFocusZoneChange(StudioFocusZone.LAYERS_ORDER)
                                             }
                                             PointerEventType.Scroll -> {
-                                                activeFocusZone = StudioFocusZone.LAYERS_ORDER
+                                                onFocusZoneChange(StudioFocusZone.LAYERS_ORDER)
                                                 val scrollChange = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
                                                 if (scrollChange != 0f) {
                                                     coroutineScope.launch {
@@ -1451,7 +1751,6 @@ fun PcEditorScreen(
                                 }
                             }
                     ) {
-                        // Header
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1468,14 +1767,14 @@ fun PcEditorScreen(
                             )
                         }
 
-                        // Vertically stacked layers in left column with mouse scroll
                         Column(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth()
                                 .verticalScroll(layersScrollState)
                         ) {
-                            projectLayers.forEachIndexed { index, layer ->
+                            projectLayers.indices.reversed().forEach { index ->
+                                val layer = projectLayers[index]
                                 val isSelected = index == uiState.activeLayerIndex
                                 val currFrameLayer = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers?.getOrNull(index)
                                 val isVis = currFrameLayer?.isVisible ?: layer.isVisible
@@ -1516,7 +1815,6 @@ fun PcEditorScreen(
                             }
                         }
 
-                        // Música (Audio Layer)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1524,7 +1822,7 @@ fun PcEditorScreen(
                                 .background(Color(currentTheme.bg).copy(alpha = 0.6f))
                                 .border(0.5.dp, themeBorder)
                                 .clickable {
-                                    if (audioAsset == null) audioPicker.launch("audio/*")
+                                    if (audioAsset == null) onLaunchAudioPicker()
                                     else Toast.makeText(context, "Faixa de áudio: ${audioAsset.name}", Toast.LENGTH_SHORT).show()
                                 }
                                 .padding(horizontal = 6.dp),
@@ -1545,7 +1843,6 @@ fun PcEditorScreen(
                             )
                         }
 
-                        // Vídeo / GIF Layer
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1559,7 +1856,7 @@ fun PcEditorScreen(
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.clickable {
-                                    if (videoAsset == null) videoPicker.launch("video/*")
+                                    if (videoAsset == null) onLaunchVideoPicker()
                                     else Toast.makeText(context, "Mídia: ${videoAsset.name}", Toast.LENGTH_SHORT).show()
                                 }
                             ) {
@@ -1577,7 +1874,6 @@ fun PcEditorScreen(
                                 )
                             }
 
-                            // Desktop sub-buttons: tr (transform), a% (opacity), reset
                             Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Text(
                                     text = "tr",
@@ -1590,7 +1886,7 @@ fun PcEditorScreen(
                                         .padding(horizontal = 3.dp)
                                         .clickable {
                                             if (videoAsset != null) viewModel.toggleVideoTransformMode()
-                                            else videoPicker.launch("video/*")
+                                            else onLaunchVideoPicker()
                                         }
                                         .testTag("pc_video_tr_button")
                                 )
@@ -1624,8 +1920,6 @@ fun PcEditorScreen(
                         }
                     }
 
-                    // Tick & track geometry with visual zoom
-                    val fps = uiState.project.fps.coerceAtLeast(1)
                     val tickWidth = (24 * uiState.timelineZoom).dp
                     val frameStartTicks = remember(uiState.project.frames) {
                         val starts = mutableListOf<Int>()
@@ -1651,7 +1945,6 @@ fun PcEditorScreen(
                     }
                     val playheadTickRounded = playheadTickFloat.roundToInt()
 
-                    // Right Scrollable Frame Ruler & True Stacked Layer Tracks
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -1663,7 +1956,6 @@ fun PcEditorScreen(
                                 .width(totalTrackWidth)
                                 .fillMaxHeight()
                         ) {
-                            // 1. Two-Tier Ruler Row (mouse scroll moves horizontally; tap/drag Pinça scrubs audio for Lip-Sync!)
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1675,7 +1967,7 @@ fun PcEditorScreen(
                                         val maxScrubMs = ((totalProjectTicks.coerceAtLeast(1).toDouble() / fps.toDouble()) * 1000.0).toLong()
                                         detectHorizontalDragGestures(
                                             onDragStart = { startOffset ->
-                                                activeFocusZone = StudioFocusZone.TIMELINE_RULER
+                                                onFocusZoneChange(StudioFocusZone.TIMELINE_RULER)
                                                 val tickPos = (startOffset.x / tickPx).coerceAtLeast(0f)
                                                 val targetMs = ((tickPos / fps.toFloat()) * 1000.0).toLong().coerceIn(0L, maxScrubMs)
                                                 viewModel.scrubToTimelineMs(targetMs)
@@ -1695,10 +1987,10 @@ fun PcEditorScreen(
                                                 val event = awaitPointerEvent()
                                                 when (event.type) {
                                                     PointerEventType.Move, PointerEventType.Enter -> {
-                                                        activeFocusZone = StudioFocusZone.TIMELINE_RULER
+                                                        onFocusZoneChange(StudioFocusZone.TIMELINE_RULER)
                                                     }
                                                     PointerEventType.Scroll -> {
-                                                        activeFocusZone = StudioFocusZone.TIMELINE_RULER
+                                                        onFocusZoneChange(StudioFocusZone.TIMELINE_RULER)
                                                         val scrollChange = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
                                                         if (scrollChange != 0f) {
                                                             coroutineScope.launch {
@@ -1728,7 +2020,6 @@ fun PcEditorScreen(
                                         horizontalAlignment = Alignment.CenterHorizontally,
                                         verticalArrangement = Arrangement.SpaceBetween
                                     ) {
-                                        // Top Tier: Second number at t % fps == 0
                                         Box(
                                             modifier = Modifier
                                                 .fillMaxWidth()
@@ -1745,7 +2036,6 @@ fun PcEditorScreen(
                                             }
                                         }
 
-                                        // Bottom Tier: Dotted tick circles (• • • • •)
                                         Box(
                                             modifier = Modifier
                                                 .fillMaxWidth()
@@ -1753,7 +2043,6 @@ fun PcEditorScreen(
                                             contentAlignment = Alignment.Center
                                         ) {
                                             if (isPlayheadTick) {
-                                                // Downward Cyan Triangle (Pinça)
                                                 Icon(
                                                     Icons.Default.ArrowDropDown,
                                                     contentDescription = "Agulha da Timeline (Pinça)",
@@ -1761,7 +2050,6 @@ fun PcEditorScreen(
                                                     modifier = Modifier.size(16.dp)
                                                 )
                                             } else {
-                                                // Bolinha do tick
                                                 Box(
                                                     modifier = Modifier
                                                         .size(if (isSnapHover) 7.dp else if (isSecondMark) 4.dp else 2.5.dp)
@@ -1784,7 +2072,6 @@ fun PcEditorScreen(
                                 }
                             }
 
-                            // 2. Stacked Horizontal Tracks for EACH Layer (One on top of the other, matching Windows)
                             Column(
                                 modifier = Modifier
                                     .weight(1f)
@@ -1795,10 +2082,10 @@ fun PcEditorScreen(
                                                 val event = awaitPointerEvent()
                                                 when (event.type) {
                                                     PointerEventType.Move, PointerEventType.Enter -> {
-                                                        activeFocusZone = StudioFocusZone.TIMELINE_FRAMES
+                                                        onFocusZoneChange(StudioFocusZone.TIMELINE_FRAMES)
                                                     }
                                                     PointerEventType.Scroll -> {
-                                                        activeFocusZone = StudioFocusZone.TIMELINE_FRAMES
+                                                        onFocusZoneChange(StudioFocusZone.TIMELINE_FRAMES)
                                                         val scrollChange = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
                                                         if (scrollChange < 0f) {
                                                             viewModel.zoomTimeline(1.15f)
@@ -1811,7 +2098,7 @@ fun PcEditorScreen(
                                         }
                                     }
                             ) {
-                                projectLayers.forEachIndexed { lIdx, _ ->
+                                projectLayers.indices.reversed().forEach { lIdx ->
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -1905,7 +2192,6 @@ fun PcEditorScreen(
                                                     }
                                                 }
 
-                                                // Draggable Duration Handle ("bolinha" to stretch frame duration)
                                                 if (isCurrentLayer) {
                                                     Box(
                                                         modifier = Modifier
@@ -1961,7 +2247,6 @@ fun PcEditorScreen(
                                 }
                             }
 
-                            // 3. Audio Track Row (Full real PCM waveform envelope "varetinhas")
                             Row(
                                 modifier = Modifier
                                     .height(24.dp)
@@ -2021,7 +2306,6 @@ fun PcEditorScreen(
                                 }
                             }
 
-                            // 4. Video / GIF Track Row
                             Row(
                                 modifier = Modifier
                                     .height(24.dp)
@@ -2060,7 +2344,6 @@ fun PcEditorScreen(
                             }
                         }
 
-                        // 5. Playhead Vertical Needle ("Pinça" line running smoothly through tracks & waveform)
                         val playheadOffset = (tickWidth * playheadTickFloat) + (tickWidth / 2)
                         Box(
                             modifier = Modifier
@@ -2074,443 +2357,452 @@ fun PcEditorScreen(
             }
         }
     }
+}
 
-        // Painel Flutuante de Subcamadas Isoladas por Quadro ("Camadas do Quadro")
-        val currFramePc = uiState.project.frames.getOrNull(uiState.currentFrameIndex)
-        val activeTimelineLayerNamePc = currFramePc?.layers?.getOrNull(uiState.activeLayerIndex)?.name ?: "Camada Principal"
-        FrameLayersFloatingPanel(
-            visible = uiState.isFrameLayersPanelOpen,
-            currentFrameIndex = uiState.currentFrameIndex,
-            localLayers = currFramePc?.localLayers ?: emptyList(),
-            activeLocalLayerIndex = uiState.activeLocalLayerIndex,
-            activeTargetIsFrameLocalLayer = uiState.activeTargetIsFrameLocalLayer,
-            activeTimelineLayerName = activeTimelineLayerNamePc,
-            theme = currentTheme,
-            onClose = { viewModel.closeFrameLayersPanel() },
-            onSelectLocalLayer = { viewModel.selectFrameLocalLayer(it) },
-            onUseTimelineLayerTarget = { viewModel.useTimelineLayerTarget() },
-            onAddLocalLayer = { viewModel.addFrameLocalLayer() },
-            onDeleteLocalLayer = { viewModel.deleteFrameLocalLayer(it) },
-            onRenameLocalLayer = { idx, newName -> viewModel.renameFrameLocalLayer(idx, newName) },
-            onMoveLocalLayerUp = { viewModel.moveFrameLocalLayerUp(it) },
-            onMoveLocalLayerDown = { viewModel.moveFrameLocalLayerDown(it) },
-            onToggleVisibility = { viewModel.toggleFrameLocalLayerVisibility(it) },
-            onToggleLock = { viewModel.toggleFrameLocalLayerLock(it) },
-            onChangeOpacity = { idx, op -> viewModel.setFrameLocalLayerOpacity(idx, op) },
-            onChangeBlendEffect = { idx, eff -> viewModel.setFrameLocalLayerBlendEffect(idx, eff) },
-            onToggleClippingMask = { viewModel.toggleFrameLocalLayerClippingMask(it) },
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = 16.dp)
-        )
+@Composable
+private fun PcEditorDialogsAndModals(
+    uiState: EditorUiState,
+    viewModel: KodanimaViewModel,
+    context: Context,
+    currentTheme: KodanimaTheme,
+    themeMuted: Color,
+    themeBorder: Color,
+    showThemeMenu: Boolean,
+    onDismissThemeMenu: () -> Unit,
+    showMediaImportChoice: Boolean,
+    onDismissMediaImportChoice: () -> Unit,
+    showOnionOpacityDialog: Boolean,
+    onDismissOnionOpacityDialog: () -> Unit,
+    showFpsDialog: Boolean,
+    onDismissFpsDialog: () -> Unit,
+    showDurationDialog: Boolean,
+    onDismissDurationDialog: () -> Unit,
+    onLaunchAudioPicker: () -> Unit,
+    onLaunchVideoPicker: () -> Unit
+) {
+    QuickCopyPasteGestureMenu(
+        visible = uiState.isQuickGestureMenuOpen,
+        theme = currentTheme,
+        hasActiveSelection = uiState.activeSelection.isActive,
+        onDismiss = { viewModel.closeQuickGestureMenu() },
+        onCopySelection = { viewModel.copySelection() },
+        onCutSelection = {
+            viewModel.copySelection()
+            viewModel.deleteSelection()
+        },
+        onPasteSelection = { viewModel.pasteSelection() },
+        onClearLayer = { viewModel.clearActiveLayer() },
+        onUndo = { viewModel.undo() },
+        onRedo = { viewModel.redo() }
+    )
 
-        // Floating Zen Mode Exit Pill (when bars are hidden, tap to restore)
-        if (uiState.isZenModeActive) {
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(12.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .clickable { viewModel.setZenModeActive(false) }
-                    .border(1.dp, adaptiveCyan, RoundedCornerShape(20.dp))
-                    .shadow(8.dp, RoundedCornerShape(20.dp))
-                    .testTag("pc_exit_zen_btn"),
-                color = Color(currentTheme.panel).copy(alpha = 0.92f)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        Icons.Default.FullscreenExit,
-                        contentDescription = "Sair do Modo Foco",
-                        tint = adaptiveCyan,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(5.dp))
-                    Text(
-                        text = "Sair do Foco (TAB)",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = adaptiveCyan
-                    )
+    when (uiState.activeDialog) {
+        EditorDialog.LAYERS -> {
+            LayersBottomSheet(
+                layers = uiState.project.frames[uiState.currentFrameIndex].layers,
+                activeLayerIndex = uiState.activeLayerIndex,
+                mediaAssets = uiState.project.mediaAssets,
+                onSelectLayer = { viewModel.setActiveLayer(it) },
+                onAddLayer = { viewModel.addLayer() },
+                onDeleteActiveLayer = { viewModel.deleteActiveLayer() },
+                onToggleVisibility = { viewModel.toggleLayerVisibility(it) },
+                onToggleLock = { viewModel.toggleLayerLock(it) },
+                onChangeOpacity = { idx, op -> viewModel.setLayerOpacity(idx, op) },
+                onImportAudio = onLaunchAudioPicker,
+                onImportVideo = onLaunchVideoPicker,
+                onRemoveAsset = { viewModel.deleteMediaAsset(it) },
+                onToggleAudioMute = { viewModel.toggleAudioMute(it) },
+                onSetAudioVolume = { id, vol -> viewModel.setAudioVolume(id, vol) },
+                onUpdateAssetOpacity = { id, op -> viewModel.updateSpecialAssetOpacity(id, op) },
+                onUpdateAssetScale = { id, sc -> viewModel.updateSpecialAssetScale(id, sc) },
+                onResetAssetTransform = { viewModel.resetSpecialAssetTransform(it) },
+                onToggleVideoTransformMode = { viewModel.toggleVideoTransformMode() },
+                onMoveLayerUp = { viewModel.moveLayerUp(it) },
+                onMoveLayerDown = { viewModel.moveLayerDown(it) },
+                onAddBucketLayer = { viewModel.addBucketLayer(insertBelowActive = true) },
+                onSelectBucketTargetLayer = { viewModel.setActiveBucketTargetLayer(it) },
+                onToggleBucketReference = { viewModel.toggleTimelineLayerBucketReference(it) },
+                onDismiss = { viewModel.closeDialog() }
+            )
+        }
+        EditorDialog.COLOR_PICKER -> {
+            ColorPickerDialog(
+                initialColor = uiState.currentColor,
+                recentColors = uiState.recentColors,
+                onColorSelected = { newColor ->
+                    viewModel.setColor(newColor, recordToRecents = false)
+                },
+                onDismiss = {
+                    viewModel.recordRecentColor(uiState.currentColor)
+                    viewModel.closeDialog()
                 }
-            }
+            )
         }
-
-        QuickCopyPasteGestureMenu(
-            visible = uiState.isQuickGestureMenuOpen,
-            theme = currentTheme,
-            hasActiveSelection = uiState.activeSelection.isActive,
-            onDismiss = { viewModel.closeQuickGestureMenu() },
-            onCopySelection = { viewModel.copySelection() },
-            onCutSelection = {
-                viewModel.copySelection()
-                viewModel.deleteSelection()
-            },
-            onPasteSelection = { viewModel.pasteSelection() },
-            onClearLayer = { viewModel.clearActiveLayer() },
-            onUndo = { viewModel.undo() },
-            onRedo = { viewModel.redo() }
-        )
-
-        // Dialogs & Overlays
-        when (uiState.activeDialog) {
-            EditorDialog.LAYERS -> {
-                LayersBottomSheet(
-                    layers = uiState.project.frames[uiState.currentFrameIndex].layers,
-                    activeLayerIndex = uiState.activeLayerIndex,
-                    mediaAssets = uiState.project.mediaAssets,
-                    onSelectLayer = { viewModel.setActiveLayer(it) },
-                    onAddLayer = { viewModel.addLayer() },
-                    onDeleteActiveLayer = { viewModel.deleteActiveLayer() },
-                    onToggleVisibility = { viewModel.toggleLayerVisibility(it) },
-                    onToggleLock = { viewModel.toggleLayerLock(it) },
-                    onChangeOpacity = { idx, op -> viewModel.setLayerOpacity(idx, op) },
-                    onImportAudio = { audioPicker.launch("audio/*") },
-                    onImportVideo = { videoPicker.launch("video/*") },
-                    onRemoveAsset = { viewModel.deleteMediaAsset(it) },
-                    onToggleAudioMute = { viewModel.toggleAudioMute(it) },
-                    onSetAudioVolume = { id, vol -> viewModel.setAudioVolume(id, vol) },
-                    onUpdateAssetOpacity = { id, op -> viewModel.updateSpecialAssetOpacity(id, op) },
-                    onUpdateAssetScale = { id, sc -> viewModel.updateSpecialAssetScale(id, sc) },
-                    onResetAssetTransform = { viewModel.resetSpecialAssetTransform(it) },
-                    onToggleVideoTransformMode = { viewModel.toggleVideoTransformMode() },
-                    onDismiss = { viewModel.closeDialog() }
-                )
-            }
-            EditorDialog.COLOR_PICKER -> {
-                ColorPickerDialog(
-                    initialColor = uiState.currentColor,
-                    recentColors = uiState.recentColors,
-                    onColorSelected = { newColor ->
-                        viewModel.setColor(newColor)
-                        viewModel.closeDialog()
-                    },
-                    onDismiss = { viewModel.closeDialog() }
-                )
-            }
-            EditorDialog.PROJECT_SETTINGS -> {
-                ProjectSettingsDialog(
-                    project = uiState.project,
-                    savedCustomResolutions = uiState.preferences.savedCustomResolutions,
-                    onSaveCustomResolution = { n, w, h -> viewModel.saveCustomResolution(n, w, h) },
-                    onDeleteCustomResolution = { viewModel.deleteCustomResolution(it) },
-                    onUpdateProjectName = { viewModel.setProjectName(it) },
-                    onUpdateResolution = { viewModel.setResolution(it) },
-                    onUpdateFps = { viewModel.setFps(it) },
-                    onUpdateOnionSkin = { viewModel.updateOnionSkinSettings(it) },
-                    onClose = { viewModel.closeDialog() }
-                )
-            }
-            EditorDialog.EXPORT -> {
-                ExportDialog(
-                    exportState = uiState.exportState,
-                    onExportMp4 = { viewModel.exportToMp4(context) },
-                    onExportGif = { viewModel.exportToGif(context) },
-                    onExportSpriteSheet = { viewModel.exportToSpriteSheet(context) },
-                    onExportPngFrame = { viewModel.exportCurrentFramePng(context) },
-                    onExportFramePackZip = { viewModel.exportFramePackZip(context) },
-                    onExportProjectFile = { viewModel.exportProjectFile(context) },
-                    onDismissState = { viewModel.dismissExportState() },
-                    onClose = {
-                        viewModel.dismissExportState()
-                        viewModel.closeDialog()
-                    }
-                )
-            }
-            else -> {}
+        EditorDialog.PROJECT_SETTINGS -> {
+            ProjectSettingsDialog(
+                project = uiState.project,
+                savedCustomResolutions = uiState.preferences.savedCustomResolutions,
+                onSaveCustomResolution = { n, w, h -> viewModel.saveCustomResolution(n, w, h) },
+                onDeleteCustomResolution = { viewModel.deleteCustomResolution(it) },
+                onUpdateProjectName = { viewModel.setProjectName(it) },
+                onUpdateResolution = { viewModel.setResolution(it) },
+                onUpdateFps = { viewModel.setFps(it) },
+                onUpdateOnionSkin = { viewModel.updateOnionSkinSettings(it) },
+                onClose = { viewModel.closeDialog() }
+            )
         }
+        EditorDialog.EXPORT -> {
+            ExportDialog(
+                exportState = uiState.exportState,
+                onExportMp4 = { viewModel.exportToMp4(context) },
+                onExportGif = { viewModel.exportToGif(context) },
+                onExportSpriteSheet = { viewModel.exportToSpriteSheet(context) },
+                onExportPngFrame = { viewModel.exportCurrentFramePng(context) },
+                onExportFramePackZip = { viewModel.exportFramePackZip(context) },
+                onExportProjectFile = { viewModel.exportProjectFile(context) },
+                onDismissState = { viewModel.dismissExportState() },
+                onClose = {
+                    viewModel.dismissExportState()
+                    viewModel.closeDialog()
+                },
+                cameraEnabled = uiState.project.camera3D.isEnabled,
+                cameraCropOnly = uiState.exportCameraCropOnly,
+                onToggleCameraCropOnly = { viewModel.setExportCameraCropOnly(it) }
+            )
+        }
+        else -> {}
+    }
 
-        // Quick Theme Selection Dialog
-        if (showThemeMenu) {
-            AlertDialog(
-                onDismissRequest = { showThemeMenu = false },
-                title = { Text("Escolher Tema da Interface") },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        KodanimaTheme.values().forEach { th ->
-                            val isSel = th == currentTheme
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(if (isSel) Color(th.accent).copy(alpha = 0.25f) else Color(th.panel))
-                                    .border(1.dp, if (isSel) Color(th.accent) else themeBorder, RoundedCornerShape(8.dp))
-                                    .clickable {
-                                        viewModel.setTheme(th)
-                                        showThemeMenu = false
-                                    }
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(20.dp)
-                                            .clip(CircleShape)
-                                            .background(Color(th.bg))
-                                            .border(1.5.dp, Color(th.accent), CircleShape)
-                                    )
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Text(
-                                        text = th.namePt,
-                                        fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
-                                        color = Color(th.text)
-                                    )
+    if (showThemeMenu) {
+        AlertDialog(
+            onDismissRequest = onDismissThemeMenu,
+            title = { Text("Escolher Tema da Interface") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    KodanimaTheme.values().forEach { th ->
+                        val isSel = th == currentTheme
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (isSel) Color(th.accent).copy(alpha = 0.25f) else Color(th.panel))
+                                .border(1.dp, if (isSel) Color(th.accent) else themeBorder, RoundedCornerShape(8.dp))
+                                .clickable {
+                                    viewModel.setTheme(th)
+                                    onDismissThemeMenu()
                                 }
-                                if (isSel) {
-                                    Icon(Icons.Default.Check, contentDescription = null, tint = Color(th.accent))
-                                }
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(th.bg))
+                                        .border(1.5.dp, Color(th.accent), CircleShape)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = th.namePt,
+                                    fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                                    color = Color(th.text)
+                                )
+                            }
+                            if (isSel) {
+                                Icon(Icons.Default.Check, contentDescription = null, tint = Color(th.accent))
                             }
                         }
                     }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showThemeMenu = false }) { Text("Fechar") }
                 }
-            )
-        }
+            },
+            confirmButton = {
+                TextButton(onClick = onDismissThemeMenu) { Text("Fechar") }
+            }
+        )
+    }
 
-        // Media Import Choice Modal
-        if (showMediaImportChoice) {
-            AlertDialog(
-                onDismissRequest = { showMediaImportChoice = false },
-                title = { Text("Importar Mídia para a Timeline") },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                showMediaImportChoice = false
-                                audioPicker.launch("audio/*")
-                            },
-                            modifier = Modifier.fillMaxWidth()
+    if (showMediaImportChoice) {
+        AlertDialog(
+            onDismissRequest = onDismissMediaImportChoice,
+            title = { Text("Importar Mídia para a Timeline") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            onDismissMediaImportChoice()
+                            onLaunchAudioPicker()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Audiotrack, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Faixa de Áudio (.mp3, .wav, .aac)")
+                    }
+                    Button(
+                        onClick = {
+                            onDismissMediaImportChoice()
+                            onLaunchVideoPicker()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.VideoFile, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Vídeo ou GIF de Referência")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onDismissMediaImportChoice) { Text("Cancelar") }
+            }
+        )
+    }
+
+    if (showOnionOpacityDialog) {
+        val initialOpacity = remember(showOnionOpacityDialog) { uiState.project.onionSkin.opacity }
+        var sliderVal by remember(showOnionOpacityDialog) { mutableStateOf(initialOpacity) }
+        AlertDialog(
+            onDismissRequest = onDismissOnionOpacityDialog,
+            title = { Text("Opacidade da Camada Cebola") },
+            text = {
+                Column {
+                    Text("Ajuste ao vivo a opacidade dos quadros anteriores e próximos:")
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Slider(
+                        value = sliderVal.coerceIn(0.05f, 1.0f),
+                        onValueChange = {
+                            sliderVal = it
+                            viewModel.setOnionSkinOpacity(it)
+                        },
+                        valueRange = 0.05f..1.0f
+                    )
+                    Text(
+                        text = "${(sliderVal * 100).roundToInt()}%",
+                        fontWeight = FontWeight.Bold,
+                        color = Color(currentTheme.accent)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.setOnionSkinOpacity(sliderVal)
+                    onDismissOnionOpacityDialog()
+                }) {
+                    Text("Confirmar")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    viewModel.setOnionSkinOpacity(initialOpacity)
+                    onDismissOnionOpacityDialog()
+                }) { Text("Cancelar") }
+            }
+        )
+    }
+
+    if (showFpsDialog) {
+        var selectedFps by remember { mutableStateOf(uiState.project.fps) }
+        AlertDialog(
+            onDismissRequest = onDismissFpsDialog,
+            title = { Text("Taxa de Quadros por Segundo (FPS)") },
+            text = {
+                Column {
+                    listOf(12, 24, 30, 60).forEach { fps ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedFps = fps }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Default.Audiotrack, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Faixa de Áudio (.mp3, .wav, .aac)")
-                        }
-                        Button(
-                            onClick = {
-                                showMediaImportChoice = false
-                                videoPicker.launch("video/*")
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Default.VideoFile, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Vídeo ou GIF de Referência")
+                            Text(
+                                text = "$fps FPS",
+                                fontSize = 14.sp,
+                                fontWeight = if (selectedFps == fps) FontWeight.Bold else FontWeight.Normal,
+                                color = if (selectedFps == fps) Color(currentTheme.accent) else Color(currentTheme.text)
+                            )
                         }
                     }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showMediaImportChoice = false }) { Text("Cancelar") }
                 }
-            )
-        }
-
-        // Onion Opacity Dialog (atualiza em tempo real ao arrastar)
-        if (showOnionOpacityDialog) {
-            val initialOpacity = remember(showOnionOpacityDialog) { uiState.project.onionSkin.opacity }
-            var sliderVal by remember(showOnionOpacityDialog) { mutableStateOf(initialOpacity) }
-            AlertDialog(
-                onDismissRequest = { showOnionOpacityDialog = false },
-                title = { Text("Opacidade da Camada Cebola") },
-                text = {
-                    Column {
-                        Text("Ajuste ao vivo a opacidade dos quadros anteriores e próximos:")
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Slider(
-                            value = sliderVal.coerceIn(0.05f, 1.0f),
-                            onValueChange = {
-                                sliderVal = it
-                                viewModel.setOnionSkinOpacity(it)
-                            },
-                            valueRange = 0.05f..1.0f
-                        )
-                        Text(
-                            text = "${(sliderVal * 100).roundToInt()}%",
-                            fontWeight = FontWeight.Bold,
-                            color = Color(currentTheme.accent)
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        viewModel.setOnionSkinOpacity(sliderVal)
-                        showOnionOpacityDialog = false
-                    }) {
-                        Text("Confirmar")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = {
-                        viewModel.setOnionSkinOpacity(initialOpacity)
-                        showOnionOpacityDialog = false
-                    }) { Text("Cancelar") }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.setProjectFps(selectedFps)
+                    onDismissFpsDialog()
+                }) {
+                    Text("Confirmar")
                 }
-            )
-        }
+            }
+        )
+    }
 
-        // FPS Dialog
-        if (showFpsDialog) {
-            var selectedFps by remember { mutableStateOf(uiState.project.fps) }
-            AlertDialog(
-                onDismissRequest = { showFpsDialog = false },
-                title = { Text("Taxa de Quadros por Segundo (FPS)") },
-                text = {
-                    Column {
-                        listOf(12, 24, 30, 60).forEach { fps ->
-                            Row(
+    if (showDurationDialog) {
+        val currHold = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.holdFrames ?: 1
+        var inputHoldText by remember { mutableStateOf(currHold.toString()) }
+        var applyToAll by remember { mutableStateOf(false) }
+        val parsedHold = inputHoldText.toIntOrNull() ?: currHold
+        val calcSec = parsedHold / uiState.project.fps.toFloat()
+
+        AlertDialog(
+            onDismissRequest = onDismissDurationDialog,
+            title = { Text("Duração do Quadro (Hold)") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "Defina a duração do quadro ${uiState.currentFrameIndex + 1} em número de ciclos de renderização (hold):",
+                        fontSize = 12.sp,
+                        color = Color(currentTheme.text).copy(alpha = 0.8f)
+                    )
+
+                    OutlinedTextField(
+                        value = inputHoldText,
+                        onValueChange = { inputHoldText = it.filter { char -> char.isDigit() }.take(3) },
+                        label = { Text("Número de Quadros") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Number
+                        )
+                    )
+
+                    Text(
+                        text = "= ${String.format("%.3f", calcSec)} segundos a ${uiState.project.fps} FPS",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(currentTheme.accent)
+                    )
+
+                    Text(
+                        text = "Predefinições Rápidas:",
+                        fontSize = 11.sp,
+                        color = themeMuted
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(1, 2, 3, 4, 6, 12, 24).forEach { preset ->
+                            Surface(
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { selectedFps = fps }
-                                    .padding(vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(if (parsedHold == preset) Color(currentTheme.accent).copy(alpha = 0.3f) else Color(currentTheme.panel))
+                                    .border(1.dp, if (parsedHold == preset) Color(currentTheme.accent) else themeBorder, RoundedCornerShape(6.dp))
+                                    .clickable { inputHoldText = preset.toString() }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
                             ) {
                                 Text(
-                                    text = "$fps FPS",
-                                    fontSize = 14.sp,
-                                    fontWeight = if (selectedFps == fps) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (selectedFps == fps) Color(currentTheme.accent) else Color(currentTheme.text)
+                                    text = "${preset}q",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (parsedHold == preset) Color(currentTheme.accent) else Color(currentTheme.text)
                                 )
                             }
                         }
                     }
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        viewModel.setProjectFps(selectedFps)
-                        showFpsDialog = false
-                    }) {
-                        Text("Confirmar")
-                    }
-                }
-            )
-        }
 
-        // Frame Hold Duration Typed Input Dialog
-        if (showDurationDialog) {
-            val currHold = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.holdFrames ?: 1
-            var inputHoldText by remember { mutableStateOf(currHold.toString()) }
-            var applyToAll by remember { mutableStateOf(false) }
-            val parsedHold = inputHoldText.toIntOrNull() ?: currHold
-            val calcSec = parsedHold / uiState.project.fps.toFloat()
-
-            AlertDialog(
-                onDismissRequest = { showDurationDialog = false },
-                title = { Text("Duração do Quadro (Hold)") },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text(
-                            text = "Defina a duração do quadro ${uiState.currentFrameIndex + 1} em número de ciclos de renderização (hold):",
-                            fontSize = 12.sp,
-                            color = Color(currentTheme.text).copy(alpha = 0.8f)
-                        )
-
-                        OutlinedTextField(
-                            value = inputHoldText,
-                            onValueChange = { inputHoldText = it.filter { char -> char.isDigit() }.take(3) },
-                            label = { Text("Número de Quadros") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.Number
-                            )
-                        )
-
-                        Text(
-                            text = "= ${String.format("%.3f", calcSec)} segundos a ${uiState.project.fps} FPS",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(currentTheme.accent)
-                        )
-
-                        Text(
-                            text = "Predefinições Rápidas:",
-                            fontSize = 11.sp,
-                            color = themeMuted
-                        )
-
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            listOf(1, 2, 3, 4, 6, 12, 24).forEach { preset ->
-                                Surface(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(if (parsedHold == preset) Color(currentTheme.accent).copy(alpha = 0.3f) else Color(currentTheme.panel))
-                                        .border(1.dp, if (parsedHold == preset) Color(currentTheme.accent) else themeBorder, RoundedCornerShape(6.dp))
-                                        .clickable { inputHoldText = preset.toString() }
-                                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                                ) {
-                                    Text(
-                                        text = "${preset}q",
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (parsedHold == preset) Color(currentTheme.accent) else Color(currentTheme.text)
-                                    )
-                                }
-                            }
-                        }
-
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { applyToAll = !applyToAll }
-                        ) {
-                            Checkbox(
-                                checked = applyToAll,
-                                onCheckedChange = { applyToAll = it }
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Aplicar a todos os quadros da animação",
-                                fontSize = 12.sp,
-                                color = Color(currentTheme.text)
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            val finalHold = parsedHold.coerceIn(1, 300)
-                            if (applyToAll) {
-                                viewModel.setAllFramesHoldDuration(finalHold)
-                                Toast.makeText(context, "Duração de ${finalHold}q aplicada a todos os quadros!", Toast.LENGTH_SHORT).show()
-                            } else {
-                                viewModel.setFrameHoldDuration(uiState.currentFrameIndex, finalHold)
-                                Toast.makeText(context, "Quadro ${uiState.currentFrameIndex + 1}: ${finalHold}q (${String.format("%.3f", finalHold / uiState.project.fps.toFloat())}s)", Toast.LENGTH_SHORT).show()
-                            }
-                            showDurationDialog = false
-                        }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { applyToAll = !applyToAll }
                     ) {
-                        Text("Confirmar")
+                        Checkbox(
+                            checked = applyToAll,
+                            onCheckedChange = { applyToAll = it }
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Aplicar a todos os quadros da animação",
+                            fontSize = 12.sp,
+                            color = Color(currentTheme.text)
+                        )
                     }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showDurationDialog = false }) { Text("Cancelar") }
                 }
-            )
-        }
-
-        ReferenceImageChoiceDialog(
-            pendingUri = uiState.pendingReferenceImageUri,
-            theme = currentTheme,
-            onChooseTimelineLayer = { uri ->
-                viewModel.applyPickedImageAsTimelineLayer(context, uri)
             },
-            onChooseFloatingWindow = { uri ->
-                viewModel.applyPickedImageAsFloatingWindow(context, uri)
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val finalHold = parsedHold.coerceIn(1, 300)
+                        if (applyToAll) {
+                            viewModel.setAllFramesHoldDuration(finalHold)
+                            Toast.makeText(context, "Duração de ${finalHold}q aplicada a todos os quadros!", Toast.LENGTH_SHORT).show()
+                        } else {
+                            viewModel.setFrameHoldDuration(uiState.currentFrameIndex, finalHold)
+                            Toast.makeText(context, "Quadro ${uiState.currentFrameIndex + 1}: ${finalHold}q (${String.format("%.3f", finalHold / uiState.project.fps.toFloat())}s)", Toast.LENGTH_SHORT).show()
+                        }
+                        onDismissDurationDialog()
+                    }
+                ) {
+                    Text("Confirmar")
+                }
             },
-            onDismiss = { viewModel.dismissReferenceImageChoice() }
+            dismissButton = {
+                TextButton(onClick = onDismissDurationDialog) { Text("Cancelar") }
+            }
         )
+    }
+
+    ReferenceImageChoiceDialog(
+        pendingUri = uiState.pendingReferenceImageUri,
+        theme = currentTheme,
+        onChooseTimelineLayer = { uri ->
+            viewModel.applyPickedImageAsTimelineLayer(context, uri)
+        },
+        onChooseFloatingWindow = { uri ->
+            viewModel.applyPickedImageAsFloatingWindow(context, uri)
+        },
+        onDismiss = { viewModel.dismissReferenceImageChoice() }
+    )
+
+    if (uiState.isPaletteTrayOpen) {
+        ColorPaletteTrayModal(
+            paletteConfig = uiState.preferences.colorPalette,
+            currentColor = uiState.currentColor,
+            selectedSlotIndex = uiState.selectedPaletteSlotIndex,
+            theme = currentTheme,
+            onSelectSlot = { viewModel.selectPaletteSlot(it) },
+            onSaveToSlot = { viewModel.saveCurrentColorToPaletteSlot(it) },
+            onRemoveSlot = { viewModel.removePaletteSlot(it) },
+            onRollColorTheoryDice = { viewModel.generateColorTheoryPaletteRow() },
+            onChangeGridSize = { cols, rows -> viewModel.setPaletteGridSize(cols, rows) },
+            onActivateEyedropper = {
+                viewModel.startEyedropperFromPaletteTray()
+            },
+            onOpenColorWheel = {
+                viewModel.openColorWheelFromPaletteTray()
+            },
+            onDismiss = { viewModel.closePaletteTray() }
+        )
+    }
+}
+
+@Composable
+private fun DesktopCustomToolButton(
+    tooltip: String,
+    isSelected: Boolean,
+    accentColor: Color,
+    defaultTint: Color = MaterialTheme.colorScheme.onSurface,
+    onClick: () -> Unit,
+    iconContent: @Composable (Color) -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .size(36.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick),
+        color = if (isSelected) accentColor.copy(alpha = 0.25f) else Color.Transparent,
+        border = androidx.compose.foundation.BorderStroke(
+            width = if (isSelected) 1.5.dp else 0.dp,
+            color = if (isSelected) accentColor else Color.Transparent
+        )
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            iconContent(if (isSelected) accentColor else defaultTint)
+        }
     }
 }
 

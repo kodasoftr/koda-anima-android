@@ -432,4 +432,159 @@ object SelectionGeometryHelper {
             affectedOriginalIds = affectedIds
         )
     }
+
+    /**
+     * Splits strokes according to active selection polarity.
+     * When [isInverted] is false, captures strokes inside [poly].
+     * When [isInverted] is true, protects content inside [poly] and captures everything outside [poly].
+     */
+    fun splitStrokesBySelection(
+        strokes: List<DrawingStroke>,
+        poly: List<StrokePoint>,
+        isInverted: Boolean,
+        boundsWidth: Float = 1920f,
+        boundsHeight: Float = 1080f
+    ): SelectionSplitResult {
+        if (!isInverted) return splitStrokesByPolygon(strokes, poly)
+        if (strokes.isEmpty() || poly.size < 3) {
+            return SelectionSplitResult(emptyList(), emptyList(), emptySet())
+        }
+
+        val polyBounds = computeBounds(poly)
+        val pMinX = polyBounds[0]
+        val pMinY = polyBounds[1]
+        val pMaxX = polyBounds[2]
+        val pMaxY = polyBounds[3]
+
+        val capturedSelected = ArrayList<DrawingStroke>()
+        val stationaryProtected = ArrayList<DrawingStroke>()
+        val affectedIds = LinkedHashSet<String>()
+
+        for (stroke in strokes) {
+            if (stroke.points.isEmpty()) continue
+            if (!stroke.intersects(pMinX - 2f, pMinY - 2f, pMaxX + 2f, pMaxY + 2f)) {
+                // Entire stroke is outside the polygon -> belongs to inverted selection!
+                affectedIds.add(stroke.id)
+                capturedSelected.add(withRecomputedBounds(stroke.copy(id = UUID.randomUUID().toString())))
+                continue
+            }
+
+            if (stroke.tool == ToolType.BUCKET) {
+                val inSpans = ArrayList<StrokePoint>()
+                val outSpans = ArrayList<StrokePoint>()
+                val pairCount = (stroke.points.size / 2) * 2
+                var i = 0
+                while (i < pairCount) {
+                    val p0 = stroke.points[i]
+                    val p1 = stroke.points[i + 1]
+                    val y = p0.y
+                    val left = min(p0.x, p1.x)
+                    val right = max(p0.x, p1.x)
+                    if (y < pMinY || y > pMaxY || right < pMinX || left > pMaxX) {
+                        outSpans.add(p0)
+                        outSpans.add(p1)
+                    } else {
+                        val crossings = computePolygonRowIntersections(y, poly)
+                        val cuts = ArrayList<Float>(crossings.size + 2)
+                        cuts.add(left)
+                        for (cx in crossings) {
+                            if (cx > left + 0.05f && cx < right - 0.05f) cuts.add(cx)
+                        }
+                        cuts.add(right)
+                        for (cIdx in 0 until cuts.lastIndex) {
+                            val sx = cuts[cIdx]
+                            val ex = cuts[cIdx + 1]
+                            if (ex - sx < 0.01f) continue
+                            val midX = (sx + ex) * 0.5f
+                            if (isPointInPolygon(midX, y, poly)) {
+                                inSpans.add(StrokePoint(sx, y, p0.pressure))
+                                inSpans.add(StrokePoint(ex, y, p1.pressure))
+                            } else {
+                                outSpans.add(StrokePoint(sx, y, p0.pressure))
+                                outSpans.add(StrokePoint(ex, y, p1.pressure))
+                            }
+                        }
+                    }
+                    i += 2
+                }
+                if (outSpans.isNotEmpty()) {
+                    affectedIds.add(stroke.id)
+                    capturedSelected.add(
+                        withRecomputedBounds(stroke.copy(id = UUID.randomUUID().toString(), points = outSpans))
+                    )
+                    if (inSpans.isNotEmpty()) {
+                        stationaryProtected.add(
+                            withRecomputedBounds(stroke.copy(id = UUID.randomUUID().toString(), points = inSpans))
+                        )
+                    }
+                }
+                continue
+            }
+
+            if ((stroke.tool == ToolType.RECTANGLE || stroke.tool == ToolType.CIRCLE || stroke.tool == ToolType.LASSO) && stroke.isFilled) {
+                val allInside = stroke.points.isNotEmpty() && stroke.points.all { isPointInPolygon(it.x, it.y, poly) }
+                if (!allInside) {
+                    affectedIds.add(stroke.id)
+                    capturedSelected.add(
+                        stroke.copy(
+                            id = UUID.randomUUID().toString(),
+                            clipPolygon = poly,
+                            clipInverted = true,
+                            clipBoundsWidth = boundsWidth,
+                            clipBoundsHeight = boundsHeight
+                        )
+                    )
+                }
+                continue
+            }
+
+            val sourcePts = when (stroke.tool) {
+                ToolType.LINE, ToolType.RECTANGLE, ToolType.CIRCLE -> expandShapeOutlineToPolyline(stroke)
+                else -> stroke.points
+            }
+            val effectiveTool = when (stroke.tool) {
+                ToolType.LINE, ToolType.RECTANGLE, ToolType.CIRCLE -> ToolType.PEN
+                else -> stroke.tool
+            }
+
+            val (insideRuns, outsideRuns) = clipPolylineByPolygon(sourcePts, poly)
+            if (outsideRuns.isEmpty()) {
+                continue
+            }
+
+            affectedIds.add(stroke.id)
+            if (insideRuns.isEmpty() && stroke.tool !in listOf(ToolType.LINE, ToolType.RECTANGLE, ToolType.CIRCLE)) {
+                capturedSelected.add(withRecomputedBounds(stroke.copy(id = UUID.randomUUID().toString())))
+            } else {
+                for (run in outsideRuns) {
+                    capturedSelected.add(
+                        withRecomputedBounds(
+                            stroke.copy(
+                                id = UUID.randomUUID().toString(),
+                                tool = effectiveTool,
+                                points = run
+                            )
+                        )
+                    )
+                }
+                for (run in insideRuns) {
+                    stationaryProtected.add(
+                        withRecomputedBounds(
+                            stroke.copy(
+                                id = UUID.randomUUID().toString(),
+                                tool = effectiveTool,
+                                points = run
+                            )
+                        )
+                    )
+                }
+            }
+        }
+
+        return SelectionSplitResult(
+            capturedInside = capturedSelected,
+            stationaryOutside = stationaryProtected,
+            affectedOriginalIds = affectedIds
+        )
+    }
 }

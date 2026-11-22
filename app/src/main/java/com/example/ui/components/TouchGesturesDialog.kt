@@ -10,12 +10,15 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -99,18 +102,27 @@ fun TouchGesturesDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
-        Surface(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 20.dp)
-                .heightIn(max = 600.dp)
-                .testTag("touch_gestures_dialog"),
-            shape = RoundedCornerShape(22.dp),
-            color = colorScheme.surface,
-            border = BorderStroke(1.5.dp, colorScheme.primary.copy(alpha = 0.65f)),
-            tonalElevation = 10.dp
+                .navigationBarsPadding()
+                .imePadding()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            contentAlignment = Alignment.Center
         ) {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            val maxDialogH = (maxHeight - 8.dp).coerceIn(220.dp, 620.dp)
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 580.dp)
+                    .heightIn(max = maxDialogH)
+                    .testTag("touch_gestures_dialog"),
+                shape = RoundedCornerShape(22.dp),
+                color = colorScheme.surface,
+                border = BorderStroke(1.5.dp, colorScheme.primary.copy(alpha = 0.65f)),
+                tonalElevation = 10.dp
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -304,6 +316,7 @@ fun TouchGesturesDialog(
             }
         }
     }
+}
 }
 
 /**

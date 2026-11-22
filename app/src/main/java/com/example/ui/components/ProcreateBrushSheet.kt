@@ -11,6 +11,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,12 +25,18 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Category
+import androidx.compose.material.icons.filled.Circle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.HorizontalRule
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Slider
@@ -60,6 +67,7 @@ import androidx.compose.ui.unit.sp
 import com.example.model.BrushPreset
 import com.example.model.KodanimaTheme
 import com.example.model.KritaBrushEngineKind
+import com.example.model.ToolType
 import com.example.ui.theme.NeonPink
 import kotlin.math.sin
 
@@ -224,9 +232,13 @@ fun ProcreateBrushPickerSheet(
     onRequestImportKrita: () -> Unit,
     onDeleteImportedBrush: (Int) -> Unit,
     onDismiss: () -> Unit,
+    onOpenBrushStudio: (() -> Unit)? = null,
+    selectedTool: ToolType = ToolType.BRUSH,
+    onSelectTool: ((ToolType) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var showImportedLibrary by remember { mutableStateOf(false) }
+    var showReadyShapesRow by remember { mutableStateOf(false) }
 
     AnimatedVisibility(
         visible = visible,
@@ -241,11 +253,17 @@ fun ProcreateBrushPickerSheet(
         val bgColor = Color(theme.bg)
 
         val displayList = if (showImportedLibrary) importedBrushes else BrushPreset.ALL_12_PRESETS
+        val readyShapeTools = listOf(
+            Triple(ToolType.LINE, Icons.Default.HorizontalRule, "Linha"),
+            Triple(ToolType.RECTANGLE, Icons.Default.CropSquare, "Retângulo"),
+            Triple(ToolType.CIRCLE, Icons.Default.Circle, "Círculo")
+        )
+        val isShapeSelected = selectedTool in listOf(ToolType.LINE, ToolType.RECTANGLE, ToolType.CIRCLE)
 
         Surface(
             modifier = Modifier
-                .fillMaxWidth(0.88f)
-                .heightIn(max = 430.dp)
+                .fillMaxWidth(0.92f)
+                .heightIn(max = 460.dp)
                 .border(1.5.dp, accentColor.copy(alpha = 0.55f), RoundedCornerShape(18.dp))
                 .testTag("procreate_brush_picker"),
             color = panelColor.copy(alpha = 0.97f),
@@ -253,7 +271,7 @@ fun ProcreateBrushPickerSheet(
             shadowElevation = 16.dp
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
-                // Header: Library Title + 3-Wheels Switcher (Native 12 <-> Imported .kpp) + Import Button
+                // Title & Close Row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -274,55 +292,152 @@ fun ProcreateBrushPickerSheet(
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+                    IconButton(onClick = onDismiss, modifier = Modifier.size(34.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = "Fechar Pincéis", tint = textColor.copy(alpha = 0.7f), modifier = Modifier.size(18.dp))
+                    }
+                }
 
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                Spacer(modifier = Modifier.height(6.dp))
+
+                // Action Row: [+ Importar] [Config. Brush] [Ferr. Prontas] [3 Rodas]
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        modifier = Modifier
+                            .heightIn(min = 34.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .border(1.dp, secondaryAccent.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+                            .clickable { onRequestImportKrita() }
+                            .testTag("mobile_import_krita_button"),
+                        color = secondaryAccent.copy(alpha = 0.14f)
                     ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = "Importar Krita", tint = secondaryAccent, modifier = Modifier.size(14.dp))
+                            Text("Importar", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = secondaryAccent)
+                        }
+                    }
+
+                    if (onOpenBrushStudio != null) {
                         Surface(
                             modifier = Modifier
-                                .heightIn(min = 36.dp)
+                                .heightIn(min = 34.dp)
                                 .clip(RoundedCornerShape(10.dp))
-                                .border(1.dp, secondaryAccent.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
-                                .clickable { onRequestImportKrita() }
-                                .testTag("mobile_import_krita_button"),
-                            color = secondaryAccent.copy(alpha = 0.14f)
+                                .border(1.dp, accentColor.copy(alpha = 0.65f), RoundedCornerShape(10.dp))
+                                .clickable {
+                                    onDismiss()
+                                    onOpenBrushStudio()
+                                }
+                                .testTag("mobile_brush_studio_btn"),
+                            color = accentColor.copy(alpha = 0.15f)
                         ) {
                             Row(
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                Icon(Icons.Default.Add, contentDescription = "Importar Krita", tint = secondaryAccent, modifier = Modifier.size(14.dp))
-                                Text("Importar", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = secondaryAccent)
+                                Icon(Icons.Default.Tune, contentDescription = "Configuração de Brush", tint = accentColor, modifier = Modifier.size(14.dp))
+                                Text("Config. Brush", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = accentColor)
                             }
                         }
+                    }
 
-                        // 3-Wheels Toggle between Native 12 and Imported Krita
+                    if (onSelectTool != null) {
                         Surface(
                             modifier = Modifier
-                                .size(38.dp)
+                                .heightIn(min = 34.dp)
                                 .clip(RoundedCornerShape(10.dp))
                                 .border(
-                                    1.2.dp,
-                                    if (showImportedLibrary) NeonPink else accentColor,
+                                    1.dp,
+                                    if (showReadyShapesRow || isShapeSelected) accentColor else textColor.copy(alpha = 0.25f),
                                     RoundedCornerShape(10.dp)
                                 )
-                                .clickable { showImportedLibrary = !showImportedLibrary }
-                                .testTag("mobile_three_wheels_brush_switch"),
-                            color = if (showImportedLibrary) NeonPink.copy(alpha = 0.22f) else bgColor.copy(alpha = 0.7f)
+                                .clickable { showReadyShapesRow = !showReadyShapesRow }
+                                .testTag("mobile_ready_shapes_btn"),
+                            color = if (showReadyShapesRow || isShapeSelected) accentColor.copy(alpha = 0.22f) else bgColor.copy(alpha = 0.5f)
                         ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                ThreeWheelsIcon(
-                                    tint = textColor,
-                                    accentColor = if (showImportedLibrary) NeonPink else accentColor,
-                                    size = 20.dp
-                                )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(Icons.Default.Category, contentDescription = "Ferramentas Prontas", tint = if (isShapeSelected) accentColor else textColor, modifier = Modifier.size(14.dp))
+                                Text("Ferr. Prontas", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = if (isShapeSelected) accentColor else textColor)
                             }
                         }
+                    }
 
-                        IconButton(onClick = onDismiss, modifier = Modifier.size(34.dp)) {
-                            Icon(Icons.Default.Close, contentDescription = "Fechar Pincéis", tint = textColor.copy(alpha = 0.7f), modifier = Modifier.size(18.dp))
+                    // 3-Wheels Toggle between Native 12 and Imported Krita
+                    Surface(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .border(
+                                1.2.dp,
+                                if (showImportedLibrary) NeonPink else accentColor,
+                                RoundedCornerShape(10.dp)
+                            )
+                            .clickable { showImportedLibrary = !showImportedLibrary }
+                            .testTag("mobile_three_wheels_brush_switch"),
+                        color = if (showImportedLibrary) NeonPink.copy(alpha = 0.22f) else bgColor.copy(alpha = 0.7f)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            ThreeWheelsIcon(
+                                tint = textColor,
+                                accentColor = if (showImportedLibrary) NeonPink else accentColor,
+                                size = 18.dp
+                            )
+                        }
+                    }
+                }
+
+                if (showReadyShapesRow && onSelectTool != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(bgColor.copy(alpha = 0.55f))
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        readyShapeTools.forEach { (shapeTool, shapeIcon, shapeLabel) ->
+                            val isActiveShape = selectedTool == shapeTool
+                            Surface(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .border(
+                                        1.dp,
+                                        if (isActiveShape) accentColor else textColor.copy(alpha = 0.18f),
+                                        RoundedCornerShape(8.dp)
+                                    )
+                                    .clickable {
+                                        onSelectTool(shapeTool)
+                                        onDismiss()
+                                    }
+                                    .testTag("tool_${shapeTool.name.lowercase()}"),
+                                color = if (isActiveShape) accentColor.copy(alpha = 0.24f) else Color.Transparent
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.Center,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(shapeIcon, contentDescription = shapeLabel, tint = if (isActiveShape) accentColor else textColor, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(shapeLabel, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = if (isActiveShape) accentColor else textColor)
+                                }
+                            }
                         }
                     }
                 }

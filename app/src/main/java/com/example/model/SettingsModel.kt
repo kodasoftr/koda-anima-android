@@ -146,7 +146,21 @@ enum class ShortcutAction(
     SAVE_PROJECT("Salvar Projeto", "Edição & Arquivo", KeyEvent.KEYCODE_S, defaultCtrl = true),
     TOGGLE_ZEN("Modo Foco / Ocultar Barras", "Visualização", KeyEvent.KEYCODE_TAB),
     TOGGLE_FRAME_LAYERS("Camadas do Quadro Atual", "Visualização", KeyEvent.KEYCODE_F7),
-    OPEN_EXPORT("Exportar / Renderizar", "Edição & Arquivo", KeyEvent.KEYCODE_F12)
+    TOGGLE_QUICK_PALETTE("Palheta Rápida Flutuante", "Visualização", KeyEvent.KEYCODE_Q),
+    OPEN_EXPORT("Exportar / Renderizar", "Edição & Arquivo", KeyEvent.KEYCODE_F12),
+
+    CAMERA_TOGGLE_MODE("Alternar Câmera 2D / 3D", "Câmera 2D & 3D", KeyEvent.KEYCODE_K),
+    CAMERA_ADD_KEYFRAME("Inserir Keyframe de Câmera", "Câmera 2D & 3D", KeyEvent.KEYCODE_I, defaultShift = true),
+    CAMERA_TOGGLE_AUTO_INTERP("Auto-Interpolar Keyframes", "Câmera 2D & 3D", KeyEvent.KEYCODE_T),
+    CAMERA_TOGGLE_3D_VIEW("Alternar Palco Estúdio 3D", "Câmera 2D & 3D", KeyEvent.KEYCODE_0),
+    CAMERA_PAN_TOOL("Ferramenta Mover Câmera", "Câmera 2D & 3D", KeyEvent.KEYCODE_H),
+    CAMERA_ROTATE_LEFT("Girar Câmera -5°", "Câmera 2D & 3D", KeyEvent.KEYCODE_COMMA),
+    CAMERA_ROTATE_RIGHT("Girar Câmera +5°", "Câmera 2D & 3D", KeyEvent.KEYCODE_PERIOD),
+    CAMERA_ZOOM_IN("Aproximar Câmera (Zoom +)", "Câmera 2D & 3D", KeyEvent.KEYCODE_EQUALS),
+    CAMERA_ZOOM_OUT("Afastar Câmera (Zoom -)", "Câmera 2D & 3D", KeyEvent.KEYCODE_MINUS),
+    CAMERA_FOV_WIDE("Aumentar FOV / Lente Aberta", "Câmera 2D & 3D", KeyEvent.KEYCODE_1),
+    CAMERA_FOV_TELE("Reduzir FOV / Teleobjetiva", "Câmera 2D & 3D", KeyEvent.KEYCODE_2),
+    CAMERA_RESET("Zerar Posição da Câmera", "Câmera 2D & 3D", KeyEvent.KEYCODE_R)
 }
 
 data class KeyboardShortcutBinding(
@@ -205,7 +219,14 @@ object ShortcutRegistry {
         KeyEvent.KEYCODE_W to "W",
         KeyEvent.KEYCODE_X to "X",
         KeyEvent.KEYCODE_Y to "Y",
-        KeyEvent.KEYCODE_Z to "Z"
+        KeyEvent.KEYCODE_Z to "Z",
+        KeyEvent.KEYCODE_EQUALS to "+",
+        KeyEvent.KEYCODE_MINUS to "-",
+        KeyEvent.KEYCODE_COMMA to ",",
+        KeyEvent.KEYCODE_PERIOD to ".",
+        KeyEvent.KEYCODE_0 to "0",
+        KeyEvent.KEYCODE_1 to "1",
+        KeyEvent.KEYCODE_2 to "2"
     )
 
     fun keyCodeDisplayName(keyCode: Int): String {
@@ -221,6 +242,10 @@ object ShortcutRegistry {
             KeyEvent.KEYCODE_DPAD_DOWN -> "↓"
             KeyEvent.KEYCODE_LEFT_BRACKET -> "["
             KeyEvent.KEYCODE_RIGHT_BRACKET -> "]"
+            KeyEvent.KEYCODE_EQUALS -> "+"
+            KeyEvent.KEYCODE_MINUS -> "-"
+            KeyEvent.KEYCODE_COMMA -> ","
+            KeyEvent.KEYCODE_PERIOD -> "."
             KeyEvent.KEYCODE_ESCAPE -> "Esc"
             KeyEvent.KEYCODE_F7 -> "F7"
             KeyEvent.KEYCODE_F12 -> "F12"
@@ -268,9 +293,14 @@ enum class MultiFingerGesture(
         "Toque rápido simultâneo com 3 dedos no canvas",
         GestureAction.REDO
     ),
+    THREE_FINGER_SWIPE_UP(
+        "Deslizar 3 dedos para cima",
+        "Arraste 3 dedos para cima no canvas (entra/sai do Modo Foco)",
+        GestureAction.TOGGLE_ZEN_FULLSCREEN
+    ),
     THREE_FINGER_SWIPE_DOWN(
         "Deslizar 3 dedos para baixo",
-        "Arraste 3 dedos para baixo no canvas (estilo Procreate)",
+        "Arraste 3 dedos para baixo no canvas (menu rápido)",
         GestureAction.COPY_PASTE_MENU
     ),
     THREE_FINGER_SWIPE_LEFT(
@@ -293,6 +323,17 @@ enum class MultiFingerGesture(
 object TouchGestureRegistry {
     fun defaultMap(): Map<MultiFingerGesture, GestureAction> =
         MultiFingerGesture.entries.associateWith { it.defaultAction }
+}
+
+data class ColorPaletteConfig(
+    val cols: Int = 6,
+    val rows: Int = 3,
+    val swatches: List<Long> = listOf(
+        0xFF000000L, 0xFFFFFFFFL, 0xFFFF3366L, 0xFFFF9100L, 0xFFFFD600L, 0xFF00E676L,
+        0xFF00D2FFL, 0xFF3E63B3L, 0xFF987EDCL, 0xFFE26CA8L, 0xFF8D6E63L, 0xFF607D8BL
+    )
+) {
+    val maxSlots: Int get() = (cols.coerceIn(2, 12) * rows.coerceIn(1, 8))
 }
 
 data class AppPreferences(
@@ -319,7 +360,9 @@ data class AppPreferences(
     val zenModeSettings: ZenModeSettings = ZenModeSettings(), // Escolha de quais barras somem ao apertar TAB
     val keyboardShortcuts: Map<ShortcutAction, KeyboardShortcutBinding> = ShortcutRegistry.defaultMap(),
     val touchGestures: Map<MultiFingerGesture, GestureAction> = TouchGestureRegistry.defaultMap(),
-    val savedCustomResolutions: List<com.example.model.ProjectResolution> = emptyList()
+    val savedCustomResolutions: List<com.example.model.ProjectResolution> = emptyList(),
+    val colorPalette: ColorPaletteConfig = ColorPaletteConfig(),
+    val savedCameraTemplates: List<com.example.model.CameraPresetTemplate> = emptyList()
 )
 
 data class ZenModeSettings(

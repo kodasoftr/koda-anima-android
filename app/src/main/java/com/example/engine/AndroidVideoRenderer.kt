@@ -29,10 +29,12 @@ object AndroidVideoRenderer {
     suspend fun renderToMp4(
         context: Context,
         project: AnimationProject,
+        cropToCamera: Boolean = true,
         onProgress: (Float, String) -> Unit
     ): File = withContext(KodanimaDispatchers.backgroundRender) {
-        var width = project.resolution.width
-        var height = project.resolution.height
+        val useCameraCrop = cropToCamera && project.camera3D.isEnabled
+        var width = if (useCameraCrop) project.camera3D.captureWidth else project.resolution.width
+        var height = if (useCameraCrop) project.camera3D.captureHeight else project.resolution.height
         if (width % 2 != 0) width -= 1
         if (height % 2 != 0) height -= 1
         width = max(160, min(1920, width))
@@ -115,7 +117,27 @@ object AndroidVideoRenderer {
                     "Codificando quadro ${i + 1}/$totalFrames via hardware GPU..."
                 )
 
-                KodanimaGraphicsEngine.drawFrameToBitmap(frame, pooledFrameBitmap, Color.WHITE, clearBitmap = true)
+                if (useCameraCrop || project.camera3D.postEffects.hasAnyEffect()) {
+                    Camera3DEngine.renderFrameWithCameraAndEffects(
+                        frame = frame,
+                        settings = project.camera3D,
+                        frameIndex = i,
+                        projectWidth = project.resolution.width,
+                        projectHeight = project.resolution.height,
+                        targetBitmap = pooledFrameBitmap,
+                        cropToCamera = useCameraCrop,
+                        background = project.canvasBackground,
+                        renderTransparentAsSky = true
+                    )
+                } else {
+                    KodanimaGraphicsEngine.drawFrameToBitmap(
+                        frame = frame,
+                        targetBitmap = pooledFrameBitmap,
+                        clearBitmap = true,
+                        background = project.canvasBackground,
+                        drawSkyWhenTransparent = true
+                    )
+                }
 
                 repeat(max(1, frame.holdFrames)) {
                     drainEncoder(false)
@@ -153,15 +175,17 @@ object AndroidVideoRenderer {
     suspend fun exportFramePackZip(
         context: Context,
         project: AnimationProject,
+        cropToCamera: Boolean = true,
         onProgress: (Float, String) -> Unit
     ): File = withContext(KodanimaDispatchers.backgroundRender) {
         val exportDir = File(context.cacheDir, "exports").apply { if (!exists()) mkdirs() }
         val zipFile = File(exportDir, "${project.name.replace(" ", "_")}_quadros_png.zip")
         if (zipFile.exists()) zipFile.delete()
 
-        val w = project.resolution.width
-        val h = project.resolution.height
-        val scratchBmp = KodanimaBitmapPool.acquire(w, h, Bitmap.Config.ARGB_8888, Color.WHITE)
+        val useCameraCrop = cropToCamera && project.camera3D.isEnabled
+        val w = if (useCameraCrop) project.camera3D.captureWidth.coerceIn(160, 4096) else project.resolution.width
+        val h = if (useCameraCrop) project.camera3D.captureHeight.coerceIn(160, 4096) else project.resolution.height
+        val scratchBmp = KodanimaBitmapPool.acquire(w, h, Bitmap.Config.ARGB_8888, Color.TRANSPARENT)
 
         try {
             ZipOutputStream(FileOutputStream(zipFile)).use { zipOut ->
@@ -169,7 +193,27 @@ object AndroidVideoRenderer {
                 for (i in project.frames.indices) {
                     onProgress(0.1f + 0.8f * (i.toFloat() / total), "Compactando quadro ${i + 1}/$total...")
                     val frame = project.frames[i]
-                    KodanimaGraphicsEngine.drawFrameToBitmap(frame, scratchBmp, Color.WHITE, clearBitmap = true)
+                    if (useCameraCrop || project.camera3D.postEffects.hasAnyEffect()) {
+                        Camera3DEngine.renderFrameWithCameraAndEffects(
+                            frame = frame,
+                            settings = project.camera3D,
+                            frameIndex = i,
+                            projectWidth = project.resolution.width,
+                            projectHeight = project.resolution.height,
+                            targetBitmap = scratchBmp,
+                            cropToCamera = useCameraCrop,
+                            background = project.canvasBackground,
+                            renderTransparentAsSky = false
+                        )
+                    } else {
+                        KodanimaGraphicsEngine.drawFrameToBitmap(
+                            frame = frame,
+                            targetBitmap = scratchBmp,
+                            clearBitmap = true,
+                            background = project.canvasBackground,
+                            drawSkyWhenTransparent = false
+                        )
+                    }
                     val entryName = String.format("frame_%06d.png", i + 1)
                     zipOut.putNextEntry(ZipEntry(entryName))
                     scratchBmp.compress(Bitmap.CompressFormat.PNG, 100, zipOut)

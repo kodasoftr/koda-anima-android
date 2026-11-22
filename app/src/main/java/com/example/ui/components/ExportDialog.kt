@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -32,6 +33,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -59,7 +61,10 @@ fun ExportDialog(
     onExportFramePackZip: (() -> Unit)? = null,
     onExportProjectFile: () -> Unit,
     onDismissState: () -> Unit,
-    onClose: () -> Unit
+    onClose: () -> Unit,
+    cameraEnabled: Boolean = false,
+    cameraCropOnly: Boolean = true,
+    onToggleCameraCropOnly: ((Boolean) -> Unit)? = null
 ) {
     Dialog(onDismissRequest = onClose) {
         Card(
@@ -93,7 +98,66 @@ fun ExportDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                if (onToggleCameraCropOnly != null) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(
+                                1.dp,
+                                if (cameraCropOnly) MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)
+                                else MaterialTheme.colorScheme.outlineVariant,
+                                RoundedCornerShape(12.dp)
+                            ),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Videocam,
+                                    contentDescription = null,
+                                    tint = if (cameraCropOnly) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Column {
+                                    Text(
+                                        text = "Considerar apenas o que está dentro da câmera (2D/3D)",
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = if (cameraCropOnly) {
+                                            if (cameraEnabled) "Renderiza somente o enquadramento ativo da câmera" else "Ative a câmera para recortar pelo quadro de captura"
+                                        } else {
+                                            "Exporta o quadro completo do canvas ignorando o recorte da câmera"
+                                        },
+                                        fontSize = 9.5.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            Switch(
+                                checked = cameraCropOnly,
+                                onCheckedChange = onToggleCameraCropOnly,
+                                modifier = Modifier.testTag("export_camera_crop_switch")
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
 
                 when (exportState) {
                     is ExportState.Progress -> {

@@ -342,6 +342,16 @@ fun FloatingReferenceImageSurface(
             Modifier
         }
 
+        val borderModifier = if (refState.isLocked && !refState.renderAboveCanvas) {
+            Modifier
+        } else {
+            Modifier.border(
+                width = if (refState.isLocked) 1.dp else 1.6.dp,
+                color = if (refState.isLocked) Color.Gray.copy(alpha = 0.5f) else accentColor,
+                shape = RoundedCornerShape(10.dp)
+            )
+        }
+
         Box(
             modifier = Modifier
                 .graphicsLayer(
@@ -354,12 +364,8 @@ fun FloatingReferenceImageSurface(
                 )
                 .sizeIn(minWidth = 80.dp, minHeight = 80.dp, maxWidth = 250.dp, maxHeight = 250.dp)
                 .clip(RoundedCornerShape(10.dp))
-                .background(Color.Black.copy(alpha = 0.25f))
-                .border(
-                    width = if (refState.isLocked) 1.dp else 1.6.dp,
-                    color = if (refState.isLocked) Color.Gray.copy(alpha = 0.7f) else accentColor,
-                    shape = RoundedCornerShape(10.dp)
-                )
+                .background(if (refState.isLocked) Color.Transparent else Color.Black.copy(alpha = 0.16f))
+                .then(borderModifier)
                 .then(interactiveModifier)
                 .testTag("floating_reference_window"),
             contentAlignment = Alignment.Center
@@ -368,7 +374,7 @@ fun FloatingReferenceImageSurface(
                 bitmap = imageBitmap,
                 contentDescription = "Janela flutuante de referência",
                 contentScale = ContentScale.Fit,
-                modifier = Modifier.padding(3.dp)
+                modifier = Modifier.padding(if (refState.isLocked) 0.dp else 3.dp)
             )
         }
     }
@@ -385,8 +391,10 @@ fun FloatingReferenceControlsBar(
     onToggleLock: () -> Unit,
     onToggleZOrder: () -> Unit,
     onChangeOpacity: (Float) -> Unit,
-    onZoomStep: (Float) -> Unit,
-    onRotateStep: (Float) -> Unit,
+    onZoomStep: (Float) -> Unit = {},
+    onRotateStep: (Float) -> Unit = {},
+    onScaleChange: ((Float) -> Unit)? = null,
+    onRotationChange: ((Float) -> Unit)? = null,
     onResetTransform: () -> Unit,
     onDeleteWindow: () -> Unit,
     modifier: Modifier = Modifier
@@ -396,7 +404,8 @@ fun FloatingReferenceControlsBar(
     val panelColor = Color(theme.panel)
     val accentColor = Color(theme.accent)
     val textColor = Color(theme.text)
-    var showOpacitySlider by remember { mutableStateOf(false) }
+    // 0 = fechado, 1 = Opacidade, 2 = Escala, 3 = Rotação
+    var activeSliderTab by remember { mutableStateOf(0) }
 
     Column(
         modifier = modifier,
@@ -452,8 +461,8 @@ fun FloatingReferenceControlsBar(
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(7.dp))
-                        .background(if (showOpacitySlider) accentColor.copy(alpha = 0.22f) else textColor.copy(alpha = 0.1f))
-                        .clickable { showOpacitySlider = !showOpacitySlider }
+                        .background(if (activeSliderTab == 1) accentColor.copy(alpha = 0.22f) else textColor.copy(alpha = 0.1f))
+                        .clickable { activeSliderTab = if (activeSliderTab == 1) 0 else 1 }
                         .padding(horizontal = 6.dp, vertical = 4.dp)
                         .testTag("floating_ref_opacity_toggle")
                 ) {
@@ -461,22 +470,40 @@ fun FloatingReferenceControlsBar(
                         text = "Op ${(refState.opacity * 100).roundToInt()}%",
                         fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
-                        color = if (showOpacitySlider) accentColor else textColor
+                        color = if (activeSliderTab == 1) accentColor else textColor
                     )
                 }
 
                 if (!refState.isLocked) {
-                    IconButton(onClick = { onZoomStep(-0.15f) }, modifier = Modifier.size(24.dp)) {
-                        Icon(Icons.Default.ZoomOut, contentDescription = "Diminuir referência", tint = textColor, modifier = Modifier.size(14.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(if (activeSliderTab == 2) accentColor.copy(alpha = 0.22f) else textColor.copy(alpha = 0.1f))
+                            .clickable { activeSliderTab = if (activeSliderTab == 2) 0 else 2 }
+                            .padding(horizontal = 6.dp, vertical = 4.dp)
+                            .testTag("floating_ref_scale_toggle")
+                    ) {
+                        Text(
+                            text = "Esc ${(refState.scale * 100).roundToInt()}%",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (activeSliderTab == 2) accentColor else textColor
+                        )
                     }
-                    IconButton(onClick = { onZoomStep(0.15f) }, modifier = Modifier.size(24.dp)) {
-                        Icon(Icons.Default.ZoomIn, contentDescription = "Ampliar referência", tint = textColor, modifier = Modifier.size(14.dp))
-                    }
-                    IconButton(onClick = { onRotateStep(-15f) }, modifier = Modifier.size(24.dp)) {
-                        Icon(Icons.AutoMirrored.Filled.RotateLeft, contentDescription = "Girar referência -15°", tint = textColor, modifier = Modifier.size(14.dp))
-                    }
-                    IconButton(onClick = { onRotateStep(15f) }, modifier = Modifier.size(24.dp)) {
-                        Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = "Girar referência +15°", tint = textColor, modifier = Modifier.size(14.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(if (activeSliderTab == 3) accentColor.copy(alpha = 0.22f) else textColor.copy(alpha = 0.1f))
+                            .clickable { activeSliderTab = if (activeSliderTab == 3) 0 else 3 }
+                            .padding(horizontal = 6.dp, vertical = 4.dp)
+                            .testTag("floating_ref_rotation_toggle")
+                    ) {
+                        Text(
+                            text = "Rot ${refState.rotationDegrees.roundToInt()}°",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (activeSliderTab == 3) accentColor else textColor
+                        )
                     }
                     IconButton(onClick = onResetTransform, modifier = Modifier.size(24.dp)) {
                         Icon(Icons.Default.RestartAlt, contentDescription = "Resetar janela", tint = textColor, modifier = Modifier.size(14.dp))
@@ -494,40 +521,101 @@ fun FloatingReferenceControlsBar(
             }
         }
 
-        if (showOpacitySlider) {
+        val showSlider = activeSliderTab == 1 || (!refState.isLocked && (activeSliderTab == 2 || activeSliderTab == 3))
+        if (showSlider) {
             Surface(
                 modifier = Modifier
-                    .widthIn(min = 210.dp, max = 270.dp)
+                    .widthIn(min = 230.dp, max = 300.dp)
                     .border(1.dp, accentColor.copy(alpha = 0.45f), RoundedCornerShape(10.dp)),
                 color = panelColor.copy(alpha = 0.95f),
                 shape = RoundedCornerShape(10.dp),
                 shadowElevation = 6.dp
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("Opacidade", fontSize = 10.sp, color = textColor)
-                    Slider(
-                        value = refState.opacity.coerceIn(0.08f, 1.0f),
-                        onValueChange = onChangeOpacity,
-                        valueRange = 0.08f..1.0f,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(22.dp)
-                            .testTag("floating_ref_opacity_slider"),
-                        colors = SliderDefaults.colors(
-                            thumbColor = accentColor,
-                            activeTrackColor = accentColor
-                        )
-                    )
-                    Text(
-                        "${(refState.opacity * 100).roundToInt()}%",
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = accentColor
-                    )
+                    when (activeSliderTab) {
+                        1 -> {
+                            Text("Opacidade", fontSize = 10.sp, color = textColor)
+                            Slider(
+                                value = refState.opacity.coerceIn(0.08f, 1.0f),
+                                onValueChange = onChangeOpacity,
+                                valueRange = 0.08f..1.0f,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(22.dp)
+                                    .testTag("floating_ref_opacity_slider"),
+                                colors = SliderDefaults.colors(
+                                    thumbColor = accentColor,
+                                    activeTrackColor = accentColor
+                                )
+                            )
+                            Text(
+                                "${(refState.opacity * 100).roundToInt()}%",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = accentColor
+                            )
+                        }
+                        2 -> {
+                            Text("Escala", fontSize = 10.sp, color = textColor)
+                            Slider(
+                                value = refState.scale.coerceIn(0.2f, 5.0f),
+                                onValueChange = { newScale ->
+                                    if (onScaleChange != null) {
+                                        onScaleChange(newScale)
+                                    } else {
+                                        onZoomStep(newScale - refState.scale)
+                                    }
+                                },
+                                valueRange = 0.2f..5.0f,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(22.dp)
+                                    .testTag("floating_ref_scale_slider"),
+                                colors = SliderDefaults.colors(
+                                    thumbColor = accentColor,
+                                    activeTrackColor = accentColor
+                                )
+                            )
+                            Text(
+                                "${(refState.scale * 100).roundToInt()}%",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = accentColor
+                            )
+                        }
+                        3 -> {
+                            Text("Rotação", fontSize = 10.sp, color = textColor)
+                            Slider(
+                                value = refState.rotationDegrees.coerceIn(-180f, 180f),
+                                onValueChange = { newRot ->
+                                    if (onRotationChange != null) {
+                                        onRotationChange(newRot)
+                                    } else {
+                                        onRotateStep(newRot - refState.rotationDegrees)
+                                    }
+                                },
+                                valueRange = -180f..180f,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(22.dp)
+                                    .testTag("floating_ref_rotation_slider"),
+                                colors = SliderDefaults.colors(
+                                    thumbColor = accentColor,
+                                    activeTrackColor = accentColor
+                                )
+                            )
+                            Text(
+                                "${refState.rotationDegrees.roundToInt()}°",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = accentColor
+                            )
+                        }
+                    }
                 }
             }
         }

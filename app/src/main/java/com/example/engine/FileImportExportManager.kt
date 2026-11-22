@@ -7,12 +7,20 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.core.content.FileProvider
 import com.example.model.AnimationProject
+import com.example.model.Camera3DKeyframe
+import com.example.model.Camera3DSettings
+import com.example.model.CameraEasingCurve
+import com.example.model.CameraPostEffectSettings
+import com.example.model.CanvasBackgroundSettings
+import com.example.model.CanvasBackgroundStyle
+import com.example.model.CanvasTexturePattern
 import com.example.model.DrawingStroke
 import com.example.model.Frame
 import com.example.model.Layer
 import com.example.model.LayerBlendEffect
 import com.example.model.OnionSkinSettings
 import com.example.model.ProjectResolution
+import com.example.model.SkyBackdropMode
 import com.example.model.StrokePoint
 import com.example.model.ToolType
 import org.json.JSONArray
@@ -91,6 +99,72 @@ object FileImportExportManager {
         os.put("prevColor", project.onionSkin.prevColor)
         os.put("nextColor", project.onionSkin.nextColor)
         root.put("onionSkin", os)
+
+        // 3D Camera & Post Effects
+        val cam = project.camera3D
+        val camObj = JSONObject().apply {
+            put("isEnabled", cam.isEnabled)
+            put("showCaptureFrame", cam.showCaptureFrame)
+            put("autoInterpolate", cam.autoInterpolate)
+            put("captureWidth", cam.captureWidth)
+            put("captureHeight", cam.captureHeight)
+            put("layerDepthSpacing", cam.layerDepthSpacing.toDouble())
+            put("cameraMode", cam.cameraMode.name)
+            val kArr = JSONArray()
+            cam.keyframes.forEach { kf ->
+                kArr.put(JSONObject().apply {
+                    put("frameIndex", kf.frameIndex)
+                    put("x", kf.x.toDouble())
+                    put("y", kf.y.toDouble())
+                    put("zoom", kf.zoom.toDouble())
+                    put("rotationZ", kf.rotationZ.toDouble())
+                    put("pitchX", kf.pitchX.toDouble())
+                    put("yawY", kf.yawY.toDouble())
+                    put("depthSeparation", kf.depthSeparation.toDouble())
+                    put("fovDegrees", kf.fovDegrees.toDouble())
+                    put("easing", kf.easing.name)
+                    put("bezierP1X", kf.bezierP1X.toDouble())
+                    put("bezierP1Y", kf.bezierP1Y.toDouble())
+                    put("bezierP2X", kf.bezierP2X.toDouble())
+                    put("bezierP2Y", kf.bezierP2Y.toDouble())
+                })
+            }
+            put("keyframes", kArr)
+            val spanArr = JSONArray()
+            cam.effectSpans.forEach { sp ->
+                spanArr.put(JSONObject().apply {
+                    put("id", sp.id)
+                    put("effect", sp.effect.name)
+                    put("startFrame", sp.startFrame)
+                    put("endFrame", sp.endFrame)
+                    put("intensity", sp.intensity.toDouble())
+                })
+            }
+            put("effectSpans", spanArr)
+            put("postEffects", JSONObject().apply {
+                put("vignette", cam.postEffects.vignette.toDouble())
+                put("bloom", cam.postEffects.bloom.toDouble())
+                put("chromaticAberration", cam.postEffects.chromaticAberration.toDouble())
+                put("filmGrain", cam.postEffects.filmGrain.toDouble())
+                put("sepia", cam.postEffects.sepia.toDouble())
+                put("radialBlur", cam.postEffects.radialBlur.toDouble())
+                put("contrastBoost", cam.postEffects.contrastBoost.toDouble())
+            })
+        }
+        root.put("camera3D", camObj)
+
+        val bg = project.canvasBackground
+        root.put("canvasBackground", JSONObject().apply {
+            put("style", bg.style.name)
+            put("primaryColor", bg.primaryColor)
+            put("secondaryColor", bg.secondaryColor)
+            put("gradientAngleDeg", bg.gradientAngleDeg.toDouble())
+            put("texturePattern", bg.texturePattern.name)
+            put("textureIntensity", bg.textureIntensity.toDouble())
+            put("skyMode", bg.skyMode.name)
+            put("skyTopColor", bg.skyTopColor)
+            put("skyBottomColor", bg.skyBottomColor)
+        })
 
         // Frames
         val framesArray = JSONArray()
@@ -251,6 +325,115 @@ object FileImportExportManager {
             resolution.copy(isCustom = resObjParsed.optBoolean("isCustom", false))
         } else resolution
 
+        val camObjParsed = root.optJSONObject("camera3D")
+        val camera3D = if (camObjParsed != null) {
+            val kArr = camObjParsed.optJSONArray("keyframes")
+            val kfList = ArrayList<Camera3DKeyframe>()
+            if (kArr != null) {
+                for (k in 0 until kArr.length()) {
+                    val ko = kArr.optJSONObject(k) ?: continue
+                    val easing = try {
+                        CameraEasingCurve.valueOf(ko.optString("easing", CameraEasingCurve.BEZIER_SUAVE.name))
+                    } catch (_: Exception) {
+                        CameraEasingCurve.BEZIER_SUAVE
+                    }
+                    kfList.add(
+                        Camera3DKeyframe(
+                            frameIndex = ko.optInt("frameIndex", 0),
+                            x = ko.optDouble("x", 0.0).toFloat(),
+                            y = ko.optDouble("y", 0.0).toFloat(),
+                            zoom = ko.optDouble("zoom", 1.0).toFloat(),
+                            rotationZ = ko.optDouble("rotationZ", 0.0).toFloat(),
+                            pitchX = ko.optDouble("pitchX", 0.0).toFloat(),
+                            yawY = ko.optDouble("yawY", 0.0).toFloat(),
+                            depthSeparation = ko.optDouble("depthSeparation", 38.0).toFloat(),
+                            fovDegrees = ko.optDouble("fovDegrees", 50.0).toFloat().coerceIn(18f, 120f),
+                            easing = easing,
+                            bezierP1X = ko.optDouble("bezierP1X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
+                            bezierP1Y = ko.optDouble("bezierP1Y", 0.1).toFloat().coerceIn(-0.4f, 1.4f),
+                            bezierP2X = ko.optDouble("bezierP2X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
+                            bezierP2Y = ko.optDouble("bezierP2Y", 1.0).toFloat().coerceIn(-0.4f, 1.4f)
+                        )
+                    )
+                }
+            }
+            val sArr = camObjParsed.optJSONArray("effectSpans")
+            val spansList = ArrayList<com.example.model.CameraEffectSpan>()
+            if (sArr != null) {
+                for (si in 0 until sArr.length()) {
+                    val so = sArr.optJSONObject(si) ?: continue
+                    val ef = try {
+                        com.example.model.CameraBuiltInEffect.valueOf(so.optString("effect", ""))
+                    } catch (_: Exception) { continue }
+                    spansList.add(
+                        com.example.model.CameraEffectSpan(
+                            id = so.optString("id", java.util.UUID.randomUUID().toString()),
+                            effect = ef,
+                            startFrame = so.optInt("startFrame", 0).coerceAtLeast(0),
+                            endFrame = so.optInt("endFrame", 6).coerceAtLeast(0),
+                            intensity = so.optDouble("intensity", 1.0).toFloat()
+                        )
+                    )
+                }
+            }
+            val camMode = try {
+                com.example.model.CameraMode.valueOf(camObjParsed.optString("cameraMode", com.example.model.CameraMode.MODE_3D.name))
+            } catch (_: Exception) { com.example.model.CameraMode.MODE_3D }
+            val po = camObjParsed.optJSONObject("postEffects")
+            val postEffects = if (po != null) {
+                CameraPostEffectSettings(
+                    vignette = po.optDouble("vignette", 0.0).toFloat(),
+                    bloom = po.optDouble("bloom", 0.0).toFloat(),
+                    chromaticAberration = po.optDouble("chromaticAberration", 0.0).toFloat(),
+                    filmGrain = po.optDouble("filmGrain", 0.0).toFloat(),
+                    sepia = po.optDouble("sepia", 0.0).toFloat(),
+                    radialBlur = po.optDouble("radialBlur", 0.0).toFloat(),
+                    contrastBoost = po.optDouble("contrastBoost", 0.0).toFloat()
+                )
+            } else CameraPostEffectSettings()
+            Camera3DSettings(
+                isEnabled = camObjParsed.optBoolean("isEnabled", false),
+                showCaptureFrame = camObjParsed.optBoolean("showCaptureFrame", true),
+                autoInterpolate = camObjParsed.optBoolean("autoInterpolate", true),
+                captureWidth = camObjParsed.optInt("captureWidth", finalResolution.width).coerceIn(160, 4096),
+                captureHeight = camObjParsed.optInt("captureHeight", finalResolution.height).coerceIn(160, 4096),
+                layerDepthSpacing = camObjParsed.optDouble("layerDepthSpacing", 38.0).toFloat(),
+                keyframes = if (kfList.isEmpty()) listOf(Camera3DKeyframe(frameIndex = 0)) else kfList,
+                postEffects = postEffects,
+                cameraMode = camMode,
+                effectSpans = spansList
+            )
+        } else {
+            Camera3DSettings(
+                captureWidth = finalResolution.width,
+                captureHeight = finalResolution.height
+            )
+        }
+
+        val bgObj = root.optJSONObject("canvasBackground")
+        val canvasBackground = if (bgObj != null) {
+            val bgStyle = try {
+                CanvasBackgroundStyle.valueOf(bgObj.optString("style", CanvasBackgroundStyle.SOLIDO.name))
+            } catch (_: Exception) { CanvasBackgroundStyle.SOLIDO }
+            val texPat = try {
+                CanvasTexturePattern.valueOf(bgObj.optString("texturePattern", CanvasTexturePattern.NENHUMA.name))
+            } catch (_: Exception) { CanvasTexturePattern.NENHUMA }
+            val skyMode = try {
+                SkyBackdropMode.valueOf(bgObj.optString("skyMode", SkyBackdropMode.GRADE_ESPACIAL.name))
+            } catch (_: Exception) { SkyBackdropMode.GRADE_ESPACIAL }
+            CanvasBackgroundSettings(
+                style = bgStyle,
+                primaryColor = bgObj.optLong("primaryColor", 0xFFFFFFFFL),
+                secondaryColor = bgObj.optLong("secondaryColor", 0xFFE3ECFFL),
+                gradientAngleDeg = bgObj.optDouble("gradientAngleDeg", 90.0).toFloat(),
+                texturePattern = texPat,
+                textureIntensity = bgObj.optDouble("textureIntensity", 0.28).toFloat().coerceIn(0.05f, 1.0f),
+                skyMode = skyMode,
+                skyTopColor = bgObj.optLong("skyTopColor", 0xFF151926L),
+                skyBottomColor = bgObj.optLong("skyBottomColor", 0xFF28314AL)
+            )
+        } else CanvasBackgroundSettings()
+
         return AnimationProject(
             id = id,
             name = name,
@@ -259,6 +442,8 @@ object FileImportExportManager {
             frames = finalFrames,
             mediaAssets = mediaAssetsList,
             onionSkin = onionSkin,
+            camera3D = camera3D,
+            canvasBackground = canvasBackground,
             lastActiveFrameIndex = savedActiveFrame,
             createdAt = createdAt,
             updatedAt = updatedAt
@@ -308,6 +493,12 @@ object FileImportExportManager {
         if (layer.isClippingMask) {
             layerObj.put("isClippingMask", true)
         }
+        if (layer.isBucketLayer) {
+            layerObj.put("isBucketLayer", true)
+        }
+        if (layer.isBucketReference) {
+            layerObj.put("isBucketReference", true)
+        }
         layer.imageAttachment?.let { att ->
             val attObj = JSONObject().apply {
                 put("uriString", att.uriString)
@@ -355,6 +546,11 @@ object FileImportExportManager {
                     clipArr.put(cObj)
                 }
                 strokeObj.put("clipPolygon", clipArr)
+                if (stroke.clipInverted) {
+                    strokeObj.put("clipInverted", true)
+                    strokeObj.put("clipBoundsWidth", stroke.clipBoundsWidth.toDouble())
+                    strokeObj.put("clipBoundsHeight", stroke.clipBoundsHeight.toDouble())
+                }
             }
             strokesArray.put(strokeObj)
         }
@@ -379,6 +575,8 @@ object FileImportExportManager {
             LayerBlendEffect.NORMAL
         }
         val isClippingMask = lObj.optBoolean("isClippingMask", false)
+        val isBucketLayer = lObj.optBoolean("isBucketLayer", false)
+        val isBucketReference = lObj.optBoolean("isBucketReference", false)
 
         val strokesList = ArrayList<DrawingStroke>()
         val strokesArray = lObj.optJSONArray("strokes")
@@ -449,6 +647,9 @@ object FileImportExportManager {
                         brushPresetId = brushPresetId,
                         customBrushParams = customBrushParams,
                         clipPolygon = clipPoly,
+                        clipInverted = sObj.optBoolean("clipInverted", false),
+                        clipBoundsWidth = sObj.optDouble("clipBoundsWidth", 0.0).toFloat(),
+                        clipBoundsHeight = sObj.optDouble("clipBoundsHeight", 0.0).toFloat(),
                         minX = sMinX,
                         minY = sMinY,
                         maxX = sMaxX,
@@ -482,7 +683,9 @@ object FileImportExportManager {
             strokes = strokesList,
             blendEffect = blendEffect,
             isClippingMask = isClippingMask,
-            imageAttachment = imageAttachment
+            imageAttachment = imageAttachment,
+            isBucketLayer = isBucketLayer,
+            isBucketReference = isBucketReference
         )
     }
 }

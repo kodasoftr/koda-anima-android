@@ -84,7 +84,8 @@ data class SelectionRegion(
     val rotationDegrees: Float = 0f,
     val capturedStrokes: List<DrawingStroke> = emptyList(),
     val hiddenSourceStrokeIds: Set<String> = emptySet(),
-    val outsideReplacementStrokes: List<DrawingStroke> = emptyList()
+    val outsideReplacementStrokes: List<DrawingStroke> = emptyList(),
+    val isInverted: Boolean = false
 ) {
     val width: Float get() = (maxX - minX).coerceAtLeast(1f)
     val height: Float get() = (maxY - minY).coerceAtLeast(1f)
@@ -111,6 +112,9 @@ data class DrawingStroke(
     val brushPresetId: Int = 1,
     val customBrushParams: String? = null,
     val clipPolygon: List<StrokePoint>? = null,
+    val clipInverted: Boolean = false,
+    val clipBoundsWidth: Float = 0f,
+    val clipBoundsHeight: Float = 0f,
     val minX: Float = Float.MAX_VALUE,
     val minY: Float = Float.MAX_VALUE,
     val maxX: Float = Float.MIN_VALUE,
@@ -171,7 +175,22 @@ data class Layer(
     val referenceImageUri: String? = null,
     val blendEffect: LayerBlendEffect = LayerBlendEffect.NORMAL,
     val isClippingMask: Boolean = false,
-    val imageAttachment: LayerImageAttachment? = null
+    val imageAttachment: LayerImageAttachment? = null,
+    val isBucketLayer: Boolean = false,
+    val isBucketReference: Boolean = false
+)
+
+enum class BucketReferenceMode(val labelPt: String) {
+    ALL_LAYERS("Todas as camadas"),
+    SELECTED_LAYERS("Camadas selecionadas")
+}
+
+data class BucketFillConfig(
+    val expandPixels: Int = 1,
+    val paintUnderneathLineArt: Boolean = false,
+    val referenceMode: BucketReferenceMode = BucketReferenceMode.ALL_LAYERS,
+    val selectedReferenceLayerIds: Set<String> = emptySet(),
+    val activeBucketTargetLayerId: String? = null
 )
 
 data class Frame(
@@ -238,6 +257,41 @@ data class ReferenceImageState(
     val renderAboveCanvas: Boolean = true
 )
 
+enum class CanvasBackgroundStyle(val labelPt: String) {
+    SOLIDO("Cor Sólida"),
+    DEGRADE("Degradê"),
+    TEXTURA("Textura de Fundo"),
+    TRANSPARENTE("Transparente")
+}
+
+enum class CanvasTexturePattern(val labelPt: String) {
+    NENHUMA("Sem Textura"),
+    PAPEL_GRANULADO("Papel Granulado"),
+    GRADE_FINA("Grade Fina"),
+    PONTILHADO("Pontilhado"),
+    LINHAS_CADERNO("Folha Pautada")
+}
+
+enum class SkyBackdropMode(val labelPt: String) {
+    ESTUDIO_ESCURO("Estúdio Escuro"),
+    GRADE_ESPACIAL("Grade Espacial"),
+    GRADIENTE_CEU("Gradiente Céu"),
+    ESTRELAS_NOTURNO("Noturno Estrelas"),
+    SOLIDO("Cor Única")
+}
+
+data class CanvasBackgroundSettings(
+    val style: CanvasBackgroundStyle = CanvasBackgroundStyle.SOLIDO,
+    val primaryColor: Long = 0xFFFFFFFFL,
+    val secondaryColor: Long = 0xFFE3ECFFL,
+    val gradientAngleDeg: Float = 90f,
+    val texturePattern: CanvasTexturePattern = CanvasTexturePattern.NENHUMA,
+    val textureIntensity: Float = 0.28f,
+    val skyMode: SkyBackdropMode = SkyBackdropMode.GRADE_ESPACIAL,
+    val skyTopColor: Long = 0xFF151926L,
+    val skyBottomColor: Long = 0xFF28314AL
+)
+
 data class AnimationProject(
     val id: String = UUID.randomUUID().toString(),
     val name: String = "Nova Animação",
@@ -246,6 +300,8 @@ data class AnimationProject(
     val frames: List<Frame> = listOf(Frame()),
     val mediaAssets: List<SpecialMediaAsset> = emptyList(),
     val onionSkin: OnionSkinSettings = OnionSkinSettings(),
+    val camera3D: Camera3DSettings = Camera3DSettings(),
+    val canvasBackground: CanvasBackgroundSettings = CanvasBackgroundSettings(),
     val lastActiveFrameIndex: Int = 0,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis()
@@ -255,7 +311,12 @@ data class GridRulerSettings(
     val isEnabled: Boolean = false,
     val cellSizePx: Float = 48f,
     val color: Long = 0xFF00D2FF,
-    val opacity: Float = 0.45f
+    val opacity: Float = 0.45f,
+    val renderBehindActiveLayer: Boolean = true,
+    val useLineCount: Boolean = false,
+    val lineCountX: Int = 12,
+    val lineCountY: Int = 8,
+    val lineThicknessDp: Float = 1.2f
 )
 
 data class PerspectiveRulerSettings(
@@ -282,3 +343,104 @@ data class FriendBrushOffer(
     val senderName: String,
     val brushPreset: BrushPreset
 )
+
+enum class CameraMode(val labelPt: String) {
+    MODE_2D("2D Plano"),
+    MODE_3D("3D Espacial")
+}
+
+enum class CameraToolAction(val labelPt: String) {
+    PAN_2D("Mover"),
+    ZOOM("Zoom"),
+    ROTATE_Z("Girar"),
+    FOV_LENS("Lente FOV"),
+    ORBIT_3D("Órbita 3D")
+}
+
+enum class CameraEasingCurve(val labelPt: String) {
+    LINEAR("Linear"),
+    BEZIER_SUAVE("Bézier Suave"),
+    BEZIER_GRAFICO("Curva Gráfica"),
+    ACELERAR("Acelerar"),
+    DESACELERAR("Desacelerar"),
+    DEGRAU("Degrau"),
+    ELASTICO("Elástico")
+}
+
+enum class CameraBuiltInEffect(val labelPt: String, val descPt: String) {
+    ZOOM_IN("Zoom Aproximar", "Aproxima suavemente do quadro inicial ao final"),
+    ZOOM_OUT("Zoom Afastar", "Afasta gradualmente revelando o cenário"),
+    PAN_CINEMA("Panorâmica Horizontal", "Desloca a câmera horizontalmente estilo cinema"),
+    TREMOR_IMPACTO("Tremor de Impacto", "Vibração rápida de câmera para cenas de ação"),
+    ORBITA_3D("Órbita 3D", "Inclinação em perspectiva 3D usando profundidade das camadas"),
+    DOLLY_TWIST("Dolly com Giro", "Aproximação combinada com rotação dramática")
+}
+
+data class CameraPostEffectSettings(
+    val vignette: Float = 0f,           // 0..1
+    val bloom: Float = 0f,              // 0..1
+    val chromaticAberration: Float = 0f,// 0..1
+    val filmGrain: Float = 0f,          // 0..1
+    val sepia: Float = 0f,              // 0..1
+    val radialBlur: Float = 0f,         // 0..1
+    val contrastBoost: Float = 0f       // -0.5..0.5
+) {
+    fun hasAnyEffect(): Boolean {
+        return vignette > 0.01f ||
+            bloom > 0.01f ||
+            chromaticAberration > 0.01f ||
+            filmGrain > 0.01f ||
+            sepia > 0.01f ||
+            radialBlur > 0.01f ||
+            kotlin.math.abs(contrastBoost) > 0.01f
+    }
+}
+
+data class Camera3DKeyframe(
+    val frameIndex: Int = 0,
+    val x: Float = 0f,
+    val y: Float = 0f,
+    val zoom: Float = 1.0f,
+    val rotationZ: Float = 0f,
+    val pitchX: Float = 0f,
+    val yawY: Float = 0f,
+    val depthSeparation: Float = 38f,
+    val fovDegrees: Float = 50f,
+    val easing: CameraEasingCurve = CameraEasingCurve.BEZIER_SUAVE,
+    val bezierP1X: Float = 0.25f,
+    val bezierP1Y: Float = 0.1f,
+    val bezierP2X: Float = 0.25f,
+    val bezierP2Y: Float = 1.0f
+)
+
+data class CameraEffectSpan(
+    val id: String = UUID.randomUUID().toString(),
+    val effect: CameraBuiltInEffect = CameraBuiltInEffect.ZOOM_IN,
+    val startFrame: Int = 0,
+    val endFrame: Int = 6,
+    val intensity: Float = 1.0f
+)
+
+data class CameraPresetTemplate(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "Predefinição de Câmera",
+    val keyframes: List<Camera3DKeyframe> = emptyList(),
+    val postEffects: CameraPostEffectSettings = CameraPostEffectSettings(),
+    val captureWidth: Int = 1280,
+    val captureHeight: Int = 720,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+data class Camera3DSettings(
+    val isEnabled: Boolean = false,
+    val showCaptureFrame: Boolean = true,
+    val autoInterpolate: Boolean = true,
+    val captureWidth: Int = 1280,
+    val captureHeight: Int = 720,
+    val layerDepthSpacing: Float = 38f,
+    val keyframes: List<Camera3DKeyframe> = listOf(Camera3DKeyframe(frameIndex = 0)),
+    val postEffects: CameraPostEffectSettings = CameraPostEffectSettings(),
+    val cameraMode: CameraMode = CameraMode.MODE_3D,
+    val effectSpans: List<CameraEffectSpan> = emptyList()
+)
+

@@ -14,13 +14,19 @@ import android.graphics.RectF
 import android.os.Build
 import android.util.Base64
 import android.util.LruCache
+import android.graphics.LinearGradient
+import android.graphics.Shader
 import com.example.model.BrushDynamicParams
 import com.example.model.BrushPreset
+import com.example.model.CanvasBackgroundSettings
+import com.example.model.CanvasBackgroundStyle
+import com.example.model.CanvasTexturePattern
 import com.example.model.DrawingStroke
 import com.example.model.Frame
 import com.example.model.KritaBrushEngineKind
 import com.example.model.Layer
 import com.example.model.LayerBlendEffect
+import com.example.model.SkyBackdropMode
 import com.example.model.StrokePoint
 import com.example.model.ToolType
 import kotlin.math.abs
@@ -406,6 +412,215 @@ object KodanimaGraphicsEngine {
         }
     }
 
+    fun drawSkyBackdropToCanvas(
+        canvas: Canvas,
+        width: Float,
+        height: Float,
+        bgSettings: CanvasBackgroundSettings
+    ) {
+        val topCol = bgSettings.skyTopColor.toInt()
+        val botCol = bgSettings.skyBottomColor.toInt()
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        when (bgSettings.skyMode) {
+            SkyBackdropMode.SOLIDO -> {
+                paint.color = topCol
+                canvas.drawRect(0f, 0f, width, height, paint)
+            }
+            SkyBackdropMode.ESTUDIO_ESCURO -> {
+                paint.shader = LinearGradient(
+                    0f, 0f, 0f, height,
+                    intArrayOf(0xFF1A1E29.toInt(), 0xFF282E3E.toInt()),
+                    null,
+                    Shader.TileMode.CLAMP
+                )
+                canvas.drawRect(0f, 0f, width, height, paint)
+            }
+            SkyBackdropMode.GRADIENTE_CEU -> {
+                paint.shader = LinearGradient(
+                    0f, 0f, 0f, height,
+                    intArrayOf(topCol, botCol),
+                    null,
+                    Shader.TileMode.CLAMP
+                )
+                canvas.drawRect(0f, 0f, width, height, paint)
+            }
+            SkyBackdropMode.GRADE_ESPACIAL -> {
+                paint.shader = LinearGradient(
+                    0f, 0f, 0f, height,
+                    intArrayOf(topCol, botCol),
+                    null,
+                    Shader.TileMode.CLAMP
+                )
+                canvas.drawRect(0f, 0f, width, height, paint)
+                val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = android.graphics.Color.argb(34, 255, 255, 255)
+                    strokeWidth = max(1f, min(width, height) * 0.0016f)
+                    style = Paint.Style.STROKE
+                }
+                val step = max(24f, min(width, height) / 14f)
+                var gx = 0f
+                while (gx <= width) {
+                    canvas.drawLine(gx, 0f, gx, height, gridPaint)
+                    gx += step
+                }
+                var gy = 0f
+                while (gy <= height) {
+                    canvas.drawLine(0f, gy, width, gy, gridPaint)
+                    gy += step
+                }
+            }
+            SkyBackdropMode.ESTRELAS_NOTURNO -> {
+                paint.shader = LinearGradient(
+                    0f, 0f, 0f, height,
+                    intArrayOf(topCol, botCol),
+                    null,
+                    Shader.TileMode.CLAMP
+                )
+                canvas.drawRect(0f, 0f, width, height, paint)
+                val starPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+                val starCount = 110
+                for (i in 0 until starCount) {
+                    val sx = fastHashNoise(i * 17f, 13f, 911) * width
+                    val sy = fastHashNoise(29f, i * 23f, 419) * height
+                    val rad = 0.8f + fastHashNoise(i.toFloat(), i * 3f, 77) * (min(width, height) * 0.0035f).coerceAtLeast(1.2f)
+                    val alpha = (110 + (fastHashNoise(sx, sy, i) * 145f).toInt()).coerceIn(80, 255)
+                    starPaint.color = (alpha shl 24) or 0x00F4F8FF
+                    canvas.drawCircle(sx, sy, rad, starPaint)
+                }
+            }
+        }
+    }
+
+    fun drawProjectBackgroundToCanvas(
+        canvas: Canvas,
+        width: Float,
+        height: Float,
+        bgSettings: CanvasBackgroundSettings,
+        drawSkyWhenTransparent: Boolean = false
+    ) {
+        if (width <= 0f || height <= 0f) return
+        if (bgSettings.style == CanvasBackgroundStyle.TRANSPARENTE) {
+            if (drawSkyWhenTransparent) {
+                drawSkyBackdropToCanvas(canvas, width, height, bgSettings)
+            } else {
+                canvas.drawColor(android.graphics.Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            }
+            return
+        }
+
+        val c1 = bgSettings.primaryColor.toInt()
+        val c2 = bgSettings.secondaryColor.toInt()
+        val basePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+        when (bgSettings.style) {
+            CanvasBackgroundStyle.SOLIDO -> {
+                basePaint.color = c1
+                canvas.drawRect(0f, 0f, width, height, basePaint)
+            }
+            CanvasBackgroundStyle.DEGRADE -> {
+                val rad = Math.toRadians(bgSettings.gradientAngleDeg.toDouble())
+                val dx = cos(rad).toFloat() * width * 0.5f
+                val dy = sin(rad).toFloat() * height * 0.5f
+                val cx = width * 0.5f
+                val cy = height * 0.5f
+                basePaint.shader = LinearGradient(
+                    cx - dx, cy - dy, cx + dx, cy + dy,
+                    intArrayOf(c1, c2),
+                    null,
+                    Shader.TileMode.CLAMP
+                )
+                canvas.drawRect(0f, 0f, width, height, basePaint)
+            }
+            CanvasBackgroundStyle.TEXTURA -> {
+                basePaint.color = c1
+                canvas.drawRect(0f, 0f, width, height, basePaint)
+            }
+            CanvasBackgroundStyle.TRANSPARENTE -> Unit
+        }
+
+        val pattern = if (bgSettings.style == CanvasBackgroundStyle.TEXTURA &&
+            bgSettings.texturePattern == CanvasTexturePattern.NENHUMA
+        ) {
+            CanvasTexturePattern.PAPEL_GRANULADO
+        } else {
+            bgSettings.texturePattern
+        }
+
+        if (pattern != CanvasTexturePattern.NENHUMA &&
+            (bgSettings.style == CanvasBackgroundStyle.TEXTURA || bgSettings.textureIntensity > 0.01f)
+        ) {
+            val inten = bgSettings.textureIntensity.coerceIn(0.05f, 1.0f)
+            val tintRgb = if (bgSettings.secondaryColor != bgSettings.primaryColor) {
+                c2 and 0x00FFFFFF
+            } else {
+                val lum = (((c1 ushr 16) and 0xFF) * 299 + ((c1 ushr 8) and 0xFF) * 587 + (c1 and 0xFF) * 114) / 1000
+                if (lum > 140) 0x004B5A78 else 0x00D8E2FF
+            }
+            val patAlpha = (inten * 155f).toInt().coerceIn(16, 185)
+            val patColor = (patAlpha shl 24) or tintRgb
+            val patPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = patColor
+                strokeWidth = max(1f, min(width, height) * 0.0018f)
+            }
+            val step = max(16f, min(width, height) / 22f)
+            when (pattern) {
+                CanvasTexturePattern.GRADE_FINA -> {
+                    patPaint.style = Paint.Style.STROKE
+                    var x = step
+                    while (x < width) {
+                        canvas.drawLine(x, 0f, x, height, patPaint)
+                        x += step
+                    }
+                    var y = step
+                    while (y < height) {
+                        canvas.drawLine(0f, y, width, y, patPaint)
+                        y += step
+                    }
+                }
+                CanvasTexturePattern.PONTILHADO -> {
+                    patPaint.style = Paint.Style.FILL
+                    val r = max(1.2f, step * 0.085f)
+                    var y = step * 0.5f
+                    while (y < height) {
+                        var x = step * 0.5f
+                        while (x < width) {
+                            canvas.drawCircle(x, y, r, patPaint)
+                            x += step
+                        }
+                        y += step
+                    }
+                }
+                CanvasTexturePattern.LINHAS_CADERNO -> {
+                    patPaint.style = Paint.Style.STROKE
+                    var y = step
+                    while (y < height) {
+                        canvas.drawLine(0f, y, width, y, patPaint)
+                        y += step
+                    }
+                    val marginPaint = Paint(patPaint).apply {
+                        color = (patAlpha shl 24) or 0x00E57373
+                        strokeWidth = max(1.3f, min(width, height) * 0.0024f)
+                    }
+                    val marginX = width * 0.11f
+                    canvas.drawLine(marginX, 0f, marginX, height, marginPaint)
+                }
+                CanvasTexturePattern.PAPEL_GRANULADO -> {
+                    patPaint.style = Paint.Style.FILL
+                    val grainCount = 480
+                    val rad = max(0.8f, min(width, height) * 0.0022f)
+                    for (i in 0 until grainCount) {
+                        val gx = fastHashNoise(i * 11f, 37f, 101) * width
+                        val gy = fastHashNoise(43f, i * 19f, 307) * height
+                        val a = ((0.35f + fastHashNoise(gx, gy, i) * 0.65f) * patAlpha).toInt().coerceIn(8, 160)
+                        patPaint.color = (a shl 24) or tintRgb
+                        canvas.drawCircle(gx, gy, rad, patPaint)
+                    }
+                }
+                CanvasTexturePattern.NENHUMA -> Unit
+            }
+        }
+    }
+
     /**
      * Renders a complete Frame into an existing or pooled Bitmap at target resolution.
      */
@@ -413,15 +628,52 @@ object KodanimaGraphicsEngine {
         frame: Frame,
         width: Int,
         height: Int,
+        backgroundColor: Int = android.graphics.Color.WHITE,
+        background: CanvasBackgroundSettings? = null
+    ): Bitmap {
+        val clearCol = if (background?.style == CanvasBackgroundStyle.TRANSPARENTE) {
+            android.graphics.Color.TRANSPARENT
+        } else {
+            backgroundColor
+        }
+        val bitmap = KodanimaBitmapPool.acquire(
+            max(1, width),
+            max(1, height),
+            Bitmap.Config.ARGB_8888,
+            clearColor = clearCol
+        )
+        drawFrameToBitmap(frame, bitmap, backgroundColor, clearBitmap = false, background = background)
+        return bitmap
+    }
+
+    /**
+     * Renders only selected reference layers (when non-empty) or all visible layers into a pooled Bitmap.
+     */
+    fun renderSelectedLayersToBitmap(
+        frame: Frame,
+        width: Int,
+        height: Int,
+        selectedLayerIds: Set<String>?,
         backgroundColor: Int = android.graphics.Color.WHITE
     ): Bitmap {
+        if (selectedLayerIds.isNullOrEmpty()) {
+            return renderFrameToBitmap(frame, width, height, backgroundColor)
+        }
         val bitmap = KodanimaBitmapPool.acquire(
             max(1, width),
             max(1, height),
             Bitmap.Config.ARGB_8888,
             clearColor = backgroundColor
         )
-        drawFrameToBitmap(frame, bitmap, backgroundColor, clearBitmap = false)
+        val canvas = Canvas(bitmap)
+        val allLayers = if (frame.localLayers.isEmpty()) frame.layers else frame.layers + frame.localLayers
+        val filtered = allLayers.filter { it.id in selectedLayerIds }
+        drawLayersStackToCanvas(
+            layers = filtered,
+            canvas = canvas,
+            targetWidth = bitmap.width,
+            targetHeight = bitmap.height
+        )
         return bitmap
     }
 
@@ -432,18 +684,28 @@ object KodanimaGraphicsEngine {
         frame: Frame,
         targetBitmap: Bitmap,
         backgroundColor: Int = android.graphics.Color.WHITE,
-        clearBitmap: Boolean = true
+        clearBitmap: Boolean = true,
+        background: CanvasBackgroundSettings? = null,
+        drawSkyWhenTransparent: Boolean = false
     ) {
         val canvas = Canvas(targetBitmap)
-        if (clearBitmap) {
+        val w = targetBitmap.width
+        val h = targetBitmap.height
+        if (background != null) {
+            drawProjectBackgroundToCanvas(
+                canvas = canvas,
+                width = w.toFloat(),
+                height = h.toFloat(),
+                bgSettings = background,
+                drawSkyWhenTransparent = drawSkyWhenTransparent
+            )
+        } else if (clearBitmap) {
             if (backgroundColor != android.graphics.Color.TRANSPARENT) {
                 canvas.drawColor(backgroundColor)
             } else {
                 canvas.drawColor(android.graphics.Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
             }
         }
-        val w = targetBitmap.width
-        val h = targetBitmap.height
         val combinedLayers = if (frame.localLayers.isEmpty()) {
             frame.layers
         } else {
@@ -843,6 +1105,14 @@ object KodanimaGraphicsEngine {
         if (hasClip) {
             val cp = scratch.clipPath
             cp.reset()
+            if (stroke.clipInverted) {
+                cp.fillType = android.graphics.Path.FillType.EVEN_ODD
+                val boundW = max(4096f, stroke.clipBoundsWidth + 1024f)
+                val boundH = max(4096f, stroke.clipBoundsHeight + 1024f)
+                cp.addRect(-1024f, -1024f, boundW, boundH, android.graphics.Path.Direction.CW)
+            } else {
+                cp.fillType = android.graphics.Path.FillType.WINDING
+            }
             cp.moveTo(clipPoly!![0].x, clipPoly[0].y)
             for (i in 1 until clipPoly.size) {
                 cp.lineTo(clipPoly[i].x, clipPoly[i].y)
@@ -2001,14 +2271,18 @@ object KodanimaGraphicsEngine {
         startX: Int,
         startY: Int,
         tolerance: Int = 20,
-        selectionPoly: List<StrokePoint>? = null
+        selectionPoly: List<StrokePoint>? = null,
+        isSelectionInverted: Boolean = false,
+        expandPixels: Int = 0
     ): List<StrokePoint> {
         val width = bitmap.width
         val height = bitmap.height
         if (startX !in 0 until width || startY !in 0 until height) return emptyList()
         val hasSelectionClip = selectionPoly != null && selectionPoly.size >= 3
-        if (hasSelectionClip && !SelectionGeometryHelper.isPointInPolygon(startX.toFloat(), startY.toFloat(), selectionPoly!!)) {
-            return emptyList()
+        if (hasSelectionClip) {
+            val inPoly = SelectionGeometryHelper.isPointInPolygon(startX.toFloat(), startY.toFloat(), selectionPoly!!)
+            val allowed = if (isSelectionInverted) !inPoly else inPoly
+            if (!allowed) return emptyList()
         }
 
         val targetColor = bitmap.getPixel(startX, startY)
@@ -2016,7 +2290,7 @@ object KodanimaGraphicsEngine {
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
         val visited = BooleanArray(width * height)
-        val filledMask = BooleanArray(width * height)
+        var filledMask = BooleanArray(width * height)
         val queue = PrimitiveIntQueue(4096)
 
         val startIdx = startY * width + startX
@@ -2025,12 +2299,15 @@ object KodanimaGraphicsEngine {
         var minY = startY
         var maxY = startY
 
+        fun isInsideSelection(px: Int, py: Int): Boolean {
+            if (!hasSelectionClip) return true
+            val inPoly = SelectionGeometryHelper.isPointInPolygon(px.toFloat(), py.toFloat(), selectionPoly!!)
+            return if (isSelectionInverted) !inPoly else inPoly
+        }
+
         fun canVisitPixel(px: Int, py: Int, nIdx: Int): Boolean {
             if (visited[nIdx]) return false
-            if (hasSelectionClip && !SelectionGeometryHelper.isPointInPolygon(px.toFloat(), py.toFloat(), selectionPoly!!)) {
-                return false
-            }
-            return true
+            return isInsideSelection(px, py)
         }
 
         while (!queue.isEmpty) {
@@ -2060,6 +2337,59 @@ object KodanimaGraphicsEngine {
                     val n = idx + width
                     if (canVisitPixel(x, y + 1, n)) { visited[n] = true; queue.add(x or ((y + 1) shl 16)) }
                 }
+            }
+        }
+
+        val clampedExpand = expandPixels.coerceIn(-8, 24)
+        if (clampedExpand > 0) {
+            var nextMask = BooleanArray(width * height)
+            repeat(clampedExpand) {
+                filledMask.copyInto(nextMask)
+                val yFrom = (minY - 1).coerceAtLeast(0)
+                val yTo = (maxY + 1).coerceAtMost(height - 1)
+                for (y in yFrom..yTo) {
+                    val rowOff = y * width
+                    for (x in 0 until width) {
+                        val idx = rowOff + x
+                        if (filledMask[idx]) continue
+                        val hasNeighbor =
+                            (x > 0 && filledMask[idx - 1]) ||
+                            (x < width - 1 && filledMask[idx + 1]) ||
+                            (y > 0 && filledMask[idx - width]) ||
+                            (y < height - 1 && filledMask[idx + width])
+                        if (hasNeighbor && isInsideSelection(x, y)) {
+                            nextMask[idx] = true
+                            if (y < minY) minY = y
+                            if (y > maxY) maxY = y
+                        }
+                    }
+                }
+                val tmp = filledMask
+                filledMask = nextMask
+                nextMask = tmp
+            }
+        } else if (clampedExpand < 0) {
+            var nextMask = BooleanArray(width * height)
+            repeat(-clampedExpand) {
+                filledMask.copyInto(nextMask)
+                for (y in minY..maxY) {
+                    val rowOff = y * width
+                    for (x in 0 until width) {
+                        val idx = rowOff + x
+                        if (!filledMask[idx]) continue
+                        val isBorder =
+                            x == 0 || !filledMask[idx - 1] ||
+                            x == width - 1 || !filledMask[idx + 1] ||
+                            y == 0 || !filledMask[idx - width] ||
+                            y == height - 1 || !filledMask[idx + width]
+                        if (isBorder) {
+                            nextMask[idx] = false
+                        }
+                    }
+                }
+                val tmp = filledMask
+                filledMask = nextMask
+                nextMask = tmp
             }
         }
 
@@ -2280,7 +2610,8 @@ object KodanimaGraphicsEngine {
         frames: List<Frame>,
         frameWidth: Int,
         frameHeight: Int,
-        columns: Int = 4
+        columns: Int = 4,
+        background: CanvasBackgroundSettings? = null
     ): Bitmap {
         val totalFrames = max(1, frames.size)
         val cols = min(columns, totalFrames)
@@ -2304,7 +2635,13 @@ object KodanimaGraphicsEngine {
             for (i in frames.indices) {
                 val col = i % cols
                 val row = i / cols
-                drawFrameToBitmap(frames[i], scratchBitmap, android.graphics.Color.TRANSPARENT, clearBitmap = true)
+                drawFrameToBitmap(
+                    frames[i],
+                    scratchBitmap,
+                    android.graphics.Color.TRANSPARENT,
+                    clearBitmap = true,
+                    background = background
+                )
                 sheetCanvas.drawBitmap(scratchBitmap, (col * frameWidth).toFloat(), (row * frameHeight).toFloat(), null)
             }
         } finally {

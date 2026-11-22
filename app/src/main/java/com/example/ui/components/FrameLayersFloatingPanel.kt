@@ -13,6 +13,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -28,6 +29,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
@@ -106,6 +108,9 @@ fun FrameLayersFloatingPanel(
     onChangeOpacity: (Int, Float) -> Unit,
     onChangeBlendEffect: (Int, LayerBlendEffect) -> Unit,
     onToggleClippingMask: (Int) -> Unit,
+    onAddBucketLayer: (() -> Unit)? = null,
+    onToggleBucketReference: ((Int) -> Unit)? = null,
+    onSelectBucketTargetLayer: ((String) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var dragOffsetX by remember { mutableFloatStateOf(0f) }
@@ -125,27 +130,30 @@ fun FrameLayersFloatingPanel(
     } else -1
     val selectedLocalLayer = if (validLocalIdx in localLayers.indices) localLayers[validLocalIdx] else null
 
-    AnimatedVisibility(
-        visible = visible,
-        enter = fadeIn() + scaleIn(initialScale = 0.94f),
-        exit = fadeOut() + scaleOut(targetScale = 0.94f),
-        modifier = modifier
-    ) {
-        Surface(
-            modifier = Modifier
-                .offset { IntOffset(dragOffsetX.roundToInt(), dragOffsetY.roundToInt()) }
-                .widthIn(min = 276.dp, max = 336.dp)
-                .heightIn(max = 520.dp)
-                .shadow(16.dp, RoundedCornerShape(16.dp))
-                .border(1.4.dp, borderColor, RoundedCornerShape(16.dp))
-                .testTag("frame_layers_floating_panel"),
-            color = panelBg.copy(alpha = 0.97f),
-            shape = RoundedCornerShape(16.dp)
+    BoxWithConstraints(modifier = modifier) {
+        val adaptiveMaxH = (maxHeight - 16.dp).coerceIn(220.dp, 520.dp)
+        AnimatedVisibility(
+            visible = visible,
+            enter = fadeIn() + scaleIn(initialScale = 0.94f),
+            exit = fadeOut() + scaleOut(targetScale = 0.94f)
         ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+            Surface(
+                modifier = Modifier
+                    .offset { IntOffset(dragOffsetX.roundToInt(), dragOffsetY.roundToInt()) }
+                    .widthIn(min = 276.dp, max = 336.dp)
+                    .heightIn(max = adaptiveMaxH)
+                    .shadow(16.dp, RoundedCornerShape(16.dp))
+                    .border(1.4.dp, borderColor, RoundedCornerShape(16.dp))
+                    .testTag("frame_layers_floating_panel"),
+                color = panelBg.copy(alpha = 0.97f),
+                shape = RoundedCornerShape(16.dp)
             ) {
+                Column(
+                    modifier = Modifier
+                        .padding(12.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                 // Draggable Header Row with Icon + Title + X Close button
                 Row(
                     modifier = Modifier
@@ -267,6 +275,38 @@ fun FrameLayersFloatingPanel(
                                 fontWeight = FontWeight.Bold,
                                 color = if (theme.isLight) Color.White else Color.Black
                             )
+                        }
+                    }
+
+                    if (onAddBucketLayer != null) {
+                        Surface(
+                            modifier = Modifier
+                                .heightIn(min = 38.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onAddBucketLayer() }
+                                .testTag("frame_layer_add_bucket_button"),
+                            color = Color(0xFF00D2FF).copy(alpha = 0.2f),
+                            border = BorderStroke(1.dp, Color(0xFF00D2FF).copy(alpha = 0.7f)),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Add,
+                                    contentDescription = "Nova subcamada Balde",
+                                    tint = Color(0xFF00D2FF),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "Balde",
+                                    fontSize = 10.5.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF00D2FF)
+                                )
+                            }
                         }
                     }
 
@@ -440,14 +480,59 @@ fun FrameLayersFloatingPanel(
                                             .weight(1f)
                                             .padding(horizontal = 4.dp)
                                     ) {
-                                        Text(
-                                            text = layer.name,
-                                            fontSize = 11.5.sp,
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                            color = if (layer.isVisible) textColor else mutedText,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            Text(
+                                                text = layer.name,
+                                                fontSize = 11.5.sp,
+                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                                color = if (layer.isVisible) textColor else mutedText,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f, fill = false)
+                                            )
+                                            if (layer.isBucketLayer) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(4.dp))
+                                                        .background(Color(0xFF00D2FF).copy(alpha = 0.22f))
+                                                        .border(0.8.dp, Color(0xFF00D2FF), RoundedCornerShape(4.dp))
+                                                        .clickable(enabled = onSelectBucketTargetLayer != null) {
+                                                            onSelectBucketTargetLayer?.invoke(layer.id)
+                                                        }
+                                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                                ) {
+                                                    Text("BALDE", fontSize = 8.sp, fontWeight = FontWeight.Bold, color = Color(0xFF00D2FF))
+                                                }
+                                            }
+                                            if (onToggleBucketReference != null) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(4.dp))
+                                                        .background(
+                                                            if (layer.isBucketReference) NeonGreen.copy(alpha = 0.22f)
+                                                            else bgDeep.copy(alpha = 0.5f)
+                                                        )
+                                                        .border(
+                                                            0.8.dp,
+                                                            if (layer.isBucketReference) NeonGreen else textColor.copy(alpha = 0.22f),
+                                                            RoundedCornerShape(4.dp)
+                                                        )
+                                                        .clickable { onToggleBucketReference(idx) }
+                                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                                        .testTag("frame_layer_ref_$idx")
+                                                ) {
+                                                    Text(
+                                                        text = if (layer.isBucketReference) "Ref ✓" else "Ref",
+                                                        fontSize = 8.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = if (layer.isBucketReference) NeonGreen else mutedText
+                                                    )
+                                                }
+                                            }
+                                        }
                                         Text(
                                             text = buildString {
                                                 append("${(layer.opacity * 100).toInt()}%")
@@ -608,6 +693,7 @@ fun FrameLayersFloatingPanel(
                     }
                 }
             }
+        }
         }
     }
 

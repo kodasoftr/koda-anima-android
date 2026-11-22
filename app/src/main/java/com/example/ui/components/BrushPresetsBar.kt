@@ -16,7 +16,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Category
+import androidx.compose.material.icons.filled.Circle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CropSquare
+import androidx.compose.material.icons.filled.HorizontalRule
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -36,13 +42,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.model.BrushPreset
 import com.example.model.KodanimaTheme
+import com.example.model.ToolType
 import com.example.ui.theme.NeonPink
 
 /**
  * Horizontal Krita Brush Bar for Kodanima 2D:
- * - Shows the 12 Most-Used Krita Native Brushes by default.
- * - Ends with a 3-overlapping-wheels button that switches the horizontal bar to
- *   user-imported Krita brushes (.kpp / .bundle) + "+ Importar .kpp".
+ * - Houses Importar .kpp and Ferramentas Prontas (Linha/Retângulo/Círculo)
+ * - Shows the 12 Most-Used Krita Native Brushes by default or Imported Krita brushes via the 3-wheels toggle.
  */
 @Composable
 fun BrushPresetsBar(
@@ -53,10 +59,14 @@ fun BrushPresetsBar(
     importedBrushes: List<BrushPreset> = emptyList(),
     onRequestImportKrita: (() -> Unit)? = null,
     onDeleteImportedBrush: ((Int) -> Unit)? = null,
+    onOpenBrushStudio: (() -> Unit)? = null,
+    selectedTool: ToolType? = null,
+    onSelectTool: ((ToolType) -> Unit)? = null,
     modifier: Modifier = Modifier,
     isCompact: Boolean = false
 ) {
     var showImportedBar by remember { mutableStateOf(false) }
+    var showReadyShapesMenu by remember { mutableStateOf(false) }
 
     val accentColor = Color(theme.accent)
     val secondaryAccent = Color(theme.secondaryAccent)
@@ -64,6 +74,13 @@ fun BrushPresetsBar(
     val panelColor = Color(theme.panel)
     val textColor = Color(theme.text)
     val displayList = if (showImportedBar) importedBrushes else nativeBrushes
+
+    val readyShapeTools = listOf(
+        Triple(ToolType.LINE, Icons.Default.HorizontalRule, "Linha"),
+        Triple(ToolType.RECTANGLE, Icons.Default.CropSquare, "Retângulo"),
+        Triple(ToolType.CIRCLE, Icons.Default.Circle, "Círculo")
+    )
+    val isShapeSelected = selectedTool in listOf(ToolType.LINE, ToolType.RECTANGLE, ToolType.CIRCLE)
 
     Surface(
         modifier = modifier
@@ -106,6 +123,55 @@ fun BrushPresetsBar(
                                 fontWeight = FontWeight.Bold,
                                 color = secondaryAccent
                             )
+                        }
+                    }
+                }
+
+                if (onSelectTool != null) {
+                    Box {
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { showReadyShapesMenu = !showReadyShapesMenu }
+                                .testTag("pc_ready_shapes_btn"),
+                            color = if (isShapeSelected) accentColor.copy(alpha = 0.25f) else textColor.copy(alpha = 0.08f),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (isShapeSelected) accentColor else textColor.copy(alpha = 0.28f)
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = if (isCompact) 3.dp else 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                val shapeIcon = readyShapeTools.firstOrNull { it.first == selectedTool }?.second ?: Icons.Default.Category
+                                val shapeLabel = readyShapeTools.firstOrNull { it.first == selectedTool }?.third ?: "Ferr. Prontas"
+                                Icon(shapeIcon, contentDescription = "Ferramentas Prontas", tint = if (isShapeSelected) accentColor else textColor, modifier = Modifier.size(13.dp))
+                                Text(
+                                    text = shapeLabel,
+                                    fontSize = if (isCompact) 9.sp else 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (isShapeSelected) accentColor else textColor
+                                )
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = showReadyShapesMenu,
+                            onDismissRequest = { showReadyShapesMenu = false }
+                        ) {
+                            readyShapeTools.forEach { (shapeTool, shapeIcon, shapeLabel) ->
+                                DropdownMenuItem(
+                                    text = { Text(shapeLabel, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) },
+                                    leadingIcon = { Icon(shapeIcon, contentDescription = shapeLabel, modifier = Modifier.size(16.dp)) },
+                                    modifier = Modifier.testTag("tool_${shapeTool.name.lowercase()}"),
+                                    onClick = {
+                                        onSelectTool(shapeTool)
+                                        showReadyShapesMenu = false
+                                    }
+                                )
+                            }
                         }
                     }
                 }

@@ -670,6 +670,23 @@ class MainActivity : ComponentActivity() {
         KodanimaBitmapPool.clear()
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val focused = currentFocus
+        val isTypingInTextField = focused is android.widget.EditText
+        val st = viewModel.uiState.value
+        val inCleanEditor = st.currentScreen == AppScreen.EDITOR &&
+            st.activeDialog == com.example.viewmodel.EditorDialog.NONE
+        if (!isTypingInTextField && inCleanEditor) {
+            if (event.action == KeyEvent.ACTION_DOWN && viewModel.handlePhysicalKeyEvent(event, this)) {
+                return true
+            }
+            if (event.keyCode == KeyEvent.KEYCODE_TAB && st.preferences.tabletSettings.keyboardShortcutsEnabled) {
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (event != null && viewModel.handlePhysicalKeyEvent(event, this)) {
             return true

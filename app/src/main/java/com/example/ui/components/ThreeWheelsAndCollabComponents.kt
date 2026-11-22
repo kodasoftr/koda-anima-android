@@ -10,6 +10,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -39,11 +40,13 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.IosShare
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.OpenWith
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.ViewTimeline
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.WifiTethering
@@ -284,28 +287,34 @@ fun ExtraToolsFloatingMenu(
     onUpdatePerspectiveRulerSettings: ((PerspectiveRulerSettings) -> Unit)? = null,
     onionSkinOpacity: Float = 0.25f,
     onChangeOnionSkinOpacity: ((Float) -> Unit)? = null,
+    onOpenPaletteTray: (() -> Unit)? = null,
+    isQuickPaletteOpen: Boolean = false,
+    onToggleQuickPalette: (() -> Unit)? = null,
+    onOpenCameraTimeline: (() -> Unit)? = null,
+    isCameraTimelineOpen: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    AnimatedVisibility(
-        visible = visible,
-        enter = fadeIn(),
-        exit = fadeOut(),
-        modifier = modifier
-    ) {
-        val panelColor = Color(theme.panel)
-        val accentColor = Color(theme.accent)
-        val textColor = Color(theme.text)
-
-        Surface(
-            modifier = Modifier
-                .widthIn(min = 204.dp, max = 246.dp)
-                .heightIn(max = 460.dp)
-                .border(1.2.dp, accentColor.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
-                .testTag("extra_tools_floating_menu"),
-            color = panelColor.copy(alpha = 0.97f),
-            shape = RoundedCornerShape(14.dp),
-            shadowElevation = 12.dp
+    BoxWithConstraints(modifier = modifier) {
+        val maxMenuH = (maxHeight - 16.dp).coerceIn(180.dp, 460.dp)
+        AnimatedVisibility(
+            visible = visible,
+            enter = fadeIn(),
+            exit = fadeOut()
         ) {
+            val panelColor = Color(theme.panel)
+            val accentColor = Color(theme.accent)
+            val textColor = Color(theme.text)
+
+            Surface(
+                modifier = Modifier
+                    .widthIn(min = 204.dp, max = 246.dp)
+                    .heightIn(max = maxMenuH)
+                    .border(1.2.dp, accentColor.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
+                    .testTag("extra_tools_floating_menu"),
+                color = panelColor.copy(alpha = 0.97f),
+                shape = RoundedCornerShape(14.dp),
+                shadowElevation = 12.dp
+            ) {
             Column(
                 modifier = Modifier
                     .padding(10.dp)
@@ -392,25 +401,89 @@ fun ExtraToolsFloatingMenu(
                         )
                     }
                 }
+                if (onOpenPaletteTray != null) {
+                    ExtraToolRow(
+                        icon = Icons.Default.Palette,
+                        label = "Palheta de Cor",
+                        isActive = false,
+                        textColor = textColor,
+                        accentColor = accentColor,
+                        modifier = Modifier.testTag("three_wheels_palette_tray_btn")
+                    ) {
+                        onOpenPaletteTray(); onDismiss()
+                    }
+                }
+                if (onToggleQuickPalette != null) {
+                    ExtraToolRow(
+                        icon = Icons.Default.Palette,
+                        label = "Palheta Rápida (Já Escolhida)",
+                        isActive = isQuickPaletteOpen,
+                        textColor = textColor,
+                        accentColor = accentColor,
+                        trailingActionText = "Q",
+                        modifier = Modifier.testTag("extra_menu_quick_palette")
+                    ) {
+                        onToggleQuickPalette(); onDismiss()
+                    }
+                }
+                if (onOpenCameraTimeline != null) {
+                    ExtraToolRow(
+                        icon = Icons.Default.Videocam,
+                        label = "Câmera 3D & Pós-Efeitos",
+                        isActive = isCameraTimelineOpen,
+                        textColor = textColor,
+                        accentColor = accentColor,
+                        modifier = Modifier.testTag("three_wheels_camera_3d_btn")
+                    ) {
+                        onOpenCameraTimeline(); onDismiss()
+                    }
+                }
                 ExtraToolRow(Icons.Default.Flip, "Espelhar Visualização", mirrorHorizontal, textColor, accentColor) {
                     onToggleMirror()
                 }
                 if (onToggleGridRuler != null) {
                     var showGridConfig by remember { mutableStateOf(false) }
-                    ExtraToolRow(
-                        Icons.Default.GridOn,
-                        if (gridRulerSettings.isEnabled) "Régua Quadriculada (Ativa)" else "Régua Quadriculada",
-                        gridRulerSettings.isEnabled,
-                        textColor,
-                        accentColor,
-                        trailingActionText = "Cor/Opac"
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        onToggleGridRuler()
-                        showGridConfig = true
+                        Box(modifier = Modifier.weight(1f)) {
+                            ExtraToolRow(
+                                Icons.Default.GridOn,
+                                if (gridRulerSettings.isEnabled) "Régua Quadriculada (Ativa)" else "Régua Quadriculada",
+                                gridRulerSettings.isEnabled,
+                                textColor,
+                                accentColor
+                            ) {
+                                val turningOn = !gridRulerSettings.isEnabled
+                                onToggleGridRuler()
+                                showGridConfig = turningOn
+                            }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (showGridConfig) accentColor.copy(alpha = 0.22f) else textColor.copy(alpha = 0.08f))
+                                .border(0.8.dp, if (showGridConfig) accentColor else textColor.copy(alpha = 0.16f), RoundedCornerShape(8.dp))
+                                .clickable { showGridConfig = !showGridConfig }
+                                .padding(horizontal = 7.dp, vertical = 9.dp)
+                        ) {
+                            Text(
+                                text = if (showGridConfig) "Ocultar" else "Config",
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (showGridConfig) accentColor else textColor.copy(alpha = 0.8f)
+                            )
+                        }
                     }
-                    if (showGridConfig || gridRulerSettings.isEnabled) {
+                    if (showGridConfig) {
                         RulerConfigPanel(
-                            title = "Grade (${gridRulerSettings.cellSizePx.toInt()}px)",
+                            title = if (gridRulerSettings.useLineCount) {
+                                "Grade (${gridRulerSettings.lineCountX}×${gridRulerSettings.lineCountY} linhas • ${String.format("%.1f", gridRulerSettings.lineThicknessDp)}dp)"
+                            } else {
+                                "Grade (${gridRulerSettings.cellSizePx.toInt()}px • ${String.format("%.1f", gridRulerSettings.lineThicknessDp)}dp)"
+                            },
                             selectedColorLong = gridRulerSettings.color,
                             opacity = gridRulerSettings.opacity,
                             onChangeOpacity = { op ->
@@ -422,28 +495,241 @@ fun ExtraToolsFloatingMenu(
                                 onUpdateGridRulerSettings?.invoke(gridRulerSettings.copy(color = c))
                             },
                             extraContent = {
+                                // Modo: Espaçamento (px) vs Quantidade de Linhas (X x Y)
                                 Row(
-                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
-                                    listOf(24f, 32f, 48f, 64f, 96f).forEach { spacing ->
-                                        val sel = gridRulerSettings.cellSizePx.toInt() == spacing.toInt()
-                                        Box(
-                                            modifier = Modifier
-                                                .clip(RoundedCornerShape(6.dp))
-                                                .background(if (sel) accentColor else textColor.copy(alpha = 0.12f))
-                                                .clickable {
-                                                    onUpdateGridRulerSettings?.invoke(gridRulerSettings.copy(cellSizePx = spacing, isEnabled = true))
-                                                }
-                                                .padding(horizontal = 6.dp, vertical = 3.dp)
-                                        ) {
-                                            Text(
-                                                "${spacing.toInt()}px",
-                                                fontSize = 9.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = if (sel) Color.Black else textColor
-                                            )
+                                    val byCount = gridRulerSettings.useLineCount
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(if (!byCount) accentColor.copy(alpha = 0.24f) else textColor.copy(alpha = 0.08f))
+                                            .border(0.8.dp, if (!byCount) accentColor else textColor.copy(alpha = 0.16f), RoundedCornerShape(6.dp))
+                                            .clickable {
+                                                onUpdateGridRulerSettings?.invoke(gridRulerSettings.copy(useLineCount = false, isEnabled = true))
+                                            }
+                                            .padding(horizontal = 4.dp, vertical = 4.dp)
+                                            .testTag("grid_mode_spacing_btn"),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text("Espaço (px)", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = if (!byCount) accentColor else textColor)
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(if (byCount) accentColor.copy(alpha = 0.24f) else textColor.copy(alpha = 0.08f))
+                                            .border(0.8.dp, if (byCount) accentColor else textColor.copy(alpha = 0.16f), RoundedCornerShape(6.dp))
+                                            .clickable {
+                                                onUpdateGridRulerSettings?.invoke(gridRulerSettings.copy(useLineCount = true, isEnabled = true))
+                                            }
+                                            .padding(horizontal = 4.dp, vertical = 4.dp)
+                                            .testTag("grid_mode_line_count_btn"),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text("Qtd. Linhas", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = if (byCount) accentColor else textColor)
+                                    }
+                                }
+
+                                if (gridRulerSettings.useLineCount) {
+                                    // Controles X (colunas) e Y (linhas horizontais)
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                                            Text("Lin. V:", fontSize = 8.5.sp, color = textColor.copy(alpha = 0.8f))
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(20.dp)
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(textColor.copy(alpha = 0.14f))
+                                                    .clickable {
+                                                        onUpdateGridRulerSettings?.invoke(
+                                                            gridRulerSettings.copy(lineCountX = (gridRulerSettings.lineCountX - 1).coerceIn(1, 32), isEnabled = true)
+                                                        )
+                                                    },
+                                                contentAlignment = Alignment.Center
+                                            ) { Text("-", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = textColor) }
+                                            Text("${gridRulerSettings.lineCountX}", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = accentColor)
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(20.dp)
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(textColor.copy(alpha = 0.14f))
+                                                    .clickable {
+                                                        onUpdateGridRulerSettings?.invoke(
+                                                            gridRulerSettings.copy(lineCountX = (gridRulerSettings.lineCountX + 1).coerceIn(1, 32), isEnabled = true)
+                                                        )
+                                                    },
+                                                contentAlignment = Alignment.Center
+                                            ) { Text("+", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = textColor) }
                                         }
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                                            Text("Lin. H:", fontSize = 8.5.sp, color = textColor.copy(alpha = 0.8f))
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(20.dp)
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(textColor.copy(alpha = 0.14f))
+                                                    .clickable {
+                                                        onUpdateGridRulerSettings?.invoke(
+                                                            gridRulerSettings.copy(lineCountY = (gridRulerSettings.lineCountY - 1).coerceIn(1, 32), isEnabled = true)
+                                                        )
+                                                    },
+                                                contentAlignment = Alignment.Center
+                                            ) { Text("-", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = textColor) }
+                                            Text("${gridRulerSettings.lineCountY}", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = accentColor)
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(20.dp)
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(textColor.copy(alpha = 0.14f))
+                                                    .clickable {
+                                                        onUpdateGridRulerSettings?.invoke(
+                                                            gridRulerSettings.copy(lineCountY = (gridRulerSettings.lineCountY + 1).coerceIn(1, 32), isEnabled = true)
+                                                        )
+                                                    },
+                                                contentAlignment = Alignment.Center
+                                            ) { Text("+", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = textColor) }
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        listOf(2, 3, 4, 6, 8, 12).forEach { n ->
+                                            val sel = gridRulerSettings.lineCountX == n && gridRulerSettings.lineCountY == n
+                                            Box(
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(6.dp))
+                                                    .background(if (sel) accentColor else textColor.copy(alpha = 0.12f))
+                                                    .clickable {
+                                                        onUpdateGridRulerSettings?.invoke(
+                                                            gridRulerSettings.copy(lineCountX = n, lineCountY = n, useLineCount = true, isEnabled = true)
+                                                        )
+                                                    }
+                                                    .padding(horizontal = 6.dp, vertical = 3.dp)
+                                            ) {
+                                                Text(
+                                                    "${n}×${n}",
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = if (sel) Color.Black else textColor
+                                                )
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Row(
+                                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        listOf(24f, 32f, 48f, 64f, 96f).forEach { spacing ->
+                                            val sel = gridRulerSettings.cellSizePx.toInt() == spacing.toInt()
+                                            Box(
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(6.dp))
+                                                    .background(if (sel) accentColor else textColor.copy(alpha = 0.12f))
+                                                    .clickable {
+                                                        onUpdateGridRulerSettings?.invoke(gridRulerSettings.copy(cellSizePx = spacing, isEnabled = true))
+                                                    }
+                                                    .padding(horizontal = 6.dp, vertical = 3.dp)
+                                            ) {
+                                                Text(
+                                                    "${spacing.toInt()}px",
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = if (sel) Color.Black else textColor
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Espessura da linha (grossura)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = "Gross.:",
+                                        fontSize = 9.sp,
+                                        color = textColor.copy(alpha = 0.78f)
+                                    )
+                                    Slider(
+                                        value = gridRulerSettings.lineThicknessDp.coerceIn(0.4f, 6.0f),
+                                        onValueChange = { th ->
+                                            onUpdateGridRulerSettings?.invoke(gridRulerSettings.copy(lineThicknessDp = th.coerceIn(0.4f, 6.0f)))
+                                        },
+                                        valueRange = 0.4f..6.0f,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(18.dp)
+                                            .testTag("grid_line_thickness_slider"),
+                                        colors = SliderDefaults.colors(
+                                            thumbColor = accentColor,
+                                            activeTrackColor = accentColor
+                                        )
+                                    )
+                                    Text(
+                                        text = "${String.format("%.1f", gridRulerSettings.lineThicknessDp.coerceIn(0.4f, 6.0f))}dp",
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = accentColor
+                                    )
+                                }
+                                // Z-order option for Grid Ruler: Atrás da camada vs Na frente de tudo
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    val behind = gridRulerSettings.renderBehindActiveLayer
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(if (behind) accentColor.copy(alpha = 0.22f) else textColor.copy(alpha = 0.08f))
+                                            .border(0.8.dp, if (behind) accentColor else textColor.copy(alpha = 0.15f), RoundedCornerShape(6.dp))
+                                            .clickable {
+                                                onUpdateGridRulerSettings?.invoke(
+                                                    gridRulerSettings.copy(renderBehindActiveLayer = true)
+                                                )
+                                            }
+                                            .padding(horizontal = 4.dp, vertical = 4.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            "Atrás da camada",
+                                            fontSize = 8.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (behind) accentColor else textColor
+                                        )
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(if (!behind) accentColor.copy(alpha = 0.22f) else textColor.copy(alpha = 0.08f))
+                                            .border(0.8.dp, if (!behind) accentColor else textColor.copy(alpha = 0.15f), RoundedCornerShape(6.dp))
+                                            .clickable {
+                                                onUpdateGridRulerSettings?.invoke(
+                                                    gridRulerSettings.copy(renderBehindActiveLayer = false)
+                                                )
+                                            }
+                                            .padding(horizontal = 4.dp, vertical = 4.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            "Na frente de tudo",
+                                            fontSize = 8.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (!behind) accentColor else textColor
+                                        )
                                     }
                                 }
                             }
@@ -718,6 +1004,7 @@ fun ExtraToolsFloatingMenu(
                     }
                 }
             }
+        }
         }
     }
 }

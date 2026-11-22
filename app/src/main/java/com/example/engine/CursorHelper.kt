@@ -14,11 +14,46 @@ import java.nio.ByteOrder
 import kotlin.math.max
 import kotlin.math.min
 
+data class CursorBitmapWithHotspot(
+    val bitmap: Bitmap,
+    val hotspotX: Float = 0.5f,
+    val hotspotY: Float = 0.5f
+)
+
 /**
  * Robust loader and LAN transfer encoder for custom tablet cursors:
  * Supports .png, .webp, .jpg, Windows .cur (cursor), and Windows .ani (animated cursor).
  */
 object CursorHelper {
+
+    fun loadCursorWithHotspotFromFile(filePath: String): CursorBitmapWithHotspot? {
+        val bmp = loadCursorBitmapFromFile(filePath) ?: return null
+        val metaFile = File("$filePath.hotspot")
+        if (metaFile.exists()) {
+            try {
+                val parts = metaFile.readText().trim().split(",")
+                if (parts.size == 2) {
+                    val hx = parts[0].toFloatOrNull()?.coerceIn(0f, 1f) ?: 0.5f
+                    val hy = parts[1].toFloatOrNull()?.coerceIn(0f, 1f) ?: 0.5f
+                    return CursorBitmapWithHotspot(bmp, hx, hy)
+                }
+            } catch (_: Exception) {}
+        }
+        return CursorBitmapWithHotspot(bmp, 0.5f, 0.5f)
+    }
+
+    private fun extractCurHotspotFraction(bytes: ByteArray, bmpW: Int, bmpH: Int): Pair<Float, Float>? {
+        if (bytes.size > 22 && bytes[0].toInt() == 0 && bytes[1].toInt() == 0 && bytes[2].toInt() == 2) {
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            val count = buffer.getShort(4).toInt()
+            if (count > 0 && bmpW > 0 && bmpH > 0) {
+                val hxPx = (buffer.getShort(10).toInt() and 0xFFFF).toFloat()
+                val hyPx = (buffer.getShort(12).toInt() and 0xFFFF).toFloat()
+                return (hxPx / bmpW.toFloat()).coerceIn(0f, 1f) to (hyPx / bmpH.toFloat()).coerceIn(0f, 1f)
+            }
+        }
+        return null
+    }
 
     fun loadCursorBitmap(context: Context, uri: Uri): Bitmap? {
         return try {
@@ -45,10 +80,15 @@ object CursorHelper {
     fun saveCursorToInternalStorage(context: Context, uri: Uri): String? {
         var bmp: Bitmap? = null
         return try {
-            bmp = loadCursorBitmap(context, uri) ?: return null
-            val cursorFile = File(context.filesDir, "custom_cursor_${System.currentTimeMillis()}.png")
+            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+            bmp = decodeCursorBytes(bytes) ?: return null
+            val ts = System.currentTimeMillis()
+            val cursorFile = File(context.filesDir, "custom_cursor_$ts.png")
             FileOutputStream(cursorFile).use { fos ->
                 bmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
+            }
+            extractCurHotspotFraction(bytes, bmp.width, bmp.height)?.let { (hx, hy) ->
+                File("${cursorFile.absolutePath}.hotspot").writeText("$hx,$hy")
             }
             cursorFile.absolutePath
         } catch (e: Exception) {

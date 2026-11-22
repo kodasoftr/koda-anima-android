@@ -8,6 +8,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,10 +21,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.CompareArrows
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
@@ -47,6 +51,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -56,7 +61,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -65,24 +73,31 @@ import androidx.compose.ui.unit.sp
 import com.example.model.AppScreen
 import com.example.model.AppUiMode
 import com.example.model.BrushPreset
+import com.example.model.CameraMode
 import com.example.model.MultiplayerRole
 import com.example.model.ToolType
 import com.example.ui.components.BrushStudioDrawer
+import com.example.ui.components.BucketConfigPopover
+import com.example.ui.components.CameraSideToolbar
+import com.example.ui.components.CameraTimelinePanel
 import com.example.ui.components.CanvasView
 import com.example.ui.components.CollaboratorHorizontalStrip
+import com.example.ui.components.ColorPaletteTrayModal
 import com.example.ui.components.ColorPickerDialog
+import com.example.ui.components.EraserVectorIcon
 import com.example.ui.components.ExportDialog
 import com.example.ui.components.ExtraToolsFloatingMenu
 import com.example.ui.components.FloatingReferenceControlsBar
-import com.example.ui.components.FloatingReferenceImageSurface
 import com.example.ui.components.FrameLayersFloatingPanel
 import com.example.ui.components.FriendBrushOfferBanner
+import com.example.ui.components.InlineNumericPxInput
 import com.example.ui.components.KritaBrushStrokeWaveformPreview
 import com.example.ui.components.LayersBottomSheet
 import com.example.ui.components.ProcreateBrushPickerSheet
 import com.example.ui.components.ProjectSettingsDialog
 import com.example.ui.components.ProjectsListDialog
 import com.example.ui.components.QuickCopyPasteGestureMenu
+import com.example.ui.components.QuickPaletteFloatingWindow
 import com.example.ui.components.ReferenceImageChoiceDialog
 import com.example.ui.components.ThreeWheelsIcon
 import com.example.ui.components.TimelineBar
@@ -115,6 +130,11 @@ fun AnimationEditorScreen(
 
     var showProcreateBrushes by remember { mutableStateOf(false) }
     var showExtraToolsMenu by remember { mutableStateOf(false) }
+    val mobileFocusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        runCatching { mobileFocusRequester.requestFocus() }
+    }
 
     BackHandler {
         if (uiState.multiplayerRole == MultiplayerRole.CLIENT) {
@@ -193,36 +213,96 @@ fun AnimationEditorScreen(
     Scaffold(
         modifier = modifier
             .fillMaxSize()
-            .background(bgColor),
+            .background(bgColor)
+            .focusRequester(mobileFocusRequester)
+            .focusable()
+            .onPreviewKeyEvent { keyEvent ->
+                if (keyEvent.nativeKeyEvent.action == android.view.KeyEvent.ACTION_DOWN) {
+                    viewModel.handlePhysicalKeyEvent(keyEvent.nativeKeyEvent, context)
+                } else {
+                    false
+                }
+            },
         containerColor = bgColor,
         bottomBar = {
             if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideTimeline) {
-                TimelineBar(
-                    frames = uiState.project.frames,
-                    currentFrameIndex = uiState.currentFrameIndex,
-                    isPlaying = uiState.isPlaying,
-                    onionSkinEnabled = uiState.onionSkinEnabled,
-                    layerCount = uiState.project.frames[uiState.currentFrameIndex].layers.size,
-                    fps = uiState.project.fps,
-                    onSelectFrame = { viewModel.goToFrame(it) },
-                    onTogglePlay = { viewModel.togglePlayback() },
-                    onNextFrame = { viewModel.nextFrame() },
-                    onPrevFrame = { viewModel.prevFrame() },
-                    onAddFrame = { viewModel.addFrame() },
-                    onDuplicateFrame = { viewModel.duplicateCurrentFrame() },
-                    onDeleteFrame = { viewModel.deleteCurrentFrame() },
-                    onToggleOnionSkin = { viewModel.toggleOnionSkin() },
-                    onOpenLayers = { viewModel.openDialog(EditorDialog.LAYERS) },
-                    onOpenSettings = { viewModel.openDialog(EditorDialog.PROJECT_SETTINGS) },
-                    theme = currentTheme,
-                    mediaAssets = uiState.project.mediaAssets,
-                    activeScrubTimeMs = uiState.activeScrubTimeMs,
-                    onSetFrameHold = { idx, hold -> viewModel.setFrameHoldDuration(idx, hold) },
-                    onScrubToMs = { viewModel.scrubToTimelineMs(it) },
-                    onEndScrub = { viewModel.endAudioScrub() },
-                    onionSkinOpacity = uiState.project.onionSkin.opacity,
-                    onChangeOnionSkinOpacity = { viewModel.setOnionSkinOpacity(it) }
-                )
+                if (uiState.isCameraTimelineOpen) {
+                    CameraTimelinePanel(
+                        cameraSettings = uiState.project.camera3D,
+                        currentFrameIndex = uiState.currentFrameIndex,
+                        totalFrames = uiState.project.frames.size,
+                        isPlaying = uiState.isPlaying,
+                        isSideView3D = uiState.isCameraSideView3D,
+                        savedTemplates = uiState.preferences.savedCameraTemplates,
+                        theme = currentTheme,
+                        onSelectFrame = { viewModel.goToFrame(it) },
+                        onTogglePlay = { viewModel.togglePlayback() },
+                        onToggleCameraEnabled = { viewModel.toggleCameraEnabled() },
+                        onToggleSideView3D = { viewModel.toggleCameraSideView3D() },
+                        onToggleAutoInterpolate = { viewModel.toggleCameraAutoInterpolate() },
+                        onToggleCaptureFrameOverlay = { viewModel.toggleCameraShowCaptureFrame() },
+                        onUpdateCurrentCamera = { viewModel.updateCameraAtCurrentFrame(it) },
+                        onAddOrUpdateKeyframe = { viewModel.addOrUpdateCameraKeyframeAtCurrentFrame(it) },
+                        onDeleteKeyframeAt = { viewModel.deleteCameraKeyframeAt(it) },
+                        onResetKeyframes = { viewModel.resetCameraKeyframesToDefault() },
+                        onSetCameraResolution = { w, h -> viewModel.setCameraResolution(w, h) },
+                        onSetLayerDepthSpacing = { viewModel.setCameraLayerDepthSpacing(it) },
+                        onApplyBuiltInEffect = { viewModel.applyCameraBuiltInEffect(it) },
+                        onSaveTemplateToFolder = { viewModel.saveCameraTemplateToFolder(it) },
+                        onApplyTemplateFromFolder = { viewModel.applyCameraTemplateFromFolder(it) },
+                        onDeleteTemplate = { viewModel.deleteCameraTemplate(it) },
+                        onUpdatePostEffects = { viewModel.updateCameraPostEffects(it) },
+                        onResetPostEffects = { viewModel.resetCameraPostEffects() },
+                        onCloseCameraTimeline = { viewModel.closeCameraTimeline() },
+                        onSetCameraMode = { viewModel.setCameraMode(it) },
+                        onUpdateBezierHandles = { fIdx, p1x, p1y, p2x, p2y ->
+                            viewModel.updateKeyframeBezierHandles(fIdx, p1x, p1y, p2x, p2y)
+                        },
+                        onApplyEffectInRange = { eff, sf, ef, inten ->
+                            viewModel.applyCameraEffectInRange(eff, sf, ef, inten)
+                        },
+                        onRemoveEffectSpan = { viewModel.removeCameraEffectSpan(it) },
+                        canvasBackground = uiState.project.canvasBackground,
+                        onUpdateCanvasBackground = { viewModel.updateCanvasBackground(it) },
+                        onConnectTwoKeyframes = { viewModel.connectTwoCameraKeyframes() },
+                        onPrevKeyframe = { viewModel.jumpToPrevCameraKeyframe() },
+                        onNextKeyframe = { viewModel.jumpToNextCameraKeyframe() },
+                        onResetCurrentKeyframe = { viewModel.resetCameraAtCurrentFrame() },
+                        onSetCameraFov = { viewModel.setCameraFov(it) },
+                        onNudgeCameraPan = { dx, dy -> viewModel.nudgeCameraPan(dx, dy) },
+                        onZoomCameraBy = { viewModel.zoomCameraBy(it) },
+                        onRotateCameraBy = { viewModel.rotateCameraBy(it) },
+                        onTiltOrbitCameraBy = { dYaw, dPitch -> viewModel.tiltOrbitCameraBy(dYaw, dPitch) },
+                        onAddFrame = { viewModel.addFrame() }
+                    )
+                } else {
+                    TimelineBar(
+                        frames = uiState.project.frames,
+                        currentFrameIndex = uiState.currentFrameIndex,
+                        isPlaying = uiState.isPlaying,
+                        onionSkinEnabled = uiState.onionSkinEnabled,
+                        layerCount = uiState.project.frames[uiState.currentFrameIndex].layers.size,
+                        fps = uiState.project.fps,
+                        onSelectFrame = { viewModel.goToFrame(it) },
+                        onTogglePlay = { viewModel.togglePlayback() },
+                        onNextFrame = { viewModel.nextFrame() },
+                        onPrevFrame = { viewModel.prevFrame() },
+                        onAddFrame = { viewModel.addFrame() },
+                        onDuplicateFrame = { viewModel.duplicateCurrentFrame() },
+                        onDeleteFrame = { viewModel.deleteCurrentFrame() },
+                        onToggleOnionSkin = { viewModel.toggleOnionSkin() },
+                        onOpenLayers = { viewModel.openDialog(EditorDialog.LAYERS) },
+                        onOpenSettings = { viewModel.openDialog(EditorDialog.PROJECT_SETTINGS) },
+                        theme = currentTheme,
+                        mediaAssets = uiState.project.mediaAssets,
+                        activeScrubTimeMs = uiState.activeScrubTimeMs,
+                        onSetFrameHold = { idx, hold -> viewModel.setFrameHoldDuration(idx, hold) },
+                        onScrubToMs = { viewModel.scrubToTimelineMs(it) },
+                        onEndScrub = { viewModel.endAudioScrub() },
+                        onionSkinOpacity = uiState.project.onionSkin.opacity,
+                        onChangeOnionSkinOpacity = { viewModel.setOnionSkinOpacity(it) }
+                    )
+                }
             }
         }
     ) { innerPadding ->
@@ -236,21 +316,6 @@ fun AnimationEditorScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            if (isFloatingRefBelow) {
-                FloatingReferenceImageSurface(
-                    refState = uiState.referenceImage,
-                    theme = currentTheme,
-                    onTransformDelta = { dx, dy, zoomDelta, rotDelta ->
-                        viewModel.updateFloatingReferenceOffset(dx, dy)
-                        if (abs(zoomDelta - 1f) > 0.002f) {
-                            viewModel.updateFloatingReferenceScale(uiState.referenceImage.scale * zoomDelta)
-                        }
-                        if (abs(rotDelta) > 0.1f) {
-                            viewModel.rotateFloatingReference(rotDelta)
-                        }
-                    }
-                )
-            }
 
             // Main Hardware-Accelerated Animation Canvas (Hardware Accel, Stylus & Virtual Cursor)
             CanvasView(
@@ -273,6 +338,9 @@ fun AnimationEditorScreen(
                 activeSelection = uiState.activeSelection,
                 tabletSettings = uiState.preferences.tabletSettings,
                 themeAccentColor = currentTheme.accent,
+                onFocusActive = {
+                    runCatching { mobileFocusRequester.requestFocus() }
+                },
                 onTransformChange = { z, px, py, r ->
                     viewModel.updateTransform(z, px, py, r)
                 },
@@ -280,8 +348,8 @@ fun AnimationEditorScreen(
                     viewModel.addStrokeToCurrentLayer(stroke)
                 },
                 onEyedropperColorPicked = { pickedColor ->
-                    viewModel.setColor(pickedColor)
-                    viewModel.selectTool(ToolType.PENCIL)
+                    viewModel.completeEyedropperColorPick(pickedColor)
+                    Toast.makeText(context, "Cor capturada!", Toast.LENGTH_SHORT).show()
                 },
                 onBucketFill = { x, y ->
                     viewModel.performBucketFill(x, y)
@@ -336,24 +404,30 @@ fun AnimationEditorScreen(
                 onMultiFingerGesture = { gesture ->
                     viewModel.executeMultiFingerGesture(gesture)
                 },
-                isFloatingRefBelowCanvas = isFloatingRefBelow
-            )
-
-            if (uiState.referenceImage.isVisible && uiState.referenceImage.renderAboveCanvas) {
-                FloatingReferenceImageSurface(
-                    refState = uiState.referenceImage,
-                    theme = currentTheme,
-                    onTransformDelta = { dx, dy, zoomDelta, rotDelta ->
-                        viewModel.updateFloatingReferenceOffset(dx, dy)
-                        if (abs(zoomDelta - 1f) > 0.002f) {
-                            viewModel.updateFloatingReferenceScale(uiState.referenceImage.scale * zoomDelta)
-                        }
-                        if (abs(rotDelta) > 0.1f) {
-                            viewModel.rotateFloatingReference(rotDelta)
-                        }
+                isFloatingRefBelowCanvas = isFloatingRefBelow,
+                eraserSize = uiState.eraserSize,
+                referenceImage = uiState.referenceImage,
+                onFloatingRefTransformDelta = { dx, dy, zoomDelta, rotDelta ->
+                    viewModel.updateFloatingReferenceOffset(dx, dy)
+                    if (abs(zoomDelta - 1f) > 0.002f) {
+                        viewModel.updateFloatingReferenceScale(uiState.referenceImage.scale * zoomDelta)
                     }
-                )
-            }
+                    if (abs(rotDelta) > 0.1f) {
+                        viewModel.rotateFloatingReference(rotDelta)
+                    }
+                },
+                isCameraSideView3D = uiState.isCameraSideView3D,
+                isCameraModeActive = uiState.isCameraTimelineOpen,
+                cameraToolAction = uiState.cameraToolAction,
+                onCameraTransformDelta = { dx, dy, zoomFactor, rotDelta, fovDelta, dYaw, dPitch ->
+                    if (abs(dx) > 0.01f || abs(dy) > 0.01f) viewModel.nudgeCameraPan(dx, dy)
+                    if (abs(zoomFactor - 1f) > 0.001f) viewModel.zoomCameraBy(zoomFactor)
+                    if (abs(rotDelta) > 0.01f) viewModel.rotateCameraBy(rotDelta)
+                    if (abs(fovDelta) > 0.01f) viewModel.adjustCameraFov(fovDelta)
+                    if (abs(dYaw) > 0.01f || abs(dPitch) > 0.01f) viewModel.tiltOrbitCameraBy(dYaw, dPitch)
+                },
+                theme = currentTheme
+            )
 
             // Unobstructed Top HUD Stack (Collaborators + Procreate Brush Trigger — zero top bar clutter)
             Column(
@@ -364,13 +438,15 @@ fun AnimationEditorScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                // Horizontal Compact Collaborators Strip (Never covered by toolbars, hideable in Settings)
-                CollaboratorHorizontalStrip(
-                    connectedFriends = uiState.connectedFriends,
-                    showHud = uiState.preferences.showCanvasCollaboratorsHud,
-                    fallbackPingMs = uiState.currentPingMs,
-                    theme = currentTheme
-                )
+                // Horizontal Compact Collaborators Strip (Never covered by toolbars, hidden during Zen Mode)
+                if (!uiState.isZenModeActive) {
+                    CollaboratorHorizontalStrip(
+                        connectedFriends = uiState.connectedFriends,
+                        showHud = uiState.preferences.showCanvasCollaboratorsHud,
+                        fallbackPingMs = uiState.currentPingMs,
+                        theme = currentTheme
+                    )
+                }
 
                 if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideBrushBar) {
                     Row(
@@ -404,7 +480,7 @@ fun AnimationEditorScreen(
                                         .height(14.dp)
                                 )
                                 Text(
-                                    text = "${uiState.activeBrushPreset.shortLabel} • ${uiState.brushSize.toInt()}px",
+                                    text = "${uiState.activeBrushPreset.shortLabel} • ${(if (uiState.selectedTool == ToolType.ERASER) uiState.eraserSize else uiState.brushSize).toInt()}px",
                                     fontSize = 10.5.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = textColor,
@@ -419,7 +495,7 @@ fun AnimationEditorScreen(
                         }
 
                         // Subtle optional Rotation Reset chip (replaces rotated angle badge moved out of removed top bar)
-                        if (abs(uiState.rotation) > 0.5f) {
+                        if (!uiState.isZenModeActive && abs(uiState.rotation) > 0.5f) {
                             val rotDeg = uiState.rotation.roundToInt()
                             Surface(
                                 modifier = Modifier
@@ -454,18 +530,20 @@ fun AnimationEditorScreen(
                     }
                 }
 
-                FriendBrushOfferBanner(
-                    offer = uiState.pendingFriendBrushOffer,
-                    theme = currentTheme,
-                    onAccept = {
-                        viewModel.acceptFriendBrushOffer(context)
-                        Toast.makeText(context, "Brush baixado para seus Importados!", Toast.LENGTH_SHORT).show()
-                    },
-                    onDecline = { viewModel.declineFriendBrushOffer() }
-                )
+                if (!uiState.isZenModeActive) {
+                    FriendBrushOfferBanner(
+                        offer = uiState.pendingFriendBrushOffer,
+                        theme = currentTheme,
+                        onAccept = {
+                            viewModel.acceptFriendBrushOffer(context)
+                            Toast.makeText(context, "Brush baixado para seus Importados!", Toast.LENGTH_SHORT).show()
+                        },
+                        onDecline = { viewModel.declineFriendBrushOffer() }
+                    )
+                }
 
                 // Floating Mobile Eraser Options Toolbar (when ToolType.ERASER is active)
-                if (uiState.selectedTool == ToolType.ERASER) {
+                if (uiState.selectedTool == ToolType.ERASER && !uiState.isZenModeActive) {
                     Surface(
                         modifier = Modifier
                             .shadow(6.dp, RoundedCornerShape(12.dp))
@@ -479,9 +557,7 @@ fun AnimationEditorScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Icon(
-                                Icons.Default.Clear,
-                                contentDescription = "Borracha",
+                            EraserVectorIcon(
                                 tint = NeonPink,
                                 modifier = Modifier.size(14.dp)
                             )
@@ -515,15 +591,19 @@ fun AnimationEditorScreen(
                                 }
                             }
 
-                            Text(
-                                text = "${uiState.brushSize.toInt()}px",
-                                fontSize = 9.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = textColor
+                            InlineNumericPxInput(
+                                valuePx = uiState.eraserSize,
+                                minPx = 2f,
+                                maxPx = 120f,
+                                accentColor = NeonPink,
+                                textColor = textColor,
+                                panelBgColor = panelColor,
+                                testTag = "mobile_eraser_px_input",
+                                onCommitValue = { viewModel.setEraserSize(it) }
                             )
                             Slider(
-                                value = uiState.brushSize,
-                                onValueChange = { viewModel.setBrushSize(it) },
+                                value = uiState.eraserSize,
+                                onValueChange = { viewModel.setEraserSize(it) },
                                 valueRange = 2f..80f,
                                 modifier = Modifier
                                     .width(55.dp)
@@ -569,8 +649,35 @@ fun AnimationEditorScreen(
                     }
                 }
 
+                // Quick Config. Balde chip when Bucket tool is selected
+                if (uiState.selectedTool == ToolType.BUCKET && !uiState.isZenModeActive) {
+                    Surface(
+                        modifier = Modifier
+                            .shadow(6.dp, RoundedCornerShape(999.dp))
+                            .clip(RoundedCornerShape(999.dp))
+                            .border(1.dp, accentColor, RoundedCornerShape(999.dp))
+                            .clickable { viewModel.toggleBucketConfig() }
+                            .testTag("mobile_bucket_config_chip"),
+                        color = panelColor.copy(alpha = 0.96f)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Icon(Icons.Default.FormatPaint, contentDescription = null, tint = accentColor, modifier = Modifier.size(13.dp))
+                            Text(
+                                text = "Config. Balde (+${uiState.bucketConfig.expandPixels}px)",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = textColor
+                            )
+                        }
+                    }
+                }
+
                 // Floating FlipaClip-style Selection Actions Toolbar
-                if (uiState.activeSelection.isActive) {
+                if (uiState.activeSelection.isActive && !uiState.isZenModeActive) {
                     Surface(
                         modifier = Modifier
                             .shadow(10.dp, RoundedCornerShape(20.dp))
@@ -580,10 +687,43 @@ fun AnimationEditorScreen(
                         color = panelColor.copy(alpha = 0.96f)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                            modifier = Modifier
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 6.dp, vertical = 3.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
+                            Surface(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { viewModel.invertSelection() }
+                                    .border(
+                                        1.dp,
+                                        if (uiState.activeSelection.isInverted) OrangeAccent else textColor.copy(alpha = 0.25f),
+                                        RoundedCornerShape(8.dp)
+                                    )
+                                    .testTag("mobile_invert_selection_btn"),
+                                color = if (uiState.activeSelection.isInverted) OrangeAccent.copy(alpha = 0.25f) else Color.Transparent
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.CompareArrows,
+                                        contentDescription = "Inverter Seleção",
+                                        tint = if (uiState.activeSelection.isInverted) OrangeAccent else textColor,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Text(
+                                        text = "Inverter",
+                                        fontSize = 9.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (uiState.activeSelection.isInverted) OrangeAccent else textColor
+                                    )
+                                }
+                            }
                             IconButton(onClick = { viewModel.flipSelectionH() }, modifier = Modifier.size(32.dp)) {
                                 Icon(Icons.Default.SwapHoriz, contentDescription = "Espelhar H", tint = textColor, modifier = Modifier.size(18.dp))
                             }
@@ -629,7 +769,7 @@ fun AnimationEditorScreen(
 
                 // Floating Mobile Video Transform HUD (when Transformar Vídeo mode is active)
                 val activeVideoAsset = uiState.project.mediaAssets.firstOrNull { it.type == "video" || it.type == "gif" }
-                if (uiState.isVideoTransformMode && activeVideoAsset != null) {
+                if (uiState.isVideoTransformMode && activeVideoAsset != null && !uiState.isZenModeActive) {
                     Surface(
                         modifier = Modifier
                             .shadow(8.dp, RoundedCornerShape(14.dp))
@@ -682,7 +822,7 @@ fun AnimationEditorScreen(
                     uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers?.getOrNull(uiState.activeLayerIndex)
                 } else null
                 val activeLayerImgAttachment = activeLayerImageTarget?.imageAttachment
-                if (activeLayerImageTarget != null && activeLayerImgAttachment != null) {
+                if (activeLayerImageTarget != null && activeLayerImgAttachment != null && !uiState.isZenModeActive) {
                     TimelineLayerImageTransformHud(
                         layerName = activeLayerImageTarget.name,
                         attachment = activeLayerImgAttachment,
@@ -705,7 +845,7 @@ fun AnimationEditorScreen(
                     )
                 }
 
-                if (uiState.referenceImage.isVisible) {
+                if (uiState.referenceImage.isVisible && !uiState.isZenModeActive) {
                     FloatingReferenceControlsBar(
                         refState = uiState.referenceImage,
                         theme = currentTheme,
@@ -716,6 +856,8 @@ fun AnimationEditorScreen(
                             viewModel.updateFloatingReferenceScale(uiState.referenceImage.scale + step)
                         },
                         onRotateStep = { deg -> viewModel.rotateFloatingReference(deg) },
+                        onScaleChange = { viewModel.setFloatingReferenceScaleDirect(it) },
+                        onRotationChange = { viewModel.setFloatingReferenceRotationDirect(it) },
                         onResetTransform = { viewModel.resetFloatingReferenceTransform() },
                         onDeleteWindow = { viewModel.clearReferenceImage() }
                     )
@@ -723,7 +865,7 @@ fun AnimationEditorScreen(
 
                 // Procreate-style Krita Brush Library Drawer (12 Native + Imported .kpp/.bundle)
                 ProcreateBrushPickerSheet(
-                    visible = showProcreateBrushes,
+                    visible = showProcreateBrushes && !uiState.isZenModeActive,
                     activePreset = uiState.activeBrushPreset,
                     brushSize = uiState.brushSize,
                     brushOpacity = uiState.brushOpacity,
@@ -734,43 +876,71 @@ fun AnimationEditorScreen(
                     onChangeOpacity = { viewModel.setBrushOpacity(it) },
                     onRequestImportKrita = { kritaBrushPicker.launch(arrayOf("*/*")) },
                     onDeleteImportedBrush = { viewModel.deleteImportedKritaBrush(context, it) },
-                    onDismiss = { showProcreateBrushes = false }
+                    onDismiss = { showProcreateBrushes = false },
+                    onOpenBrushStudio = {
+                        viewModel.toggleBrushStudio()
+                        showProcreateBrushes = false
+                    },
+                    selectedTool = uiState.selectedTool,
+                    onSelectTool = { viewModel.selectTool(it) }
                 )
             }
 
-            // Floating Left Toolbox Palette (Thumb-friendly touch tools + 3-wheels extra tools toggle)
+            // Floating Left Toolbox Palette OR Camera Mode Dedicated Toolbar
             if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideToolbar) {
-                ToolboxPalette(
-                    selectedTool = uiState.selectedTool,
-                    currentColor = uiState.currentColor,
-                    brushSize = uiState.brushSize,
-                    isStylusOnlyMode = uiState.isStylusOnlyMode,
-                    canUndo = uiState.canUndo,
-                    canRedo = uiState.canRedo,
-                    onSelectTool = { viewModel.selectTool(it) },
-                    onChangeBrushSize = { viewModel.setBrushSize(it) },
-                    onOpenColorPicker = { viewModel.openDialog(EditorDialog.COLOR_PICKER) },
-                    onToggleStylusOnly = { viewModel.setStylusOnlyMode(!uiState.isStylusOnlyMode) },
-                    onUndo = { viewModel.undo() },
-                    onRedo = { viewModel.redo() },
-                    onResetZoom = { viewModel.resetCanvasTransform() },
-                    theme = currentTheme,
-                    eraserUsesPressure = uiState.preferences.eraserUsesPressure,
-                    onToggleEraserPressure = { viewModel.setEraserUsesPressure(!uiState.preferences.eraserUsesPressure) },
-                    eraserPresetId = uiState.preferences.eraserBrushPresetId,
-                    onSelectEraserPreset = { viewModel.setEraserBrushPresetId(it) },
-                    isExtraToolsOpen = showExtraToolsMenu,
-                    onToggleExtraTools = { showExtraToolsMenu = !showExtraToolsMenu },
-                    onOpenBrushStudio = { viewModel.toggleBrushStudio() },
-                    modifier = Modifier
-                        .align(Alignment.CenterStart)
-                        .padding(start = 8.dp)
-                )
+                if (uiState.isCameraTimelineOpen) {
+                    CameraSideToolbar(
+                        selectedAction = uiState.cameraToolAction,
+                        is3DMode = uiState.project.camera3D.cameraMode == CameraMode.MODE_3D,
+                        isSideView3D = uiState.isCameraSideView3D,
+                        showCaptureFrame = uiState.project.camera3D.showCaptureFrame,
+                        theme = currentTheme,
+                        onSelectAction = { viewModel.setCameraToolAction(it) },
+                        onAddOrUpdateKeyframe = { viewModel.addOrUpdateCameraKeyframeAtCurrentFrame(null) },
+                        onConnectTwoKeyframes = { viewModel.connectTwoCameraKeyframes() },
+                        onToggleCaptureFrame = { viewModel.toggleCameraShowCaptureFrame() },
+                        onToggleSideView3D = { viewModel.toggleCameraSideView3D() },
+                        onResetCurrentKeyframe = { viewModel.resetCameraAtCurrentFrame() },
+                        onCloseCameraMode = { viewModel.closeCameraTimeline() },
+                        modifier = Modifier
+                            .align(Alignment.CenterStart)
+                            .padding(start = 8.dp)
+                    )
+                } else {
+                    ToolboxPalette(
+                        selectedTool = uiState.selectedTool,
+                        currentColor = uiState.currentColor,
+                        brushSize = uiState.brushSize,
+                        isStylusOnlyMode = uiState.isStylusOnlyMode,
+                        canUndo = uiState.canUndo,
+                        canRedo = uiState.canRedo,
+                        onSelectTool = { viewModel.selectTool(it) },
+                        onChangeBrushSize = { viewModel.setBrushSize(it) },
+                        onOpenColorPicker = { viewModel.openDialog(EditorDialog.COLOR_PICKER) },
+                        onToggleStylusOnly = { viewModel.setStylusOnlyMode(!uiState.isStylusOnlyMode) },
+                        onUndo = { viewModel.undo() },
+                        onRedo = { viewModel.redo() },
+                        onResetZoom = { viewModel.resetCanvasTransform() },
+                        theme = currentTheme,
+                        eraserUsesPressure = uiState.preferences.eraserUsesPressure,
+                        onToggleEraserPressure = { viewModel.setEraserUsesPressure(!uiState.preferences.eraserUsesPressure) },
+                        eraserPresetId = uiState.preferences.eraserBrushPresetId,
+                        onSelectEraserPreset = { viewModel.setEraserBrushPresetId(it) },
+                        isExtraToolsOpen = showExtraToolsMenu,
+                        onToggleExtraTools = { showExtraToolsMenu = !showExtraToolsMenu },
+                        onOpenBrushStudio = { viewModel.toggleBrushStudio() },
+                        eraserSize = uiState.eraserSize,
+                        onChangeEraserSize = { viewModel.setEraserSize(it) },
+                        modifier = Modifier
+                            .align(Alignment.CenterStart)
+                            .padding(start = 8.dp)
+                    )
+                }
             }
 
             // Floating Mobile Brush Studio Configurator Drawer
             BrushStudioDrawer(
-                visible = uiState.isBrushStudioOpen && !showExtraToolsMenu,
+                visible = uiState.isBrushStudioOpen && !showExtraToolsMenu && !uiState.isZenModeActive,
                 activePreset = uiState.activeBrushPreset,
                 nativePresets = uiState.nativeBrushPresets,
                 importedPresets = uiState.importedKritaBrushes,
@@ -841,16 +1011,60 @@ fun AnimationEditorScreen(
                 onUpdatePerspectiveRulerSettings = { viewModel.updatePerspectiveRulerSettings(it) },
                 onionSkinOpacity = uiState.project.onionSkin.opacity,
                 onChangeOnionSkinOpacity = { viewModel.setOnionSkinOpacity(it) },
+                onOpenPaletteTray = { viewModel.openPaletteTray() },
+                isQuickPaletteOpen = uiState.isQuickPaletteOpen,
+                onToggleQuickPalette = { viewModel.toggleQuickPalette() },
+                onOpenCameraTimeline = { viewModel.toggleCameraTimeline() },
+                isCameraTimelineOpen = uiState.isCameraTimelineOpen,
                 modifier = Modifier
                     .align(Alignment.CenterStart)
                     .padding(start = 58.dp)
             )
 
+            // Popover Flutuante Config. Balde (Expandir px + Pintar por baixo + Camadas Referência)
+            if (uiState.showBucketConfig && !uiState.isZenModeActive) {
+                val currFrameBucket = uiState.project.frames.getOrNull(uiState.currentFrameIndex)
+                BucketConfigPopover(
+                    config = uiState.bucketConfig,
+                    frameLayers = currFrameBucket?.layers ?: emptyList(),
+                    localLayers = currFrameBucket?.localLayers ?: emptyList(),
+                    panelColor = panelColor,
+                    accentColor = accentColor,
+                    textColor = textColor,
+                    onUpdateConfig = { viewModel.updateBucketConfig(it) },
+                    onToggleTimelineLayerReference = { viewModel.toggleTimelineLayerBucketReference(it) },
+                    onToggleLocalLayerReference = { viewModel.toggleFrameLocalLayerBucketReference(it) },
+                    onCreateBucketLayer = { viewModel.addBucketLayer(insertBelowActive = true) },
+                    onSelectBucketTargetLayer = { viewModel.setActiveBucketTargetLayer(it) },
+                    onDismiss = { viewModel.closeBucketConfig() },
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(start = 58.dp)
+                )
+            }
+
+            // Janela Flutuante de Palheta Rápida (Já Escolhida, Arrastável e com Cadeado)
+            if (uiState.isQuickPaletteOpen && !uiState.isZenModeActive) {
+                QuickPaletteFloatingWindow(
+                    swatches = uiState.preferences.colorPalette.swatches,
+                    currentColor = uiState.currentColor,
+                    isLocked = uiState.isQuickPaletteLocked,
+                    panelColor = panelColor,
+                    accentColor = accentColor,
+                    textColor = textColor,
+                    onSelectColor = { viewModel.setColor(it) },
+                    onOpenFullPaletteTray = { viewModel.openPaletteTray() },
+                    onToggleLock = { viewModel.toggleQuickPaletteLock() },
+                    onClose = { viewModel.closeQuickPalette() },
+                    modifier = Modifier.align(Alignment.TopEnd)
+                )
+            }
+
             // Painel Flutuante de Subcamadas Isoladas por Quadro ("Camadas do Quadro")
             val currFrameObj = uiState.project.frames.getOrNull(uiState.currentFrameIndex)
             val activeTimelineLayerName = currFrameObj?.layers?.getOrNull(uiState.activeLayerIndex)?.name ?: "Camada Principal"
             FrameLayersFloatingPanel(
-                visible = uiState.isFrameLayersPanelOpen,
+                visible = uiState.isFrameLayersPanelOpen && !uiState.isZenModeActive,
                 currentFrameIndex = uiState.currentFrameIndex,
                 localLayers = currFrameObj?.localLayers ?: emptyList(),
                 activeLocalLayerIndex = uiState.activeLocalLayerIndex,
@@ -870,6 +1084,9 @@ fun AnimationEditorScreen(
                 onChangeOpacity = { idx, op -> viewModel.setFrameLocalLayerOpacity(idx, op) },
                 onChangeBlendEffect = { idx, eff -> viewModel.setFrameLocalLayerBlendEffect(idx, eff) },
                 onToggleClippingMask = { viewModel.toggleFrameLocalLayerClippingMask(it) },
+                onAddBucketLayer = { viewModel.addFrameLocalBucketLayer() },
+                onToggleBucketReference = { viewModel.toggleFrameLocalLayerBucketReference(it) },
+                onSelectBucketTargetLayer = { viewModel.setActiveBucketTargetLayer(it) },
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
                     .padding(end = 10.dp)
@@ -951,6 +1168,11 @@ fun AnimationEditorScreen(
                 onUpdateAssetScale = { id, sc -> viewModel.updateSpecialAssetScale(id, sc) },
                 onResetAssetTransform = { viewModel.resetSpecialAssetTransform(it) },
                 onToggleVideoTransformMode = { viewModel.toggleVideoTransformMode() },
+                onMoveLayerUp = { viewModel.moveLayerUp(it) },
+                onMoveLayerDown = { viewModel.moveLayerDown(it) },
+                onAddBucketLayer = { viewModel.addBucketLayer(insertBelowActive = true) },
+                onSelectBucketTargetLayer = { viewModel.setActiveBucketTargetLayer(it) },
+                onToggleBucketReference = { viewModel.toggleTimelineLayerBucketReference(it) },
                 onDismiss = { viewModel.closeDialog() }
             )
         }
@@ -958,8 +1180,11 @@ fun AnimationEditorScreen(
             ColorPickerDialog(
                 initialColor = uiState.currentColor,
                 recentColors = uiState.recentColors,
-                onColorSelected = { viewModel.setColor(it) },
-                onDismiss = { viewModel.closeDialog() }
+                onColorSelected = { viewModel.setColor(it, recordToRecents = false) },
+                onDismiss = {
+                    viewModel.recordRecentColor(uiState.currentColor)
+                    viewModel.closeDialog()
+                }
             )
         }
         EditorDialog.EXPORT -> {
@@ -975,7 +1200,10 @@ fun AnimationEditorScreen(
                 onClose = {
                     viewModel.dismissExportState()
                     viewModel.closeDialog()
-                }
+                },
+                cameraEnabled = uiState.project.camera3D.isEnabled,
+                cameraCropOnly = uiState.exportCameraCropOnly,
+                onToggleCameraCropOnly = { viewModel.setExportCameraCropOnly(it) }
             )
         }
         EditorDialog.PROJECT_SETTINGS -> {
@@ -1025,4 +1253,25 @@ fun AnimationEditorScreen(
         },
         onDismiss = { viewModel.dismissReferenceImageChoice() }
     )
+
+    if (uiState.isPaletteTrayOpen) {
+        ColorPaletteTrayModal(
+            paletteConfig = uiState.preferences.colorPalette,
+            currentColor = uiState.currentColor,
+            selectedSlotIndex = uiState.selectedPaletteSlotIndex,
+            theme = currentTheme,
+            onSelectSlot = { viewModel.selectPaletteSlot(it) },
+            onSaveToSlot = { viewModel.saveCurrentColorToPaletteSlot(it) },
+            onRemoveSlot = { viewModel.removePaletteSlot(it) },
+            onRollColorTheoryDice = { viewModel.generateColorTheoryPaletteRow() },
+            onChangeGridSize = { cols, rows -> viewModel.setPaletteGridSize(cols, rows) },
+            onActivateEyedropper = {
+                viewModel.startEyedropperFromPaletteTray()
+            },
+            onOpenColorWheel = {
+                viewModel.openColorWheelFromPaletteTray()
+            },
+            onDismiss = { viewModel.closePaletteTray() }
+        )
+    }
 }

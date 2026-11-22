@@ -50,15 +50,33 @@ object KritaBrushImporter {
         val nextId = ((existing.maxOfOrNull { it.id } ?: 1000).coerceAtLeast(1000)) + 1
 
         val imported = when {
+            isZipSignature(rawBytes) -> parseBundleBytes(rawBytes, nextId)
+            isPngSignature(rawBytes) -> listOfNotNull(
+                parseKppBytes(rawBytes, displayName, nextId)
+                    ?: parsePngTipPresetBytes(rawBytes, displayName, nextId)
+            )
+            isGimpBrushOrHoseSignature(rawBytes) -> listOfNotNull(
+                parseGbrBytes(rawBytes, displayName, nextId)
+                    ?: parseGihPresetBytes(rawBytes, displayName, nextId)
+            )
+            isRawXmlPreset(rawBytes) -> listOfNotNull(parseRawPresetXmlBytes(rawBytes, displayName, nextId))
+            isJsonContent(rawBytes) -> parseJsonPresetBytes(rawBytes, nextId)
             displayName.endsWith(".bundle", ignoreCase = true) ||
-                displayName.endsWith(".zip", ignoreCase = true) ||
-                isZipSignature(rawBytes) -> parseBundleBytes(rawBytes, nextId)
-
+                displayName.endsWith(".zip", ignoreCase = true) -> parseBundleBytes(rawBytes, nextId)
             displayName.endsWith(".gbr", ignoreCase = true) ->
                 listOfNotNull(parseGbrBytes(rawBytes, displayName, nextId))
-
+            displayName.endsWith(".gih", ignoreCase = true) ->
+                listOfNotNull(parseGihPresetBytes(rawBytes, displayName, nextId))
             displayName.endsWith(".json", ignoreCase = true) -> parseJsonPresetBytes(rawBytes, nextId)
-            else -> listOfNotNull(parseKppBytes(rawBytes, displayName, nextId))
+            displayName.endsWith(".xml", ignoreCase = true) ->
+                listOfNotNull(parseRawPresetXmlBytes(rawBytes, displayName, nextId))
+            else -> listOfNotNull(
+                parseKppBytes(rawBytes, displayName, nextId)
+                    ?: parseRawPresetXmlBytes(rawBytes, displayName, nextId)
+                    ?: parseGbrBytes(rawBytes, displayName, nextId)
+                    ?: parseGihPresetBytes(rawBytes, displayName, nextId)
+                    ?: parsePngTipPresetBytes(rawBytes, displayName, nextId)
+            )
         }
 
         val addedPresets = mutableListOf<BrushPreset>()
@@ -94,8 +112,9 @@ object KritaBrushImporter {
         val results = mutableListOf<BrushPreset>()
         var currentId = startingId
         val kppEntries = mutableListOf<Pair<String, ByteArray>>()
+        val xmlEntries = mutableListOf<Pair<String, ByteArray>>()
         val jsonEntries = mutableListOf<Pair<String, ByteArray>>()
-        val gbrEntries = mutableListOf<Pair<String, ByteArray>>()
+        val tipEntries = mutableListOf<Pair<String, ByteArray>>()
         val brushTipMap = HashMap<String, ByteArray>()
 
         try {
@@ -105,59 +124,106 @@ object KritaBrushImporter {
                     val name = entry.name
                     if (!entry.isDirectory) {
                         val lower = name.replace('\\', '/').lowercase()
-                        when {
-                            lower.endsWith(".kpp") -> {
-                                kppEntries.add(name to zis.readBytes())
-                            }
-                            lower.endsWith(".json") -> {
-                                if (!lower.endsWith("manifest.json")) {
-                                    jsonEntries.add(name to zis.readBytes())
+                        try {
+                            when {
+                                lower.endsWith(".kpp") -> {
+                                    kppEntries.add(name to zis.readBytes())
+                                }
+                                lower.endsWith(".json") -> {
+                                    if (!lower.endsWith("manifest.json")) {
+                                        jsonEntries.add(name to zis.readBytes())
+                                    }
+                                }
+                                lower.endsWith(".xml") && !lower.endsWith("manifest.xml") -> {
+                                    val bytes = zis.readBytes()
+                                    if (isRawXmlPreset(bytes)) {
+                                        xmlEntries.add(name to bytes)
+                                    }
+                                }
+                                lower.endsWith(".gbr") || lower.endsWith(".gih") || lower.endsWith(".png") || lower.endsWith(".pat") -> {
+                                    val bytes = zis.readBytes()
+                                    if (!lower.contains("paintoppresets/")) {
+                                        indexBrushTipBytes(brushTipMap, lower, bytes)
+                                        if (lower.endsWith(".gbr") || lower.endsWith(".gih") || lower.endsWith(".png")) {
+                                            tipEntries.add(name to bytes)
+                                        }
+                                    } else if (isPngSignature(bytes) && extractKritaPresetXmlFromPng(bytes) != null) {
+                                        kppEntries.add(name to bytes)
+                                    }
                                 }
                             }
-                            lower.endsWith(".gbr") || lower.endsWith(".gih") || lower.endsWith(".png") -> {
-                                val bytes = zis.readBytes()
-                                if (!lower.contains("paintoppresets/")) {
-                                    indexBrushTipBytes(brushTipMap, lower, bytes)
-                                }
-                                if (lower.endsWith(".gbr")) {
-                                    gbrEntries.add(name to bytes)
-                                }
-                            }
+                        } catch (entryErr: Exception) {
+                            Log.w(TAG, "Skipping corrupt ZIP entry '$name': ${entryErr.message}")
                         }
                     }
-                    zis.closeEntry()
+                    try { zis.closeEntry() } catch (_: Exception) {}
                     entry = zis.nextEntry
                 }
             }
 
             kppEntries.forEach { (name, bytes) ->
-                val parsed = parseKppBytes(
-                    rawBytes = bytes,
-                    fileName = name.substringAfterLast('/'),
-                    presetId = currentId,
-                    externalBrushTips = brushTipMap
-                )
-                if (parsed != null) {
-                    results.add(parsed)
-                    currentId++
-                }
-            }
-
-            jsonEntries.forEach { (_, bytes) ->
-                val parsedList = parseJsonPresetBytes(bytes, currentId)
-                parsedList.forEach { p ->
-                    results.add(p.copy(id = currentId))
-                    currentId++
-                }
-            }
-
-            // Fallback to standalone .gbr brushes only if the archive has no .kpp/.json presets
-            if (results.isEmpty()) {
-                gbrEntries.forEach { (name, bytes) ->
-                    val parsed = parseGbrBytes(bytes, name.substringAfterLast('/'), currentId)
+                try {
+                    val fileName = name.substringAfterLast('/')
+                    val parsed = if (isRawXmlPreset(bytes)) {
+                        parseRawPresetXmlBytes(bytes, fileName, currentId, brushTipMap)
+                    } else {
+                        parseKppBytes(
+                            rawBytes = bytes,
+                            fileName = fileName,
+                            presetId = currentId,
+                            externalBrushTips = brushTipMap
+                        )
+                    }
                     if (parsed != null) {
                         results.add(parsed)
                         currentId++
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Skipping failing .kpp '$name': ${e.message}")
+                }
+            }
+
+            xmlEntries.forEach { (name, bytes) ->
+                try {
+                    val parsed = parseRawPresetXmlBytes(bytes, name.substringAfterLast('/'), currentId, brushTipMap)
+                    if (parsed != null) {
+                        results.add(parsed)
+                        currentId++
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Skipping failing .xml preset '$name': ${e.message}")
+                }
+            }
+
+            jsonEntries.forEach { (name, bytes) ->
+                try {
+                    val parsedList = parseJsonPresetBytes(bytes, currentId)
+                    parsedList.forEach { p ->
+                        results.add(p.copy(id = currentId))
+                        currentId++
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Skipping failing .json preset '$name': ${e.message}")
+                }
+            }
+
+            // Fallback to standalone .gbr/.gih/.png tips only if no .kpp/.xml/.json presets were extracted
+            if (results.isEmpty()) {
+                tipEntries.forEach { (name, bytes) ->
+                    try {
+                        val fileName = name.substringAfterLast('/')
+                        val lower = fileName.lowercase()
+                        val parsed = when {
+                            lower.endsWith(".gih") -> parseGihPresetBytes(bytes, fileName, currentId)
+                            lower.endsWith(".png") -> parsePngTipPresetBytes(bytes, fileName, currentId)
+                            else -> parseGbrBytes(bytes, fileName, currentId)
+                        }
+                        if (parsed != null) {
+                            results.add(parsed)
+                            currentId++
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Skipping failing tip '$name': ${e.message}")
                     }
                 }
             }
@@ -165,16 +231,19 @@ object KritaBrushImporter {
             Log.e(TAG, "Error parsing .bundle archive: ${e.message}")
         } finally {
             kppEntries.clear()
+            xmlEntries.clear()
             jsonEntries.clear()
-            gbrEntries.clear()
+            tipEntries.clear()
             brushTipMap.clear()
         }
         return results
     }
 
     private fun indexBrushTipBytes(map: MutableMap<String, ByteArray>, lowerPath: String, bytes: ByteArray) {
+        val decodedPath = urlDecodeSafe(lowerPath)
         map[lowerPath] = bytes
-        val baseName = lowerPath.substringAfterLast('/')
+        map[decodedPath] = bytes
+        val baseName = decodedPath.substringAfterLast('/')
         if (baseName.isNotEmpty()) {
             map[baseName] = bytes
             val noExt = baseName.substringBeforeLast('.')
@@ -182,9 +251,13 @@ object KritaBrushImporter {
                 map.putIfAbsent(noExt, bytes)
             }
         }
-        val afterBrushes = lowerPath.substringAfter("brushes/", "")
+        val afterBrushes = decodedPath.substringAfter("brushes/", "")
         if (afterBrushes.isNotEmpty()) {
             map[afterBrushes] = bytes
+        }
+        val afterPatterns = decodedPath.substringAfter("patterns/", "")
+        if (afterPatterns.isNotEmpty()) {
+            map[afterPatterns] = bytes
         }
     }
 
@@ -245,16 +318,109 @@ object KritaBrushImporter {
         }
     }
 
+    fun parseGihPresetBytes(rawBytes: ByteArray, fileName: String, presetId: Int = 1001): BrushPreset? {
+        val tipStamp = extractGihTipStamp(rawBytes) ?: return null
+        val fallbackName = fileName.substringAfterLast('/').substringAfterLast('\\')
+            .removeSuffix(".gih").removeSuffix(".GIH")
+            .ifBlank { "GIMP Hose #$presetId" }
+        val engineKind = mapKritaMetaToEngine("gih_hose", fallbackName)
+        return BrushPreset(
+            id = presetId,
+            namePt = fallbackName,
+            shortLabel = fallbackName.take(12),
+            defaultSize = 20f,
+            defaultOpacity = defaultOpacityFor(engineKind),
+            toolType = ToolType.BRUSH,
+            textureNamePt = "Ponta animada .gih",
+            textureSymbol = symbolForEngine(engineKind),
+            descriptionPt = "Ponta raster importada (.gih GIMP Image Hose).",
+            engineKind = engineKind,
+            dynamicParams = BrushDynamicParams(
+                engineKind = engineKind,
+                hardness = defaultHardnessFor(engineKind),
+                spacing = 0.14f,
+                flow = 0.88f,
+                grainAmount = 0.25f,
+                aspectRatio = tipStamp.second,
+                angularJitter = 0.35f,
+                shapeKind = "predefined",
+                tipStampBase64 = tipStamp.first
+            ),
+            isImportedKrita = true,
+            kritaPaintOpId = "gih_tip",
+            iconBase64 = tipStamp.first
+        )
+    }
+
+    fun parsePngTipPresetBytes(rawBytes: ByteArray, fileName: String, presetId: Int = 1001): BrushPreset? {
+        if (!isPngSignature(rawBytes)) return null
+        val tipStamp = extractPngTipStamp(rawBytes) ?: return null
+        val fallbackName = fileName.substringAfterLast('/').substringAfterLast('\\')
+            .removeSuffix(".png").removeSuffix(".PNG")
+            .removeSuffix(".kpp").removeSuffix(".KPP")
+            .ifBlank { "Ponta PNG #$presetId" }
+        val engineKind = mapKritaMetaToEngine("png_tip", fallbackName)
+        return BrushPreset(
+            id = presetId,
+            namePt = fallbackName,
+            shortLabel = fallbackName.take(12),
+            defaultSize = defaultSizeFor(engineKind),
+            defaultOpacity = defaultOpacityFor(engineKind),
+            toolType = ToolType.BRUSH,
+            textureNamePt = "Ponta PNG importada",
+            textureSymbol = symbolForEngine(engineKind),
+            descriptionPt = "Ponta raster importada (.png).",
+            engineKind = engineKind,
+            dynamicParams = BrushDynamicParams(
+                engineKind = engineKind,
+                hardness = defaultHardnessFor(engineKind),
+                spacing = 0.12f,
+                flow = 0.90f,
+                aspectRatio = tipStamp.second,
+                shapeKind = "predefined",
+                tipStampBase64 = tipStamp.first
+            ),
+            isImportedKrita = true,
+            kritaPaintOpId = "png_tip",
+            iconBase64 = encodePngThumbnailBase64(rawBytes) ?: tipStamp.first
+        )
+    }
+
+    fun parseRawPresetXmlBytes(
+        rawBytes: ByteArray,
+        fileName: String,
+        presetId: Int = 1001,
+        externalBrushTips: Map<String, ByteArray> = emptyMap()
+    ): BrushPreset? {
+        if (!isRawXmlPreset(rawBytes)) return null
+        val xmlText = String(rawBytes, Charsets.UTF_8).trimStart('\uFEFF')
+        val cleanBaseName = fileName
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+            .removeSuffix(".kpp").removeSuffix(".KPP")
+            .removeSuffix(".xml").removeSuffix(".XML")
+            .ifBlank { "Brush Krita #$presetId" }
+        return buildPresetFromXmlAndThumbnail(
+            presetXml = xmlText,
+            rawNameFallback = cleanBaseName,
+            presetId = presetId,
+            thumbnailPngBytes = null,
+            externalBrushTips = externalBrushTips
+        )
+    }
+
     fun parseKppBytes(
         rawBytes: ByteArray,
         fileName: String,
         presetId: Int = 1001,
         externalBrushTips: Map<String, ByteArray> = emptyMap()
     ): BrushPreset? {
+        if (isRawXmlPreset(rawBytes)) {
+            return parseRawPresetXmlBytes(rawBytes, fileName, presetId, externalBrushTips)
+        }
         if (!isPngSignature(rawBytes)) return null
 
         val rawXml = extractKritaPresetXmlFromPng(rawBytes)
-        val presetXml = rawXml?.let { decodeXmlBody(it) }
         val cleanBaseName = fileName
             .substringAfterLast('/')
             .substringAfterLast('\\')
@@ -262,7 +428,24 @@ object KritaBrushImporter {
             .removeSuffix(".KPP")
             .ifBlank { "Brush Krita #$presetId" }
 
-        var parsedName = cleanBaseName
+        return buildPresetFromXmlAndThumbnail(
+            presetXml = rawXml,
+            rawNameFallback = cleanBaseName,
+            presetId = presetId,
+            thumbnailPngBytes = rawBytes,
+            externalBrushTips = externalBrushTips
+        )
+    }
+
+    private fun buildPresetFromXmlAndThumbnail(
+        presetXml: String?,
+        rawNameFallback: String,
+        presetId: Int,
+        thumbnailPngBytes: ByteArray?,
+        externalBrushTips: Map<String, ByteArray>
+    ): BrushPreset {
+        val cleanOuterXml = presetXml?.replace("<![CDATA[", "")?.replace("]]>", "")?.trimStart('\uFEFF')
+        var parsedName = rawNameFallback
         var paintOpId = "paintbrush"
         var parsedSize: Float? = null
         var parsedOpacity: Float? = null
@@ -280,53 +463,79 @@ object KritaBrushImporter {
         var parsedTextureStrength: Float? = null
         var parsedTipBase64: String? = null
         var tipAspectFromImage: Float? = null
+        var parsedDualColorOn = false
+        var parsedDualColorMode = "gradient"
+        var parsedDualColorMix = 0.5f
+        var parsedSecondaryColor = 0xFFFFFFFFL
+        var parsedInnerDotsOn = false
+        var sprayDensity: Float? = null
+        var sprayDotSize: Float? = null
+        var parsedDualShapeOn = false
+        var parsedSecondaryShapeKind = "circle"
+        var parsedSecondaryTipBase64: String? = null
+        var parsedDualShapeScale = 0.68f
+        var parsedDualShapeBlendMode = "combine"
 
-        if (!presetXml.isNullOrBlank()) {
-            extractXmlAttr(presetXml, "name")?.takeIf { it.isNotBlank() }?.let {
-                parsedName = decodeXmlEntities(it).trim()
+        if (!cleanOuterXml.isNullOrBlank()) {
+            extractXmlAttr(cleanOuterXml, "name")?.takeIf { it.isNotBlank() }?.let {
+                parsedName = it.trim()
             }
-            extractXmlAttr(presetXml, "paintopid")?.takeIf { it.isNotBlank() }?.let {
-                paintOpId = decodeXmlEntities(it).trim().lowercase()
+            extractXmlAttr(cleanOuterXml, "paintopid")?.takeIf { it.isNotBlank() }?.let {
+                paintOpId = it.trim().lowercase()
             }
 
-            // Krita stores the inner brush XML inside <param name="brush_definition">...</param>
-            val brushDefXml = extractParamBody(presetXml, "brush_definition") ?: presetXml
+            // Decode inner <param name="brush_definition"> carefully without breaking outer quotes
+            val brushDefRaw = extractParamBody(cleanOuterXml, "brush_definition") ?: cleanOuterXml
+            val brushDefXml = decodeEmbeddedXml(brushDefRaw)
+            val fallbackSearchXml = if (brushDefXml === cleanOuterXml) cleanOuterXml else "$brushDefXml\n$cleanOuterXml"
+
             val maskRadius = extractMaskGeneratorAttr(brushDefXml, "radius")
-                ?: extractMaskGeneratorAttr(presetXml, "radius")
+                ?: extractMaskGeneratorAttr(cleanOuterXml, "radius")
             val brushAttrDiameter = extractBrushTagAttrFloat(brushDefXml, "diameter")
+                ?: extractBrushTagAttrFloat(cleanOuterXml, "diameter")
             val brushAttrScale = extractBrushTagAttrFloat(brushDefXml, "scale")
+                ?: extractBrushTagAttrFloat(cleanOuterXml, "scale")
 
-            parsedSize = extractParamFloat(presetXml, "Diameter")
+            parsedSize = extractParamFloat(cleanOuterXml, "Diameter")
                 ?: brushAttrDiameter
                 ?: maskRadius?.let { it * 2f }
-                ?: extractParamFloat(presetXml, "Size")
+                ?: extractParamFloat(cleanOuterXml, "Size")
                 ?: brushAttrScale?.let { (it * 24f).coerceIn(4f, 64f) }
 
-            parsedOpacity = extractParamFloat(presetXml, "OpacityValue")
-                ?: extractParamFloat(presetXml, "opacity")
-            parsedFlow = extractParamFloat(presetXml, "FlowValue")
-                ?: extractParamFloat(presetXml, "flow")
-            parsedSpacing = extractParamFloat(presetXml, "Spacing")
-                ?: extractParamFloat(presetXml, "spacing")
+            parsedOpacity = extractParamFloat(cleanOuterXml, "OpacityValue")
+                ?: extractParamFloat(cleanOuterXml, "opacity")
+            parsedFlow = extractParamFloat(cleanOuterXml, "FlowValue")
+                ?: extractParamFloat(cleanOuterXml, "flow")
+            val explicitSpacing = extractParamFloat(cleanOuterXml, "Spacing")
+                ?: extractParamFloat(cleanOuterXml, "spacing")
                 ?: extractBrushTagAttrFloat(brushDefXml, "spacing")
-                ?: extractBrushTagAttrFloat(brushDefXml, "AutoSpacingCoeff")
+            val autoSpacingCoeff = extractBrushTagAttrFloat(brushDefXml, "AutoSpacingCoeff")
+                ?: extractBrushTagAttrFloat(cleanOuterXml, "AutoSpacingCoeff")
+            val useAutoSpacing = extractBrushTagAttrStr(brushDefXml, "useAutoSpacing")
+                ?.let { it == "1" || it.equals("true", ignoreCase = true) }
+                ?: (explicitSpacing == null && autoSpacingCoeff != null)
+            parsedSpacing = if (useAutoSpacing && autoSpacingCoeff != null) {
+                (autoSpacingCoeff * 0.14f).coerceIn(0.03f, 0.35f)
+            } else {
+                explicitSpacing ?: autoSpacingCoeff?.let { (it * 0.14f).coerceIn(0.03f, 0.35f) }
+            }
 
-            parsedSoftness = extractParamFloat(presetXml, "softness")
-                ?: extractParamFloat(presetXml, "Softness")
+            parsedSoftness = extractParamFloat(cleanOuterXml, "softness")
+                ?: extractParamFloat(cleanOuterXml, "Softness")
                 ?: extractMaskGeneratorAttr(brushDefXml, "softness")
-                ?: extractMaskGeneratorAttr(presetXml, "softness")
+                ?: extractMaskGeneratorAttr(cleanOuterXml, "softness")
             parsedRatio = extractMaskGeneratorAttr(brushDefXml, "ratio")
-                ?: extractMaskGeneratorAttr(presetXml, "ratio")
+                ?: extractMaskGeneratorAttr(cleanOuterXml, "ratio")
             val maskSpikes = extractMaskGeneratorAttr(brushDefXml, "spikes")
-                ?: extractMaskGeneratorAttr(presetXml, "spikes")
+                ?: extractMaskGeneratorAttr(cleanOuterXml, "spikes")
             if (maskSpikes != null) {
                 parsedSpikes = maskSpikes.toInt().coerceIn(2, 12)
             }
 
             val rawShapeType = extractMaskGeneratorAttrStr(brushDefXml, "type")
-                ?: extractMaskGeneratorAttrStr(presetXml, "type")
+                ?: extractMaskGeneratorAttrStr(cleanOuterXml, "type")
             val maskKindRaw = extractMaskGeneratorAttrStr(brushDefXml, "id")
-                ?: extractMaskGeneratorAttrStr(presetXml, "id")
+                ?: extractMaskGeneratorAttrStr(cleanOuterXml, "id")
             parsedShapeKind = when {
                 rawShapeType?.equals("rect", ignoreCase = true) == true ||
                     maskKindRaw?.contains("rect", ignoreCase = true) == true -> "rect"
@@ -340,7 +549,7 @@ object KritaBrushImporter {
             // Rotation angle (Krita Brush/MaskGenerator stores radians in [0..6.283] or degrees)
             val rawAngle = extractBrushTagAttrFloat(brushDefXml, "angle")
                 ?: extractMaskGeneratorAttr(brushDefXml, "angle")
-                ?: extractParamFloat(presetXml, "angle")
+                ?: extractParamFloat(cleanOuterXml, "angle")
             if (rawAngle != null && kotlin.math.abs(rawAngle) > 0.001f) {
                 var deg = if (kotlin.math.abs(rawAngle) <= 6.3f) {
                     Math.toDegrees(rawAngle.toDouble()).toFloat()
@@ -354,7 +563,7 @@ object KritaBrushImporter {
 
             // Link predefined raster brush tip from .bundle (`<Brush filename="..."/>`)
             val tipFilename = extractBrushTagAttrStr(brushDefXml, "filename")
-                ?: extractBrushTagAttrStr(presetXml, "filename")
+                ?: extractBrushTagAttrStr(cleanOuterXml, "filename")
             if (!tipFilename.isNullOrBlank() && externalBrushTips.isNotEmpty()) {
                 val resolvedBytes = findBrushTipBytes(tipFilename, externalBrushTips)
                 if (resolvedBytes != null) {
@@ -368,10 +577,10 @@ object KritaBrushImporter {
             }
 
             // Dynamics: Scatter, Rotation sensors, Smudge/Wet, Texture/Pattern
-            val scatterBool = extractParamBool(presetXml, "Scatter") == true ||
-                extractParamBool(presetXml, "PressureScatter") == true
-            val scatterVal = extractParamFloat(presetXml, "ScatterValue")
-                ?: extractParamFloat(presetXml, "Scatter")
+            val scatterBool = extractParamBool(cleanOuterXml, "Scatter") == true ||
+                extractParamBool(cleanOuterXml, "PressureScatter") == true
+            val scatterVal = extractParamFloat(cleanOuterXml, "ScatterValue")
+                ?: extractParamFloat(cleanOuterXml, "Scatter")
                 ?: extractMaskGeneratorAttr(brushDefXml, "randomness")
             parsedScatter = when {
                 scatterVal != null && scatterVal > 0.02f -> scatterVal.coerceIn(0f, 1.8f)
@@ -379,101 +588,97 @@ object KritaBrushImporter {
                 else -> 0f
             }
 
-            val rotParamFloat = extractParamFloat(presetXml, "RotationValue")
-                ?: extractParamFloat(presetXml, "Rotation")
-            val rotEnabled = extractParamBool(presetXml, "Rotation") == true ||
-                presetXml.contains("RotationOption", ignoreCase = true) ||
+            val rotParamFloat = extractParamFloat(cleanOuterXml, "RotationValue")
+                ?: extractParamFloat(cleanOuterXml, "Rotation")
+            val rotEnabled = extractParamBool(cleanOuterXml, "Rotation") == true ||
+                cleanOuterXml.contains("RotationOption", ignoreCase = true) ||
                 (rotParamFloat != null && rotParamFloat > 0.02f)
             if (rotEnabled) {
-                if (presetXml.contains("drawing-angle", ignoreCase = true) ||
-                    presetXml.contains("DrawingAngle", ignoreCase = true)
+                if (cleanOuterXml.contains("drawing-angle", ignoreCase = true) ||
+                    cleanOuterXml.contains("DrawingAngle", ignoreCase = true)
                 ) {
                     parsedFollowAngle = true
                 }
-                if (presetXml.contains("fuzzy", ignoreCase = true) ||
-                    presetXml.contains("FuzzyPerDab", ignoreCase = true) ||
+                if (cleanOuterXml.contains("fuzzy", ignoreCase = true) ||
+                    cleanOuterXml.contains("FuzzyPerDab", ignoreCase = true) ||
                     (rotParamFloat != null && rotParamFloat > 0.02f)
                 ) {
                     parsedAngularJitter = (rotParamFloat ?: 0.65f).coerceIn(0.15f, 1.0f)
                 }
             }
 
-            val smudgeVal = extractParamFloat(presetXml, "SmudgeRate")
-                ?: extractParamFloat(presetXml, "SmudgeRateValue")
-                ?: extractParamFloat(presetXml, "ColorRateValue")
+            val smudgeVal = extractParamFloat(cleanOuterXml, "SmudgeRate")
+                ?: extractParamFloat(cleanOuterXml, "SmudgeRateValue")
+                ?: extractParamFloat(cleanOuterXml, "ColorRateValue")
             if (smudgeVal != null && smudgeVal > 0.02f) {
                 parsedSmudgeRate = smudgeVal.coerceIn(0f, 1.0f)
             } else if ("smudge" in paintOpId) {
                 parsedSmudgeRate = 0.55f
             }
 
-            val texEnabled = extractParamBool(presetXml, "Texture/Pattern/Enabled") == true ||
-                presetXml.contains("Texture/Pattern/PatternFileName", ignoreCase = true)
+            val texEnabled = extractParamBool(cleanOuterXml, "Texture/Pattern/Enabled") == true ||
+                cleanOuterXml.contains("Texture/Pattern/PatternFileName", ignoreCase = true)
             if (texEnabled) {
                 parsedTextureStrength = (
-                    extractParamFloat(presetXml, "Texture/Pattern/Strength")
+                    extractParamFloat(cleanOuterXml, "Texture/Pattern/Strength")
                         ?: 0.55f
                     ).coerceIn(0.15f, 1.0f)
             }
 
             // Dual Color / ColorSource parsing
-            val colorSourceType = extractParamBody(presetXml, "ColorSource/Type")
+            val colorSourceType = extractParamBody(cleanOuterXml, "ColorSource/Type")
                 ?.trim()?.lowercase()
-                ?: extractXmlAttr(presetXml, "colorsource")?.lowercase()
+                ?: extractXmlAttr(cleanOuterXml, "colorsource")?.lowercase()
                 ?: ""
-            val fgBgColor = extractParamBool(presetXml, "ForegroundBackground") == true ||
-                extractParamBool(presetXml, "Color/ForegroundBackground") == true ||
+            val fgBgColor = extractParamBool(cleanOuterXml, "ForegroundBackground") == true ||
+                extractParamBool(cleanOuterXml, "Color/ForegroundBackground") == true ||
                 colorSourceType.contains("gradient") ||
                 colorSourceType.contains("fg_bg") ||
                 colorSourceType.contains("mix")
-            val mixVal = extractParamFloat(presetXml, "MixValue")
-                ?: extractParamFloat(presetXml, "Color/MixValue")
-                ?: extractParamFloat(presetXml, "DarkenValue")
-            val dualColorHex = extractParamBody(presetXml, "SecondaryColor")?.trim()
-                ?: extractXmlAttr(presetXml, "secondarycolor")
-            var parsedDualColorOn = fgBgColor || (mixVal != null && mixVal > 0.02f) || !dualColorHex.isNullOrBlank()
-            val parsedDualColorMode = when {
+            val mixVal = extractParamFloat(cleanOuterXml, "MixValue")
+                ?: extractParamFloat(cleanOuterXml, "Color/MixValue")
+                ?: extractParamFloat(cleanOuterXml, "DarkenValue")
+            val dualColorHex = extractParamBody(cleanOuterXml, "SecondaryColor")?.trim()
+                ?: extractXmlAttr(cleanOuterXml, "secondarycolor")
+            parsedDualColorOn = fgBgColor || (mixVal != null && mixVal > 0.02f) || !dualColorHex.isNullOrBlank()
+            parsedDualColorMode = when {
                 colorSourceType.contains("gradient") -> "gradient"
                 colorSourceType.contains("alt") || colorSourceType.contains("hue") -> "alternating"
                 colorSourceType.contains("edge") || colorSourceType.contains("darken") -> "edge"
                 else -> "gradient"
             }
-            val parsedDualColorMix = (mixVal ?: 0.5f).coerceIn(0.05f, 1.0f)
-            val parsedSecondaryColor = parseHexColorOrNull(dualColorHex) ?: 0xFFFFFFFFL
+            parsedDualColorMix = (mixVal ?: 0.5f).coerceIn(0.05f, 1.0f)
+            parsedSecondaryColor = parseHexColorOrNull(dualColorHex) ?: 0xFFFFFFFFL
 
             // Internal special dots / spray / particle parameters
-            val sprayParticleCount = extractParamFloat(presetXml, "sprayArea/particleCount")
-                ?: extractParamFloat(presetXml, "Spray/particleCount")
-                ?: extractParamFloat(presetXml, "Particle/count")
-            val sprayEnabled = extractParamBool(presetXml, "Spray/enabled") == true ||
-                extractParamBool(presetXml, "Particle/enabled") == true ||
-                extractParamBool(presetXml, "InnerDots/enabled") == true ||
+            val sprayParticleCount = extractParamFloat(cleanOuterXml, "sprayArea/particleCount")
+                ?: extractParamFloat(cleanOuterXml, "Spray/particleCount")
+                ?: extractParamFloat(cleanOuterXml, "Particle/count")
+            val sprayEnabled = extractParamBool(cleanOuterXml, "Spray/enabled") == true ||
+                extractParamBool(cleanOuterXml, "Particle/enabled") == true ||
+                extractParamBool(cleanOuterXml, "InnerDots/enabled") == true ||
                 (sprayParticleCount != null && sprayParticleCount >= 1f) ||
                 "spray" in paintOpId || "particle" in paintOpId
-            val sprayDensity = extractParamFloat(presetXml, "Spray/density")
-                ?: extractParamFloat(presetXml, "BrushTip/density")
-                ?: extractParamFloat(presetXml, "InnerDots/density")
+            sprayDensity = extractParamFloat(cleanOuterXml, "Spray/density")
+                ?: extractParamFloat(cleanOuterXml, "BrushTip/density")
+                ?: extractParamFloat(cleanOuterXml, "InnerDots/density")
                 ?: sprayParticleCount?.let { (it / 24f).coerceIn(0.2f, 1.0f) }
-            val sprayDotSize = extractParamFloat(presetXml, "Spray/particleSize")
-                ?: extractParamFloat(presetXml, "InnerDots/size")
-            val parsedInnerDotsOn = sprayEnabled || (sprayDensity != null && sprayDensity > 0.02f)
+            sprayDotSize = extractParamFloat(cleanOuterXml, "Spray/particleSize")
+                ?: extractParamFloat(cleanOuterXml, "InnerDots/size")
+            parsedInnerDotsOn = sprayEnabled || (sprayDensity != null && sprayDensity > 0.02f)
 
             // Masked / Dual Brush (Multi-format tip combination inside the same brush)
-            val maskingEnabled = extractParamBool(presetXml, "MaskingBrush/Enabled") == true ||
-                extractParamBool(presetXml, "DualBrush/Enabled") == true
-            val maskDefXml = extractParamBody(presetXml, "MaskingBrush/brush_definition")
-                ?: extractParamBody(presetXml, "DualBrush/brush_definition")
-            val maskMasterSize = extractParamFloat(presetXml, "MaskingBrush/MasterSize")
-            var parsedDualShapeOn = maskingEnabled || !maskDefXml.isNullOrBlank()
-            var parsedSecondaryShapeKind = "circle"
-            var parsedSecondaryTipBase64: String? = null
-            var parsedDualShapeScale = 0.68f
-            var parsedDualShapeBlendMode = "combine"
+            val maskingEnabled = extractParamBool(cleanOuterXml, "MaskingBrush/Enabled") == true ||
+                extractParamBool(cleanOuterXml, "DualBrush/Enabled") == true
+            val maskDefRaw = extractParamBody(cleanOuterXml, "MaskingBrush/brush_definition")
+                ?: extractParamBody(cleanOuterXml, "DualBrush/brush_definition")
+            val maskDefXml = maskDefRaw?.let { decodeEmbeddedXml(it) }
+            val maskMasterSize = extractParamFloat(cleanOuterXml, "MaskingBrush/MasterSize")
+            parsedDualShapeOn = maskingEnabled || !maskDefXml.isNullOrBlank()
 
             val secSourceXml = maskDefXml ?: run {
-                // Detect secondary MaskGenerator / Brush tag inside presetXml if present
-                val allBrushTags = Regex("""<Brush\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(presetXml).toList()
-                val allMaskTags = Regex("""<MaskGenerator\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(presetXml).toList()
+                val allBrushTags = Regex("""<Brush\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(fallbackSearchXml).toList()
+                val allMaskTags = Regex("""<MaskGenerator\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(fallbackSearchXml).toList()
                 buildString {
                     if (allBrushTags.size >= 2) append(allBrushTags[1].value)
                     if (allMaskTags.size >= 2) append(allMaskTags[1].value)
@@ -507,7 +712,7 @@ object KritaBrushImporter {
                 } else if (maskMasterSize != null) {
                     parsedDualShapeScale = maskMasterSize.coerceIn(0.25f, 1.45f)
                 }
-                val compOp = extractParamBody(presetXml, "MaskingBrush/CompositeOp")?.trim()?.lowercase() ?: ""
+                val compOp = extractParamBody(cleanOuterXml, "MaskingBrush/CompositeOp")?.trim()?.lowercase() ?: ""
                 parsedDualShapeBlendMode = if (compOp.contains("mult") || compOp.contains("sub") || compOp.contains("mask") || maskingEnabled) {
                     "mask"
                 } else {
@@ -516,86 +721,6 @@ object KritaBrushImporter {
             } else if (parsedDualShapeOn) {
                 parsedDualShapeBlendMode = if (maskingEnabled) "mask" else "combine"
             }
-
-            val engineKind = mapKritaMetaToEngine(paintOpId, parsedName)
-            val effectiveHardness = if (parsedSoftness != null) {
-                (1f - (parsedSoftness * 0.45f)).coerceIn(0.12f, 1.0f)
-            } else {
-                defaultHardnessFor(engineKind)
-            }
-            val baseGrain = when (engineKind) {
-                KritaBrushEngineKind.PENCIL_GRAPHITE -> 0.55f
-                KritaBrushEngineKind.CHARCOAL_SOFT -> 0.72f
-                KritaBrushEngineKind.CHALK_GRAINY -> 0.85f
-                KritaBrushEngineKind.INK_ROUGH -> 0.35f
-                KritaBrushEngineKind.BRISTLE_DRY -> 0.28f
-                else -> 0.0f
-            }
-            val effectiveGrain = maxOf(baseGrain, parsedTextureStrength ?: 0f).coerceIn(0f, 1f)
-            val effectiveAspect = (parsedRatio ?: tipAspectFromImage ?: 1.0f).coerceIn(0.08f, 1.0f)
-
-            val defaultDynamics = BrushDynamicParams(
-                engineKind = engineKind,
-                hardness = effectiveHardness,
-                spacing = (parsedSpacing ?: 0.10f).coerceIn(0.02f, 0.8f),
-                flow = (parsedFlow ?: 0.90f).coerceIn(0.08f, 1.0f),
-                grainAmount = effectiveGrain,
-                bristleCount = if (engineKind == KritaBrushEngineKind.BRISTLE_DRY) 6 else 5,
-                taperStrength = if (engineKind == KritaBrushEngineKind.INK_GPEN) 0.75f
-                else if (parsedRatio != null && parsedRatio < 0.75f) (1f - parsedRatio).coerceIn(0.15f, 0.7f)
-                else 0.15f,
-                aspectRatio = effectiveAspect,
-                angleDeg = parsedAngleDeg,
-                scatter = parsedScatter,
-                angularJitter = parsedAngularJitter,
-                followStrokeAngle = parsedFollowAngle,
-                smudgeRate = parsedSmudgeRate,
-                spikes = parsedSpikes,
-                shapeKind = parsedShapeKind,
-                tipStampBase64 = parsedTipBase64,
-                dualColorEnabled = parsedDualColorOn,
-                secondaryColor = parsedSecondaryColor,
-                secondaryColorMix = parsedDualColorMix,
-                dualColorMode = parsedDualColorMode,
-                innerDotsEnabled = parsedInnerDotsOn,
-                innerDotsDensity = (sprayDensity ?: 0.52f).coerceIn(0.1f, 1.0f),
-                innerDotsSize = (sprayDotSize ?: 0.22f).coerceIn(0.08f, 0.6f),
-                innerDotsUseSecondaryColor = parsedDualColorOn,
-                dualShapeEnabled = parsedDualShapeOn,
-                secondaryShapeKind = parsedSecondaryShapeKind,
-                secondaryTipStampBase64 = parsedSecondaryTipBase64,
-                dualShapeScale = parsedDualShapeScale,
-                dualShapeBlendMode = parsedDualShapeBlendMode
-            )
-
-            val thumbBase64 = encodePngThumbnailBase64(rawBytes)
-            val finalSize = ((parsedSize ?: defaultSizeFor(engineKind)) * 0.65f).coerceIn(2f, 48f)
-            val finalOpacity = (parsedOpacity ?: defaultOpacityFor(engineKind)).coerceIn(0.15f, 1.0f)
-
-            return BrushPreset(
-                id = presetId,
-                namePt = parsedName,
-                shortLabel = parsedName.take(12),
-                defaultSize = finalSize,
-                defaultOpacity = finalOpacity,
-                toolType = if (engineKind == KritaBrushEngineKind.PENCIL_GRAPHITE) ToolType.PENCIL
-                else if (engineKind == KritaBrushEngineKind.INK_GPEN || engineKind == KritaBrushEngineKind.PIXEL_ROUND_SIZE) ToolType.PEN
-                else ToolType.BRUSH,
-                textureNamePt = buildString {
-                    append("Krita ($paintOpId")
-                    if (parsedTipBase64 != null) append(" • Ponta")
-                    if (parsedDualShapeOn) append(" • Multi")
-                    if (parsedDualColorOn) append(" • 2Cores")
-                    append(")")
-                },
-                textureSymbol = symbolForEngine(engineKind),
-                descriptionPt = "Brush importado do Krita (.kpp • motor $paintOpId).",
-                engineKind = engineKind,
-                dynamicParams = defaultDynamics,
-                isImportedKrita = true,
-                kritaPaintOpId = paintOpId,
-                iconBase64 = thumbBase64
-            )
         }
 
         val engineKind = mapKritaMetaToEngine(paintOpId, parsedName)
@@ -633,11 +758,24 @@ object KritaBrushImporter {
             smudgeRate = parsedSmudgeRate,
             spikes = parsedSpikes,
             shapeKind = parsedShapeKind,
-            tipStampBase64 = parsedTipBase64
+            tipStampBase64 = parsedTipBase64,
+            dualColorEnabled = parsedDualColorOn,
+            secondaryColor = parsedSecondaryColor,
+            secondaryColorMix = parsedDualColorMix,
+            dualColorMode = parsedDualColorMode,
+            innerDotsEnabled = parsedInnerDotsOn,
+            innerDotsDensity = (sprayDensity ?: 0.52f).coerceIn(0.1f, 1.0f),
+            innerDotsSize = (sprayDotSize ?: 0.22f).coerceIn(0.08f, 0.6f),
+            innerDotsUseSecondaryColor = parsedDualColorOn,
+            dualShapeEnabled = parsedDualShapeOn,
+            secondaryShapeKind = parsedSecondaryShapeKind,
+            secondaryTipStampBase64 = parsedSecondaryTipBase64,
+            dualShapeScale = parsedDualShapeScale,
+            dualShapeBlendMode = parsedDualShapeBlendMode
         )
 
-        val thumbBase64 = encodePngThumbnailBase64(rawBytes)
-        val finalSize = ((parsedSize ?: defaultSizeFor(engineKind)) * 0.65f).coerceIn(2f, 48f)
+        val thumbBase64 = thumbnailPngBytes?.let { encodePngThumbnailBase64(it) } ?: parsedTipBase64
+        val finalSize = (parsedSize ?: defaultSizeFor(engineKind)).coerceIn(2f, 64f)
         val finalOpacity = (parsedOpacity ?: defaultOpacityFor(engineKind)).coerceIn(0.15f, 1.0f)
 
         return BrushPreset(
@@ -649,7 +787,13 @@ object KritaBrushImporter {
             toolType = if (engineKind == KritaBrushEngineKind.PENCIL_GRAPHITE) ToolType.PENCIL
             else if (engineKind == KritaBrushEngineKind.INK_GPEN || engineKind == KritaBrushEngineKind.PIXEL_ROUND_SIZE) ToolType.PEN
             else ToolType.BRUSH,
-            textureNamePt = if (parsedTipBase64 != null) "Krita ($paintOpId • Ponta)" else "Krita ($paintOpId)",
+            textureNamePt = buildString {
+                append("Krita ($paintOpId")
+                if (parsedTipBase64 != null) append(" • Ponta")
+                if (parsedDualShapeOn) append(" • Multi")
+                if (parsedDualColorOn) append(" • 2Cores")
+                append(")")
+            },
             textureSymbol = symbolForEngine(engineKind),
             descriptionPt = "Brush importado do Krita (.kpp • motor $paintOpId).",
             engineKind = engineKind,
@@ -661,10 +805,10 @@ object KritaBrushImporter {
     }
 
     private fun findBrushTipBytes(tipFilename: String, map: Map<String, ByteArray>): ByteArray? {
-        val clean = decodeXmlEntities(tipFilename).replace('\\', '/').trim().lowercase()
-        if (clean.isEmpty()) return null
-        map[clean]?.let { return it }
-        val base = clean.substringAfterLast('/')
+        val decoded = urlDecodeSafe(decodeXmlEntities(tipFilename)).replace('\\', '/').trim().lowercase()
+        if (decoded.isEmpty()) return null
+        map[decoded]?.let { return it }
+        val base = decoded.substringAfterLast('/')
         map[base]?.let { return it }
         val noExt = base.substringBeforeLast('.')
         return map[noExt]
@@ -675,7 +819,7 @@ object KritaBrushImporter {
         return when {
             isPngSignature(bytes) || lower.endsWith(".png") -> extractPngTipStamp(bytes)
             lower.endsWith(".gih") -> extractGihTipStamp(bytes)
-            else -> extractGbrTipStamp(bytes)
+            else -> extractGbrTipStamp(bytes) ?: extractGihTipStamp(bytes)
         }
     }
 
@@ -720,6 +864,22 @@ object KritaBrushImporter {
                 for (i in 0 until width * height) {
                     val alpha = rawBytes[pIdx++].toInt() and 0xFF
                     pixels[i] = (alpha shl 24) or 0x00FFFFFF
+                }
+            } else if (bpp == 2) {
+                for (i in 0 until width * height) {
+                    val gray = rawBytes[pIdx++].toInt() and 0xFF
+                    val a = rawBytes[pIdx++].toInt() and 0xFF
+                    val maskAlpha = if (a > 0 && a < 250) a else (255 - gray)
+                    pixels[i] = (maskAlpha.coerceIn(0, 255) shl 24) or 0x00FFFFFF
+                }
+            } else if (bpp == 3) {
+                for (i in 0 until width * height) {
+                    val r = rawBytes[pIdx++].toInt() and 0xFF
+                    val g = rawBytes[pIdx++].toInt() and 0xFF
+                    val b = rawBytes[pIdx++].toInt() and 0xFF
+                    val lum = (r * 77 + g * 150 + b * 29) shr 8
+                    val maskAlpha = 255 - lum
+                    pixels[i] = (maskAlpha.coerceIn(0, 255) shl 24) or 0x00FFFFFF
                 }
             } else if (bpp == 4) {
                 var minAlpha = 255
@@ -819,7 +979,7 @@ object KritaBrushImporter {
     }
 
     private fun encodeTipBitmapTo40pxBase64(maskBmp: Bitmap): String {
-        val maxDim = 40
+        val maxDim = 96
         val w = maskBmp.width
         val h = maskBmp.height
         val targetW: Int
@@ -842,9 +1002,10 @@ object KritaBrushImporter {
     fun extractKritaPresetXmlFromPng(pngBytes: ByteArray): String? {
         if (!isPngSignature(pngBytes)) return null
         var offset = 8
+        var fallbackXmlCandidate: String? = null
         while (offset + 12 <= pngBytes.size) {
             val len = ByteBuffer.wrap(pngBytes, offset, 4).order(ByteOrder.BIG_ENDIAN).int
-            if (len < 0 || offset + 12 + len > pngBytes.size) break
+            if (len < 0 || offset + 12L + len.toLong() > pngBytes.size.toLong()) break
             val chunkType = String(pngBytes, offset + 4, 4, Charsets.US_ASCII)
             val dataStart = offset + 8
             when (chunkType) {
@@ -852,8 +1013,12 @@ object KritaBrushImporter {
                     val zeroIdx = findByte(pngBytes, dataStart, dataStart + len, 0)
                     if (zeroIdx > dataStart) {
                         val key = String(pngBytes, dataStart, zeroIdx - dataStart, Charsets.ISO_8859_1)
+                        val text = String(pngBytes, zeroIdx + 1, dataStart + len - (zeroIdx + 1), Charsets.UTF_8)
                         if (key.equals("preset", ignoreCase = true)) {
-                            return String(pngBytes, zeroIdx + 1, dataStart + len - (zeroIdx + 1), Charsets.UTF_8)
+                            return text
+                        }
+                        if (fallbackXmlCandidate == null && looksLikeKritaPresetText(text)) {
+                            fallbackXmlCandidate = text
                         }
                     }
                 }
@@ -861,11 +1026,15 @@ object KritaBrushImporter {
                     val zeroIdx = findByte(pngBytes, dataStart, dataStart + len, 0)
                     if (zeroIdx > dataStart && zeroIdx + 2 <= dataStart + len) {
                         val key = String(pngBytes, dataStart, zeroIdx - dataStart, Charsets.ISO_8859_1)
-                        if (key.equals("preset", ignoreCase = true)) {
-                            val compressedStart = zeroIdx + 2 // skip null + compression method
-                            val compressedLen = (dataStart + len) - compressedStart
-                            if (compressedLen > 0) {
-                                return decompressZlib(pngBytes, compressedStart, compressedLen)
+                        val compressedStart = zeroIdx + 2
+                        val compressedLen = (dataStart + len) - compressedStart
+                        if (compressedLen > 0) {
+                            val text = decompressZlib(pngBytes, compressedStart, compressedLen)
+                            if (key.equals("preset", ignoreCase = true)) {
+                                return text
+                            }
+                            if (fallbackXmlCandidate == null && text != null && looksLikeKritaPresetText(text)) {
+                                fallbackXmlCandidate = text
                             }
                         }
                     }
@@ -874,23 +1043,26 @@ object KritaBrushImporter {
                     val zeroIdx = findByte(pngBytes, dataStart, dataStart + len, 0)
                     if (zeroIdx > dataStart && zeroIdx + 5 < dataStart + len) {
                         val key = String(pngBytes, dataStart, zeroIdx - dataStart, Charsets.UTF_8)
-                        if (key.equals("preset", ignoreCase = true)) {
-                            val compFlag = pngBytes[zeroIdx + 1].toInt()
-                            // skip compFlag(1), compMethod(1), langTag + \0, transKey + \0
-                            var cursor = zeroIdx + 3
-                            val langEnd = findByte(pngBytes, cursor, dataStart + len, 0)
-                            if (langEnd >= cursor) {
-                                cursor = langEnd + 1
-                                val transEnd = findByte(pngBytes, cursor, dataStart + len, 0)
-                                if (transEnd >= cursor) {
-                                    cursor = transEnd + 1
-                                    val textLen = (dataStart + len) - cursor
-                                    if (textLen > 0) {
-                                        return if (compFlag == 1) {
-                                            decompressZlib(pngBytes, cursor, textLen)
-                                        } else {
-                                            String(pngBytes, cursor, textLen, Charsets.UTF_8)
-                                        }
+                        val compFlag = pngBytes[zeroIdx + 1].toInt()
+                        var cursor = zeroIdx + 3
+                        val langEnd = findByte(pngBytes, cursor, dataStart + len, 0)
+                        if (langEnd >= cursor) {
+                            cursor = langEnd + 1
+                            val transEnd = findByte(pngBytes, cursor, dataStart + len, 0)
+                            if (transEnd >= cursor) {
+                                cursor = transEnd + 1
+                                val textLen = (dataStart + len) - cursor
+                                if (textLen > 0) {
+                                    val text = if (compFlag == 1) {
+                                        decompressZlib(pngBytes, cursor, textLen)
+                                    } else {
+                                        String(pngBytes, cursor, textLen, Charsets.UTF_8)
+                                    }
+                                    if (key.equals("preset", ignoreCase = true)) {
+                                        return text
+                                    }
+                                    if (fallbackXmlCandidate == null && text != null && looksLikeKritaPresetText(text)) {
+                                        fallbackXmlCandidate = text
                                     }
                                 }
                             }
@@ -901,7 +1073,7 @@ object KritaBrushImporter {
             }
             offset += 12 + len
         }
-        return null
+        return fallbackXmlCandidate
     }
 
     fun loadImportedBrushes(context: Context): List<BrushPreset> {
@@ -998,7 +1170,7 @@ object KritaBrushImporter {
 
     private fun parseJsonPresetBytes(rawBytes: ByteArray, startingId: Int): List<BrushPreset> {
         return try {
-            val text = String(rawBytes, Charsets.UTF_8).trim()
+            val text = String(rawBytes, Charsets.UTF_8).trimStart('\uFEFF').trim()
             if (text.startsWith("[")) {
                 val arr = JSONArray(text)
                 (0 until arr.length()).mapNotNull { idx ->
@@ -1148,9 +1320,16 @@ object KritaBrushImporter {
         KritaBrushEngineKind.BLENDER_WET_SOFT -> "◈"
     }
 
-    private fun decodeXmlBody(xml: String): String {
-        val cdataStripped = xml.replace("<![CDATA[", "").replace("]]>", "")
-        return decodeXmlEntities(cdataStripped)
+    private fun decodeEmbeddedXml(raw: String): String {
+        var cur = raw.replace("<![CDATA[", "").replace("]]>", "").trim()
+        repeat(2) {
+            if (!cur.contains('<') && (cur.contains("&lt;") || cur.contains("&quot;") || cur.contains("&apos;"))) {
+                cur = decodeXmlEntities(cur)
+            } else if (cur.contains("&lt;Brush") || cur.contains("&lt;MaskGenerator") || cur.contains("&lt;params")) {
+                cur = decodeXmlEntities(cur)
+            }
+        }
+        return cur
     }
 
     private fun decodeXmlEntities(text: String): String {
@@ -1159,57 +1338,85 @@ object KritaBrushImporter {
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
             .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&#34;", "\"")
             .replace("&amp;", "&")
     }
 
+    private fun parseFloatLenient(raw: String?): Float? {
+        val clean = raw?.trim()?.replace(',', '.') ?: return null
+        if (clean.isEmpty()) return null
+        return clean.toFloatOrNull()?.takeIf { it.isFinite() }
+    }
+
+    private fun urlDecodeSafe(raw: String): String {
+        return try {
+            java.net.URLDecoder.decode(raw.replace("+", "%2B"), "UTF-8")
+        } catch (_: Exception) {
+            raw
+        }
+    }
+
     private fun extractXmlAttr(xml: String, attr: String): String? {
-        val regex = Regex("""\b$attr\s*=\s*"([^"]*)"""")
-        return regex.find(xml)?.groupValues?.getOrNull(1)
+        val esc = Regex.escape(attr)
+        val regex = Regex("""\b$esc\s*=\s*(?:"([^"]*)"|'([^']*)')""", RegexOption.IGNORE_CASE)
+        val m = regex.find(xml) ?: return null
+        val raw = m.groupValues[1].ifEmpty { m.groupValues[2] }
+        return decodeXmlEntities(raw)
     }
 
     private fun extractParamBody(xml: String, paramName: String): String? {
         val esc = Regex.escape(paramName)
-        val bodyRegex = Regex("""<param[^>]*\bname\s*=\s*"$esc"[^>]*>([\s\S]*?)</param>""", RegexOption.IGNORE_CASE)
+        val bodyRegex = Regex("""<param\b[^>]*\bname\s*=\s*(?:"$esc"|'$esc')[^>]*>([\s\S]*?)</param>""", RegexOption.IGNORE_CASE)
         val body = bodyRegex.find(xml)?.groupValues?.getOrNull(1)
-        if (!body.isNullOrBlank()) return body
-        val attrRegex = Regex("""<param[^>]*\bname\s*=\s*"$esc"[^>]*\bvalue\s*=\s*"([^"]*)"[^>]*/?>""", RegexOption.IGNORE_CASE)
-        return attrRegex.find(xml)?.groupValues?.getOrNull(1) ?: body
+        if (!body.isNullOrBlank()) return decodeXmlEntities(body)
+        val attrRegex = Regex("""<param\b[^>]*\bname\s*=\s*(?:"$esc"|'$esc')[^>]*\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*/?>""", RegexOption.IGNORE_CASE)
+        val m = attrRegex.find(xml)
+        if (m != null) {
+            return decodeXmlEntities(m.groupValues[1].ifEmpty { m.groupValues[2] })
+        }
+        return body?.let { decodeXmlEntities(it) }
     }
 
     private fun extractMaskGeneratorAttr(xml: String, attr: String): Float? {
         val esc = Regex.escape(attr)
-        val regex = Regex("""<MaskGenerator[^>]*\b$esc\s*=\s*"([-0-9.]+)"""", RegexOption.IGNORE_CASE)
-        return regex.find(xml)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+        val regex = Regex("""<MaskGenerator\b[^>]*\b$esc\s*=\s*(?:"([^"]*)"|'([^']*)')""", RegexOption.IGNORE_CASE)
+        val m = regex.find(xml) ?: return null
+        return parseFloatLenient(m.groupValues[1].ifEmpty { m.groupValues[2] })
     }
 
     private fun extractMaskGeneratorAttrStr(xml: String, attr: String): String? {
         val esc = Regex.escape(attr)
-        val regex = Regex("""<MaskGenerator[^>]*\b$esc\s*=\s*"([^"]*)"""", RegexOption.IGNORE_CASE)
-        return regex.find(xml)?.groupValues?.getOrNull(1)?.trim()
+        val regex = Regex("""<MaskGenerator\b[^>]*\b$esc\s*=\s*(?:"([^"]*)"|'([^']*)')""", RegexOption.IGNORE_CASE)
+        val m = regex.find(xml) ?: return null
+        return decodeXmlEntities(m.groupValues[1].ifEmpty { m.groupValues[2] }).trim()
     }
 
     private fun extractBrushTagAttrFloat(xml: String, attr: String): Float? {
         val esc = Regex.escape(attr)
-        val regex = Regex("""<Brush[^>]*\b$esc\s*=\s*"([-0-9.]+)"""", RegexOption.IGNORE_CASE)
-        return regex.find(xml)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+        val regex = Regex("""<Brush\b[^>]*\b$esc\s*=\s*(?:"([^"]*)"|'([^']*)')""", RegexOption.IGNORE_CASE)
+        val m = regex.find(xml) ?: return null
+        return parseFloatLenient(m.groupValues[1].ifEmpty { m.groupValues[2] })
     }
 
     private fun extractBrushTagAttrStr(xml: String, attr: String): String? {
         val esc = Regex.escape(attr)
-        val regex = Regex("""<Brush[^>]*\b$esc\s*=\s*"([^"]*)"""", RegexOption.IGNORE_CASE)
-        return regex.find(xml)?.groupValues?.getOrNull(1)?.trim()
+        val regex = Regex("""<Brush\b[^>]*\b$esc\s*=\s*(?:"([^"]*)"|'([^']*)')""", RegexOption.IGNORE_CASE)
+        val m = regex.find(xml) ?: return null
+        return decodeXmlEntities(m.groupValues[1].ifEmpty { m.groupValues[2] }).trim()
     }
 
     private fun extractParamBool(xml: String, paramName: String): Boolean? {
         val esc = Regex.escape(paramName)
-        val bodyRegex = Regex("""<param[^>]*\bname\s*=\s*"$esc"[^>]*>([\s\S]*?)</param>""", RegexOption.IGNORE_CASE)
+        val bodyRegex = Regex("""<param\b[^>]*\bname\s*=\s*(?:"$esc"|'$esc')[^>]*>([\s\S]*?)</param>""", RegexOption.IGNORE_CASE)
         val body = bodyRegex.find(xml)?.groupValues?.getOrNull(1)?.trim()
         if (body != null) {
             if (body.equals("true", ignoreCase = true) || body == "1") return true
             if (body.equals("false", ignoreCase = true) || body == "0") return false
         }
-        val selfCloseRegex = Regex("""<param[^>]*\bname\s*=\s*"$esc"[^>]*\bvalue\s*=\s*"([^"]*)"[^>]*/?>""", RegexOption.IGNORE_CASE)
-        val sc = selfCloseRegex.find(xml)?.groupValues?.getOrNull(1)?.trim() ?: return null
+        val selfCloseRegex = Regex("""<param\b[^>]*\bname\s*=\s*(?:"$esc"|'$esc')[^>]*\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*/?>""", RegexOption.IGNORE_CASE)
+        val m = selfCloseRegex.find(xml) ?: return null
+        val sc = m.groupValues[1].ifEmpty { m.groupValues[2] }.trim()
         if (sc.equals("true", ignoreCase = true) || sc == "1") return true
         if (sc.equals("false", ignoreCase = true) || sc == "0") return false
         return null
@@ -1217,18 +1424,20 @@ object KritaBrushImporter {
 
     private fun extractParamFloat(xml: String, paramName: String, subAttr: String? = null): Float? {
         val esc = Regex.escape(paramName)
-        val bodyRegex = Regex("""<param[^>]*\bname\s*=\s*"$esc"[^>]*>([\s\S]*?)</param>""", RegexOption.IGNORE_CASE)
+        val bodyRegex = Regex("""<param\b[^>]*\bname\s*=\s*(?:"$esc"|'$esc')[^>]*>([\s\S]*?)</param>""", RegexOption.IGNORE_CASE)
         val bodyMatch = bodyRegex.find(xml)?.groupValues?.getOrNull(1)
         if (bodyMatch != null) {
             return if (subAttr != null) {
-                Regex("""\b${Regex.escape(subAttr)}\s*=\s*"([-0-9.]+)"""", RegexOption.IGNORE_CASE)
-                    .find(bodyMatch)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+                val subM = Regex("""\b${Regex.escape(subAttr)}\s*=\s*(?:"([^"]*)"|'([^']*)')""", RegexOption.IGNORE_CASE)
+                    .find(bodyMatch)
+                parseFloatLenient(subM?.let { it.groupValues[1].ifEmpty { it.groupValues[2] } })
             } else {
-                bodyMatch.trim().toFloatOrNull()
+                parseFloatLenient(bodyMatch)
             }
         }
-        val selfCloseRegex = Regex("""<param[^>]*\bname\s*=\s*"$esc"[^>]*\bvalue\s*=\s*"([-0-9.]+)"[^>]*/?>""", RegexOption.IGNORE_CASE)
-        return selfCloseRegex.find(xml)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+        val selfCloseRegex = Regex("""<param\b[^>]*\bname\s*=\s*(?:"$esc"|'$esc')[^>]*\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*/?>""", RegexOption.IGNORE_CASE)
+        val m = selfCloseRegex.find(xml) ?: return null
+        return parseFloatLenient(m.groupValues[1].ifEmpty { m.groupValues[2] })
     }
 
     private fun encodePngThumbnailBase64(pngBytes: ByteArray): String? {
@@ -1255,6 +1464,36 @@ object KritaBrushImporter {
 
     private fun isZipSignature(bytes: ByteArray): Boolean {
         return bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte()
+    }
+
+    private fun isGimpBrushOrHoseSignature(bytes: ByteArray): Boolean {
+        if (bytes.size >= 24 &&
+            bytes[20] == 'G'.code.toByte() &&
+            bytes[21] == 'I'.code.toByte() &&
+            bytes[22] == 'M'.code.toByte() &&
+            bytes[23] == 'P'.code.toByte()
+        ) return true
+        val scanLen = minOf(bytes.size, 256)
+        val head = String(bytes, 0, scanLen, Charsets.ISO_8859_1)
+        return head.contains("GIMP") && head.contains('\n')
+    }
+
+    private fun isRawXmlPreset(bytes: ByteArray): Boolean {
+        val sample = String(bytes, 0, minOf(bytes.size, 256), Charsets.UTF_8)
+            .trimStart('\uFEFF', ' ', '\t', '\r', '\n')
+        return looksLikeKritaPresetText(sample)
+    }
+
+    private fun looksLikeKritaPresetText(text: String): Boolean {
+        return text.startsWith("<Preset", ignoreCase = true) ||
+            (text.startsWith("<?xml", ignoreCase = true) && text.contains("Preset", ignoreCase = true)) ||
+            (text.contains("<Preset", ignoreCase = true) && text.contains("paintopid", ignoreCase = true))
+    }
+
+    private fun isJsonContent(bytes: ByteArray): Boolean {
+        val sample = String(bytes, 0, minOf(bytes.size, 64), Charsets.UTF_8)
+            .trimStart('\uFEFF', ' ', '\t', '\r', '\n')
+        return sample.startsWith("{") || sample.startsWith("[")
     }
 
     private fun findByte(bytes: ByteArray, start: Int, end: Int, target: Byte): Int {

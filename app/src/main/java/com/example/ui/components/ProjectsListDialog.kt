@@ -182,48 +182,67 @@ fun CreateProjectDialog(
     var fpsText by remember { mutableStateOf("12") }
 
     Dialog(onDismissRequest = onDismiss) {
-        Card(
+        Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp)
+                .padding(10.dp)
                 .testTag("create_project_dialog"),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            shape = RoundedCornerShape(18.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(24.dp),
+            tonalElevation = 6.dp,
+            border = androidx.compose.foundation.BorderStroke(
+                1.dp,
+                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
+            )
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(20.dp)
-                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 22.dp, vertical = 20.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
+                // Minimalist Header
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Criar Nova Animação",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    IconButton(onClick = onDismiss, modifier = Modifier.size(40.dp)) {
+                    Column {
+                        Text(
+                            text = "Novo Projeto",
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "${selectedRes.width}×${selectedRes.height} px • ${fps} FPS",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    ) {
                         Icon(Icons.Default.Close, contentDescription = "Fechar", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
 
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Text("Nome do Projeto", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(modifier = Modifier.height(4.dp))
+                // Project Name Input
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
+                    label = { Text("Nome do Projeto", fontSize = 12.sp) },
                     singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant,
+                        unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
                         focusedTextColor = MaterialTheme.colorScheme.onSurface,
                         unfocusedTextColor = MaterialTheme.colorScheme.onSurface
                     ),
@@ -232,138 +251,180 @@ fun CreateProjectDialog(
                         .testTag("create_project_name_input")
                 )
 
-                Spacer(modifier = Modifier.height(14.dp))
-
-                ResolutionSelectorSection(
-                    selectedResolution = selectedRes,
-                    savedCustomResolutions = savedCustomResolutions,
-                    onSelectResolution = { selectedRes = it },
-                    onSaveCustomResolution = { customName, w, h ->
-                        val created = onSaveCustomResolution(customName, w, h)
-                        selectedRes = created
-                        created
-                    },
-                    onDeleteCustomResolution = { deleted ->
-                        if (selectedRes.width == deleted.width && selectedRes.height == deleted.height && selectedRes.name == deleted.name) {
-                            selectedRes = ProjectResolution.PRESETS[0]
-                        }
-                        onDeleteCustomResolution(deleted)
+                // Canvas Resolution Section
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.36f),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp)
+                    ) {
+                        ResolutionSelectorSection(
+                            selectedResolution = selectedRes,
+                            savedCustomResolutions = savedCustomResolutions,
+                            onSelectResolution = { selectedRes = it },
+                            onSaveCustomResolution = { customName, w, h ->
+                                val created = onSaveCustomResolution(customName, w, h)
+                                selectedRes = created
+                                created
+                            },
+                            onDeleteCustomResolution = { deleted ->
+                                if (selectedRes.width == deleted.width && selectedRes.height == deleted.height && selectedRes.name == deleted.name) {
+                                    selectedRes = ProjectResolution.PRESETS[0]
+                                }
+                                onDeleteCustomResolution(deleted)
+                            }
+                        )
                     }
-                )
+                }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                // Frame Rate Section
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.36f),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            text = "Taxa de Quadros (FPS)",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
 
-                Text("Taxa de Quadros Manual (1 a 120 FPS)", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            IconButton(
+                                onClick = {
+                                    val next = (fps - 1).coerceIn(1, 120)
+                                    fps = next
+                                    fpsText = next.toString()
+                                },
+                                modifier = Modifier
+                                    .size(46.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surface)
+                                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                                    .testTag("create_project_fps_minus")
+                            ) {
+                                Icon(Icons.Default.Remove, contentDescription = "Diminuir FPS", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(18.dp))
+                            }
+
+                            OutlinedTextField(
+                                value = fpsText,
+                                onValueChange = { raw ->
+                                    val digitsOnly = raw.filter { it.isDigit() }.take(3)
+                                    fpsText = digitsOnly
+                                    val parsed = digitsOnly.toIntOrNull()
+                                    if (parsed != null) {
+                                        fps = parsed.coerceIn(1, 120)
+                                    }
+                                },
+                                singleLine = true,
+                                shape = RoundedCornerShape(12.dp),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                suffix = { Text("FPS", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
+                                    focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                                    unfocusedTextColor = MaterialTheme.colorScheme.onSurface
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("create_project_fps_input")
+                            )
+
+                            IconButton(
+                                onClick = {
+                                    val next = (fps + 1).coerceIn(1, 120)
+                                    fps = next
+                                    fpsText = next.toString()
+                                },
+                                modifier = Modifier
+                                    .size(46.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surface)
+                                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                                    .testTag("create_project_fps_plus")
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = "Aumentar FPS", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(18.dp))
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(8, 12, 24, 30, 60).forEach { f ->
+                                val isChosen = fps == f
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(RoundedCornerShape(999.dp))
+                                        .background(if (isChosen) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface)
+                                        .border(
+                                            1.dp,
+                                            if (isChosen) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                                            RoundedCornerShape(999.dp)
+                                        )
+                                        .clickable {
+                                            fps = f
+                                            fpsText = f.toString()
+                                        }
+                                        .padding(vertical = 7.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        "$f",
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isChosen) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Bottom CTA Row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(
-                        onClick = {
-                            val next = (fps - 1).coerceIn(1, 120)
-                            fps = next
-                            fpsText = next.toString()
-                        },
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant)
-                            .testTag("create_project_fps_minus")
+                    TextButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(0.8f)
                     ) {
-                        Icon(Icons.Default.Remove, contentDescription = "Diminuir FPS", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(18.dp))
+                        Text("Cancelar", color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.SemiBold)
                     }
-
-                    OutlinedTextField(
-                        value = fpsText,
-                        onValueChange = { raw ->
-                            val digitsOnly = raw.filter { it.isDigit() }.take(3)
-                            fpsText = digitsOnly
-                            val parsed = digitsOnly.toIntOrNull()
-                            if (parsed != null) {
-                                fps = parsed.coerceIn(1, 120)
-                            }
-                        },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        suffix = { Text("FPS", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant,
-                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface
-                        ),
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("create_project_fps_input")
-                    )
-
-                    IconButton(
-                        onClick = {
-                            val next = (fps + 1).coerceIn(1, 120)
-                            fps = next
-                            fpsText = next.toString()
-                        },
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant)
-                            .testTag("create_project_fps_plus")
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = "Aumentar FPS", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(18.dp))
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    listOf(8, 12, 24, 30, 60).forEach { f ->
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(if (fps == f) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant)
-                                .clickable {
-                                    fps = f
-                                    fpsText = f.toString()
-                                }
-                                .padding(vertical = 6.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                "$f",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = if (fps == f) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(18.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
-                ) {
-                    TextButton(onClick = onDismiss) {
-                        Text("Cancelar", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
                             onCreate(name.ifBlank { "Sem Título" }, selectedRes, fps)
                         },
-                        modifier = Modifier.testTag("create_project_confirm_btn"),
+                        modifier = Modifier
+                            .weight(1.4f)
+                            .height(48.dp)
+                            .testTag("create_project_confirm_btn"),
+                        shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.primary,
                             contentColor = MaterialTheme.colorScheme.onPrimary
                         )
                     ) {
-                        Text("Criar e Abrir", fontWeight = FontWeight.Bold)
+                        Text("Criar e Abrir", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     }
                 }
             }
@@ -393,14 +454,14 @@ fun ResolutionSelectorSection(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text("Resolução do Canvas", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("Resolução", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
         OutlinedButton(
             onClick = { showCustomBuilder = !showCustomBuilder },
-            shape = RoundedCornerShape(8.dp),
+            shape = RoundedCornerShape(999.dp),
             modifier = Modifier.testTag("toggle_custom_res_builder_btn"),
-            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.7f))
+            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.65f))
         ) {
-            Icon(Icons.Default.AspectRatio, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(15.dp))
+            Icon(Icons.Default.AspectRatio, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(14.dp))
             Spacer(modifier = Modifier.width(5.dp))
             Text(
                 text = if (showCustomBuilder) "Fechar" else "+ Personalizada",
@@ -415,14 +476,14 @@ fun ResolutionSelectorSection(
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 8.dp),
-            shape = RoundedCornerShape(12.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.55f))
+                .padding(top = 10.dp),
+            shape = RoundedCornerShape(14.dp),
+            color = MaterialTheme.colorScheme.surface,
+            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
         ) {
             Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = "Nova Resolução Personalizada (128 a 4096 px)",
+                    text = "Nova Resolução (128 – 4096 px)",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
@@ -432,6 +493,7 @@ fun ResolutionSelectorSection(
                     value = customName,
                     onValueChange = { customName = it },
                     singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
                     label = { Text("Nome (ex: Cinema 2K)", fontSize = 11.sp) },
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = MaterialTheme.colorScheme.primary,
@@ -453,6 +515,7 @@ fun ResolutionSelectorSection(
                         value = customWidthText,
                         onValueChange = { raw -> customWidthText = raw.filter { it.isDigit() }.take(4) },
                         singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
                         label = { Text("Largura", fontSize = 10.sp) },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier
@@ -477,6 +540,7 @@ fun ResolutionSelectorSection(
                         value = customHeightText,
                         onValueChange = { raw -> customHeightText = raw.filter { it.isDigit() }.take(4) },
                         singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
                         label = { Text("Altura", fontSize = 10.sp) },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier
@@ -495,6 +559,7 @@ fun ResolutionSelectorSection(
                         }
                     },
                     enabled = canSaveCustom,
+                    shape = RoundedCornerShape(12.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(44.dp)
@@ -506,7 +571,7 @@ fun ResolutionSelectorSection(
                 ) {
                     Icon(Icons.Default.BookmarkAdded, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Salvar Resolução Personalizada", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Text("Salvar Resolução", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }
@@ -515,7 +580,7 @@ fun ResolutionSelectorSection(
     if (savedCustomResolutions.isNotEmpty()) {
         Spacer(modifier = Modifier.height(10.dp))
         Text(
-            text = "Personalizadas Salvas (${savedCustomResolutions.size})",
+            text = "Personalizadas (${savedCustomResolutions.size})",
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
             color = NeonGreen
@@ -529,18 +594,18 @@ fun ResolutionSelectorSection(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
+                        .clip(RoundedCornerShape(12.dp))
                         .border(
                             1.2.dp,
-                            if (isSelected) NeonGreen else MaterialTheme.colorScheme.outlineVariant,
-                            RoundedCornerShape(8.dp)
+                            if (isSelected) NeonGreen else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                            RoundedCornerShape(12.dp)
                         )
                         .clickable { onSelectResolution(res) }
                         .testTag("saved_custom_res_item_$idx"),
-                    color = if (isSelected) NeonGreen.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surfaceVariant
+                    color = if (isSelected) NeonGreen.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surface
                 ) {
                     Row(
-                        modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                        modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -552,7 +617,7 @@ fun ResolutionSelectorSection(
                                 color = if (isSelected) NeonGreen else MaterialTheme.colorScheme.onSurface
                             )
                             Text(
-                                text = "${res.width}x${res.height} px • Salva",
+                                text = "${res.width}×${res.height} px",
                                 fontSize = 10.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -572,8 +637,6 @@ fun ResolutionSelectorSection(
     }
 
     Spacer(modifier = Modifier.height(10.dp))
-    Text("Predefinições Padrão", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    Spacer(modifier = Modifier.height(6.dp))
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         ProjectResolution.PRESETS.forEach { res ->
             val isSelected = !selectedResolution.isCustom &&
@@ -583,17 +646,17 @@ fun ResolutionSelectorSection(
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
+                    .clip(RoundedCornerShape(12.dp))
                     .border(
                         1.dp,
-                        if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-                        RoundedCornerShape(8.dp)
+                        if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
+                        RoundedCornerShape(12.dp)
                     )
                     .clickable { onSelectResolution(res) },
-                color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f) else MaterialTheme.colorScheme.surface
             ) {
                 Row(
-                    modifier = Modifier.padding(10.dp),
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -601,9 +664,9 @@ fun ResolutionSelectorSection(
                         res.name,
                         fontSize = 12.sp,
                         color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
                     )
-                    Text("${res.width}x${res.height}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("${res.width}×${res.height}", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }

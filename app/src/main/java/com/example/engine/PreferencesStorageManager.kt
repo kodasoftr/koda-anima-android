@@ -4,6 +4,11 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.example.model.AppPreferences
 import com.example.model.AppUiMode
+import com.example.model.Camera3DKeyframe
+import com.example.model.CameraEasingCurve
+import com.example.model.CameraPostEffectSettings
+import com.example.model.CameraPresetTemplate
+import com.example.model.ColorPaletteConfig
 import com.example.model.GestureAction
 import com.example.model.KeyboardShortcutBinding
 import com.example.model.KodanimaTheme
@@ -151,11 +156,145 @@ object PreferencesStorageManager {
             ),
             keyboardShortcuts = decodeKeyboardShortcuts(sp.getString("pref_keyboard_shortcuts_json", null)),
             touchGestures = decodeTouchGestures(sp.getString("pref_touch_gestures_json", null)),
-            savedCustomResolutions = decodeCustomResolutions(sp.getString(KEY_CUSTOM_RESOLUTIONS_JSON, null))
+            savedCustomResolutions = decodeCustomResolutions(sp.getString(KEY_CUSTOM_RESOLUTIONS_JSON, null)),
+            colorPalette = decodeColorPalette(sp.getString(KEY_COLOR_PALETTE_JSON, null)),
+            savedCameraTemplates = decodeCameraTemplates(sp.getString(KEY_CAMERA_TEMPLATES_JSON, null))
         )
     }
 
     private const val KEY_CUSTOM_RESOLUTIONS_JSON = "pref_custom_resolutions_json"
+    private const val KEY_COLOR_PALETTE_JSON = "pref_color_palette_json"
+    private const val KEY_CAMERA_TEMPLATES_JSON = "pref_camera_templates_json"
+
+    private fun decodeColorPalette(rawJson: String?): ColorPaletteConfig {
+        if (rawJson.isNullOrBlank()) return ColorPaletteConfig()
+        return try {
+            val obj = org.json.JSONObject(rawJson)
+            val cols = obj.optInt("cols", 6).coerceIn(2, 12)
+            val rows = obj.optInt("rows", 3).coerceIn(1, 8)
+            val arr = obj.optJSONArray("swatches")
+            val swatches = if (arr != null) {
+                (0 until arr.length()).map { arr.optLong(it, 0xFF000000L) }
+            } else {
+                ColorPaletteConfig().swatches
+            }
+            ColorPaletteConfig(cols = cols, rows = rows, swatches = swatches)
+        } catch (_: Exception) {
+            ColorPaletteConfig()
+        }
+    }
+
+    private fun encodeColorPalette(cfg: ColorPaletteConfig): String {
+        val obj = org.json.JSONObject()
+        obj.put("cols", cfg.cols.coerceIn(2, 12))
+        obj.put("rows", cfg.rows.coerceIn(1, 8))
+        val arr = org.json.JSONArray()
+        cfg.swatches.forEach { arr.put(it) }
+        obj.put("swatches", arr)
+        return obj.toString()
+    }
+
+    private fun decodeCameraTemplates(rawJson: String?): List<CameraPresetTemplate> {
+        if (rawJson.isNullOrBlank()) return emptyList()
+        return try {
+            val arr = org.json.JSONArray(rawJson)
+            val list = ArrayList<CameraPresetTemplate>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val kArr = obj.optJSONArray("keyframes")
+                val keyframes = ArrayList<Camera3DKeyframe>()
+                if (kArr != null) {
+                    for (k in 0 until kArr.length()) {
+                        val ko = kArr.optJSONObject(k) ?: continue
+                        val easing = try {
+                            CameraEasingCurve.valueOf(ko.optString("easing", CameraEasingCurve.BEZIER_SUAVE.name))
+                        } catch (_: Exception) {
+                            CameraEasingCurve.BEZIER_SUAVE
+                        }
+                        keyframes.add(
+                            Camera3DKeyframe(
+                                frameIndex = ko.optInt("frameIndex", 0),
+                                x = ko.optDouble("x", 0.0).toFloat(),
+                                y = ko.optDouble("y", 0.0).toFloat(),
+                                zoom = ko.optDouble("zoom", 1.0).toFloat(),
+                                rotationZ = ko.optDouble("rotationZ", 0.0).toFloat(),
+                                pitchX = ko.optDouble("pitchX", 0.0).toFloat(),
+                                yawY = ko.optDouble("yawY", 0.0).toFloat(),
+                                depthSeparation = ko.optDouble("depthSeparation", 38.0).toFloat(),
+                                fovDegrees = ko.optDouble("fovDegrees", 50.0).toFloat().coerceIn(18f, 120f),
+                                easing = easing
+                            )
+                        )
+                    }
+                }
+                val po = obj.optJSONObject("postEffects")
+                val post = if (po != null) {
+                    CameraPostEffectSettings(
+                        vignette = po.optDouble("vignette", 0.0).toFloat(),
+                        bloom = po.optDouble("bloom", 0.0).toFloat(),
+                        chromaticAberration = po.optDouble("chromaticAberration", 0.0).toFloat(),
+                        filmGrain = po.optDouble("filmGrain", 0.0).toFloat(),
+                        sepia = po.optDouble("sepia", 0.0).toFloat(),
+                        radialBlur = po.optDouble("radialBlur", 0.0).toFloat(),
+                        contrastBoost = po.optDouble("contrastBoost", 0.0).toFloat()
+                    )
+                } else CameraPostEffectSettings()
+                list.add(
+                    CameraPresetTemplate(
+                        id = obj.optString("id", java.util.UUID.randomUUID().toString()),
+                        name = obj.optString("name", "Predefinição de Câmera"),
+                        keyframes = keyframes,
+                        postEffects = post,
+                        captureWidth = obj.optInt("captureWidth", 1280).coerceIn(160, 4096),
+                        captureHeight = obj.optInt("captureHeight", 720).coerceIn(160, 4096),
+                        createdAt = obj.optLong("createdAt", System.currentTimeMillis())
+                    )
+                )
+            }
+            list
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun encodeCameraTemplates(templates: List<CameraPresetTemplate>): String {
+        val arr = org.json.JSONArray()
+        templates.forEach { t ->
+            val obj = org.json.JSONObject()
+            obj.put("id", t.id)
+            obj.put("name", t.name)
+            obj.put("captureWidth", t.captureWidth)
+            obj.put("captureHeight", t.captureHeight)
+            obj.put("createdAt", t.createdAt)
+            val kArr = org.json.JSONArray()
+            t.keyframes.forEach { kf ->
+                val ko = org.json.JSONObject()
+                ko.put("frameIndex", kf.frameIndex)
+                ko.put("x", kf.x.toDouble())
+                ko.put("y", kf.y.toDouble())
+                ko.put("zoom", kf.zoom.toDouble())
+                ko.put("rotationZ", kf.rotationZ.toDouble())
+                ko.put("pitchX", kf.pitchX.toDouble())
+                ko.put("yawY", kf.yawY.toDouble())
+                ko.put("depthSeparation", kf.depthSeparation.toDouble())
+                ko.put("fovDegrees", kf.fovDegrees.toDouble())
+                ko.put("easing", kf.easing.name)
+                kArr.put(ko)
+            }
+            obj.put("keyframes", kArr)
+            val po = org.json.JSONObject()
+            po.put("vignette", t.postEffects.vignette.toDouble())
+            po.put("bloom", t.postEffects.bloom.toDouble())
+            po.put("chromaticAberration", t.postEffects.chromaticAberration.toDouble())
+            po.put("filmGrain", t.postEffects.filmGrain.toDouble())
+            po.put("sepia", t.postEffects.sepia.toDouble())
+            po.put("radialBlur", t.postEffects.radialBlur.toDouble())
+            po.put("contrastBoost", t.postEffects.contrastBoost.toDouble())
+            obj.put("postEffects", po)
+            arr.put(obj)
+        }
+        return arr.toString()
+    }
 
     private fun decodeCustomResolutions(rawJson: String?): List<com.example.model.ProjectResolution> {
         if (rawJson.isNullOrBlank()) return emptyList()
@@ -304,6 +443,8 @@ object PreferencesStorageManager {
             .putString("pref_keyboard_shortcuts_json", encodeKeyboardShortcuts(preferences.keyboardShortcuts))
             .putString("pref_touch_gestures_json", encodeTouchGestures(preferences.touchGestures))
             .putString(KEY_CUSTOM_RESOLUTIONS_JSON, encodeCustomResolutions(preferences.savedCustomResolutions))
+            .putString(KEY_COLOR_PALETTE_JSON, encodeColorPalette(preferences.colorPalette))
+            .putString(KEY_CAMERA_TEMPLATES_JSON, encodeCameraTemplates(preferences.savedCameraTemplates))
             .commit()
     }
 

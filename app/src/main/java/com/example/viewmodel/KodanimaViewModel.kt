@@ -52,6 +52,7 @@ import com.example.engine.KodanimaDispatchers
 import com.example.engine.KritaBrushImporter
 import com.example.engine.LocalServerBridge
 import com.example.engine.LocalServerForegroundService
+import com.example.engine.Camera3DEngine
 import com.example.engine.MultiplayerStudioEngine
 import com.example.engine.PreferencesStorageManager
 import com.example.engine.ProjectCompressionManager
@@ -62,6 +63,20 @@ import com.example.engine.WifiDirectPeerItem
 import com.example.model.BezierNode
 import com.example.model.BrushPreset
 import com.example.model.AppScreen
+import com.example.model.BucketFillConfig
+import com.example.model.BucketReferenceMode
+import com.example.model.Camera3DKeyframe
+import com.example.model.Camera3DSettings
+import com.example.model.CameraBuiltInEffect
+import com.example.model.CameraEasingCurve
+import com.example.model.CameraEffectSpan
+import com.example.model.CameraMode
+import com.example.model.CameraPostEffectSettings
+import com.example.model.CameraPresetTemplate
+import com.example.model.CameraToolAction
+import com.example.model.CanvasBackgroundSettings
+import com.example.model.CanvasBackgroundStyle
+import com.example.model.ColorPaletteConfig
 import com.example.model.FriendBrushOffer
 import com.example.model.GestureAction
 import com.example.model.GridRulerSettings
@@ -106,6 +121,7 @@ data class EditorUiState(
     val activeBrushPreset: BrushPreset = BrushPreset.ALL_12_PRESETS[0],
     val currentColor: Long = 0xFF00D2FF, // Kodanima Cyan
     val brushSize: Float = 6f,
+    val eraserSize: Float = 14f,
     val brushOpacity: Float = 1.0f,
     val isPlaying: Boolean = false,
     val isLooping: Boolean = true,
@@ -164,7 +180,19 @@ data class EditorUiState(
     val isFrameLayersPanelOpen: Boolean = false,
     val activeLocalLayerIndex: Int = 0,
     val activeTargetIsFrameLocalLayer: Boolean = false,
-    val pendingReferenceImageUri: String? = null
+    val pendingReferenceImageUri: String? = null,
+    val isPaletteTrayOpen: Boolean = false,
+    val selectedPaletteSlotIndex: Int = 0,
+    val isCameraTimelineOpen: Boolean = false,
+    val isCameraSideView3D: Boolean = false,
+    val cameraToolAction: CameraToolAction = CameraToolAction.PAN_2D,
+    val bucketConfig: BucketFillConfig = BucketFillConfig(),
+    val showBucketConfig: Boolean = false,
+    val isQuickPaletteOpen: Boolean = false,
+    val isQuickPaletteLocked: Boolean = false,
+    val pendingReturnToPaletteTray: Boolean = false,
+    val toolBeforeEyedropper: ToolType = ToolType.PEN,
+    val exportCameraCropOnly: Boolean = true
 )
 
 class KodanimaViewModel : ViewModel() {
@@ -313,6 +341,9 @@ class KodanimaViewModel : ViewModel() {
         }
         multiplayerEngine.onAddLayerReceived = { layerName ->
             applyRemoteAddLayer(layerName)
+        }
+        multiplayerEngine.onMoveLayerReceived = { fromIndex, toIndex ->
+            applyRemoteMoveLayer(fromIndex, toIndex)
         }
         multiplayerEngine.onFrameLocalLayersReceived = { frameIndex, localLayers ->
             applyRemoteFrameLocalLayers(frameIndex, localLayers)
@@ -887,7 +918,10 @@ class KodanimaViewModel : ViewModel() {
             it.copy(
                 gridRulerSettings = settings.copy(
                     cellSizePx = settings.cellSizePx.coerceIn(12f, 256f),
-                    opacity = settings.opacity.coerceIn(0.1f, 1.0f)
+                    opacity = settings.opacity.coerceIn(0.1f, 1.0f),
+                    lineCountX = settings.lineCountX.coerceIn(2, 64),
+                    lineCountY = settings.lineCountY.coerceIn(2, 64),
+                    lineThicknessDp = settings.lineThicknessDp.coerceIn(0.4f, 6.0f)
                 )
             )
         }
@@ -1585,12 +1619,43 @@ class KodanimaViewModel : ViewModel() {
     // --- Drawing & Tool Selection ---
 
     fun selectTool(tool: ToolType) {
-        _uiState.update { it.copy(selectedTool = tool) }
+        _uiState.update { state ->
+            if (tool == ToolType.BUCKET) {
+                val alreadyBucket = state.selectedTool == ToolType.BUCKET
+                state.copy(
+                    selectedTool = ToolType.BUCKET,
+                    showBucketConfig = if (alreadyBucket) !state.showBucketConfig else state.showBucketConfig
+                )
+            } else {
+                state.copy(
+                    selectedTool = tool,
+                    showBucketConfig = false
+                )
+            }
+        }
     }
 
-    fun setColor(color: Long) {
+    fun toggleBucketConfig() {
+        _uiState.update { it.copy(selectedTool = ToolType.BUCKET, showBucketConfig = !it.showBucketConfig) }
+    }
+
+    fun closeBucketConfig() {
+        _uiState.update { it.copy(showBucketConfig = false) }
+    }
+
+    fun updateBucketConfig(config: BucketFillConfig) {
+        _uiState.update {
+            it.copy(
+                bucketConfig = config.copy(
+                    expandPixels = config.expandPixels.coerceIn(-8, 24)
+                )
+            )
+        }
+    }
+
+    fun setColor(color: Long, recordToRecents: Boolean = true) {
         _uiState.update { state ->
-            val updatedRecents = if (!state.recentColors.contains(color)) {
+            val updatedRecents = if (recordToRecents && !state.recentColors.contains(color)) {
                 listOf(color) + state.recentColors.take(7)
             } else {
                 state.recentColors
@@ -1599,8 +1664,20 @@ class KodanimaViewModel : ViewModel() {
         }
     }
 
+    fun recordRecentColor(color: Long) {
+        _uiState.update { state ->
+            if (state.recentColors.firstOrNull() == color) return@update state
+            val updatedRecents = (listOf(color) + state.recentColors.filter { it != color }).take(8)
+            state.copy(recentColors = updatedRecents)
+        }
+    }
+
     fun setBrushSize(size: Float) {
         _uiState.update { it.copy(brushSize = size.coerceIn(1f, 100f)) }
+    }
+
+    fun setEraserSize(size: Float) {
+        _uiState.update { it.copy(eraserSize = size.coerceIn(1f, 100f)) }
     }
 
     fun setBrushOpacity(opacity: Float) {
@@ -1663,7 +1740,14 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun closeDialog() {
-        _uiState.update { it.copy(activeDialog = EditorDialog.NONE) }
+        _uiState.update { state ->
+            val shouldReturnPalette = state.activeDialog == EditorDialog.COLOR_PICKER && state.pendingReturnToPaletteTray
+            state.copy(
+                activeDialog = EditorDialog.NONE,
+                isPaletteTrayOpen = if (shouldReturnPalette) true else state.isPaletteTrayOpen,
+                pendingReturnToPaletteTray = if (shouldReturnPalette) false else state.pendingReturnToPaletteTray
+            )
+        }
     }
 
     // --- Keyboard Shortcut Handler (PC Mode & Physical Keyboard) ---
@@ -1697,8 +1781,20 @@ class KodanimaViewModel : ViewModel() {
                     return false
                 }
             }
-            ShortcutAction.BRUSH_SIZE_DOWN -> setBrushSize((_uiState.value.brushSize - 2f).coerceAtLeast(1f))
-            ShortcutAction.BRUSH_SIZE_UP -> setBrushSize((_uiState.value.brushSize + 2f).coerceAtMost(100f))
+            ShortcutAction.BRUSH_SIZE_DOWN -> {
+                if (_uiState.value.selectedTool == ToolType.ERASER) {
+                    setEraserSize((_uiState.value.eraserSize - 2f).coerceAtLeast(1f))
+                } else {
+                    setBrushSize((_uiState.value.brushSize - 2f).coerceAtLeast(1f))
+                }
+            }
+            ShortcutAction.BRUSH_SIZE_UP -> {
+                if (_uiState.value.selectedTool == ToolType.ERASER) {
+                    setEraserSize((_uiState.value.eraserSize + 2f).coerceAtMost(100f))
+                } else {
+                    setBrushSize((_uiState.value.brushSize + 2f).coerceAtMost(100f))
+                }
+            }
             ShortcutAction.TOGGLE_MIRROR -> toggleMirrorCanvasHorizontal()
             ShortcutAction.PLAY_PAUSE -> togglePlayback()
             ShortcutAction.PREV_FRAME -> prevFrame()
@@ -1712,6 +1808,39 @@ class KodanimaViewModel : ViewModel() {
             ShortcutAction.TOGGLE_ZEN -> toggleZenMode()
             ShortcutAction.OPEN_EXPORT -> openDialog(EditorDialog.EXPORT)
             ShortcutAction.TOGGLE_FRAME_LAYERS -> toggleFrameLayersPanel()
+            ShortcutAction.TOGGLE_QUICK_PALETTE -> toggleQuickPalette()
+            ShortcutAction.CAMERA_TOGGLE_MODE -> {
+                val nextMode = if (_uiState.value.project.camera3D.cameraMode == CameraMode.MODE_2D) {
+                    CameraMode.MODE_3D
+                } else {
+                    CameraMode.MODE_2D
+                }
+                if (!_uiState.value.isCameraTimelineOpen) {
+                    toggleCameraTimeline()
+                }
+                setCameraMode(nextMode)
+            }
+            ShortcutAction.CAMERA_ADD_KEYFRAME -> addOrUpdateCameraKeyframeAtCurrentFrame()
+            ShortcutAction.CAMERA_TOGGLE_AUTO_INTERP -> toggleCameraAutoInterpolate()
+            ShortcutAction.CAMERA_TOGGLE_3D_VIEW -> {
+                if (!_uiState.value.isCameraTimelineOpen) {
+                    toggleCameraTimeline()
+                }
+                toggleCameraSideView3D()
+            }
+            ShortcutAction.CAMERA_PAN_TOOL -> {
+                if (!_uiState.value.isCameraTimelineOpen) {
+                    toggleCameraTimeline()
+                }
+                setCameraToolAction(CameraToolAction.PAN_2D)
+            }
+            ShortcutAction.CAMERA_ROTATE_LEFT -> rotateCameraBy(-5f)
+            ShortcutAction.CAMERA_ROTATE_RIGHT -> rotateCameraBy(5f)
+            ShortcutAction.CAMERA_ZOOM_IN -> zoomCameraBy(1.12f)
+            ShortcutAction.CAMERA_ZOOM_OUT -> zoomCameraBy(0.89f)
+            ShortcutAction.CAMERA_FOV_WIDE -> adjustCameraFov(5f)
+            ShortcutAction.CAMERA_FOV_TELE -> adjustCameraFov(-5f)
+            ShortcutAction.CAMERA_RESET -> resetCameraAtCurrentFrame()
         }
         return true
     }
@@ -1920,23 +2049,36 @@ class KodanimaViewModel : ViewModel() {
     fun performBucketFill(x: Float, y: Float) {
         val state = _uiState.value
         val proj = state.project
-        val currFrame = proj.frames.getOrNull(state.currentFrameIndex) ?: return
+        val frameIndex = state.currentFrameIndex
+        val currFrame = proj.frames.getOrNull(frameIndex) ?: return
         val fillColor = state.currentColor
         val fillOpacity = state.brushOpacity
+        val cfg = state.bucketConfig
         val activeSel = state.activeSelection
         val selectionClipPoly = if (activeSel.isActive && activeSel.points.size >= 3) {
             SelectionGeometryHelper.transformSelectionPolygon(activeSel)
         } else null
 
+        val refLayerIds: Set<String>? = if (cfg.referenceMode == BucketReferenceMode.SELECTED_LAYERS) {
+            val allLayers = currFrame.layers + currFrame.localLayers
+            val chosen = allLayers.filter {
+                it.isVisible && (it.isBucketReference || it.id in cfg.selectedReferenceLayerIds)
+            }.map { it.id }.toSet()
+            if (chosen.isNotEmpty()) chosen else null
+        } else {
+            null
+        }
+
         viewModelScope.launch {
             val spans = withContext(KodanimaDispatchers.backgroundRender) {
                 var bmp: Bitmap? = null
                 try {
-                    bmp = KodanimaGraphicsEngine.renderFrameToBitmap(
-                        currFrame,
-                        proj.resolution.width,
-                        proj.resolution.height,
-                        android.graphics.Color.WHITE
+                    bmp = KodanimaGraphicsEngine.renderSelectedLayersToBitmap(
+                        frame = currFrame,
+                        width = proj.resolution.width,
+                        height = proj.resolution.height,
+                        selectedLayerIds = refLayerIds,
+                        backgroundColor = android.graphics.Color.WHITE
                     )
                     val px = x.toInt().coerceIn(0, bmp.width - 1)
                     val py = y.toInt().coerceIn(0, bmp.height - 1)
@@ -1945,7 +2087,9 @@ class KodanimaViewModel : ViewModel() {
                         startX = px,
                         startY = py,
                         tolerance = 20,
-                        selectionPoly = selectionClipPoly
+                        selectionPoly = selectionClipPoly,
+                        isSelectionInverted = activeSel.isInverted,
+                        expandPixels = cfg.expandPixels
                     )
                 } finally {
                     KodanimaBitmapPool.release(bmp)
@@ -1959,10 +2103,96 @@ class KodanimaViewModel : ViewModel() {
                     opacity = fillOpacity,
                     points = spans,
                     isFilled = true,
-                    clipPolygon = selectionClipPoly
+                    clipPolygon = selectionClipPoly,
+                    clipInverted = if (selectionClipPoly != null) activeSel.isInverted else false,
+                    clipBoundsWidth = proj.resolution.width.toFloat(),
+                    clipBoundsHeight = proj.resolution.height.toFloat()
                 )
-                addStrokeToCurrentLayer(stroke)
+                commitBucketStrokeToDestination(stroke, frameIndex)
             }
+        }
+    }
+
+    /**
+     * Routes a bucket fill stroke either to the active layer or—when [BucketFillConfig.paintUnderneathLineArt]
+     * is enabled—to a dedicated [Layer.isBucketLayer] positioned below the line art (reusing any existing
+     * bucket layer before creating one).
+     */
+    private fun commitBucketStrokeToDestination(stroke: DrawingStroke, frameIndex: Int) {
+        val stateNow = _uiState.value
+        val cfg = stateNow.bucketConfig
+        val currFrame = stateNow.project.frames.getOrNull(frameIndex) ?: return
+        if (!cfg.paintUnderneathLineArt) {
+            addStrokeToCurrentLayer(stroke)
+            return
+        }
+
+        val useLocal = isUsingLocalLayer(stateNow, currFrame)
+        if (useLocal) {
+            val locals = currFrame.localLayers
+            val explicitIdx = cfg.activeBucketTargetLayerId?.let { targetId ->
+                locals.indexOfFirst { it.id == targetId && it.isVisible && !it.isLocked }
+            }?.takeIf { it >= 0 }
+            val activeIdx = stateNow.activeLocalLayerIndex.coerceIn(0, (locals.size - 1).coerceAtLeast(0))
+            val existingBelowIdx = locals.indices.lastOrNull { idx ->
+                idx <= activeIdx && locals[idx].isBucketLayer && locals[idx].isVisible && !locals[idx].isLocked
+            } ?: locals.indexOfFirst { it.isBucketLayer && it.isVisible && !it.isLocked }.takeIf { it >= 0 }
+
+            val targetIdx = explicitIdx ?: existingBelowIdx ?: run {
+                val newLayer = Layer(
+                    name = "Balde ${locals.count { it.isBucketLayer } + 1}",
+                    isBucketLayer = true
+                )
+                val insertAt = activeIdx.coerceIn(0, locals.size)
+                _uiState.update { st ->
+                    val f = st.project.frames.getOrNull(frameIndex) ?: return@update st
+                    val mutableLocals = f.localLayers.toMutableList()
+                    mutableLocals.add(insertAt, newLayer)
+                    val updatedFrames = st.project.frames.toMutableList()
+                    updatedFrames[frameIndex] = f.copy(localLayers = mutableLocals)
+                    val nextActiveLocal = if (st.activeLocalLayerIndex >= insertAt) st.activeLocalLayerIndex + 1 else st.activeLocalLayerIndex
+                    st.copy(
+                        project = st.project.copy(frames = updatedFrames),
+                        activeLocalLayerIndex = nextActiveLocal,
+                        bucketConfig = st.bucketConfig.copy(activeBucketTargetLayerId = newLayer.id)
+                    )
+                }
+                insertAt
+            }
+            addStrokeToSpecificLayer(stroke, frameIndex, targetIdx, isLocalLayer = true)
+        } else {
+            val layers = currFrame.layers
+            val explicitIdx = cfg.activeBucketTargetLayerId?.let { targetId ->
+                layers.indexOfFirst { it.id == targetId && it.isVisible && !it.isLocked }
+            }?.takeIf { it >= 0 }
+            val activeIdx = stateNow.activeLayerIndex.coerceIn(0, (layers.size - 1).coerceAtLeast(0))
+            val existingBelowIdx = layers.indices.lastOrNull { idx ->
+                idx <= activeIdx && layers[idx].isBucketLayer && layers[idx].isVisible && !layers[idx].isLocked
+            } ?: layers.indexOfFirst { it.isBucketLayer && it.isVisible && !it.isLocked }.takeIf { it >= 0 }
+
+            val targetIdx = explicitIdx ?: existingBelowIdx ?: run {
+                val newName = "Balde ${layers.count { it.isBucketLayer } + 1}"
+                val insertAt = activeIdx.coerceIn(0, layers.size)
+                var createdIdForCurrentFrame: String? = null
+                _uiState.update { st ->
+                    val updatedFrames = st.project.frames.mapIndexed { fIdx, f ->
+                        val created = Layer(name = newName, isBucketLayer = true)
+                        if (fIdx == frameIndex) createdIdForCurrentFrame = created.id
+                        val list = f.layers.toMutableList()
+                        val safeInsert = insertAt.coerceIn(0, list.size)
+                        list.add(safeInsert, created)
+                        f.copy(layers = list)
+                    }
+                    val nextActiveLayer = if (st.activeLayerIndex >= insertAt) st.activeLayerIndex + 1 else st.activeLayerIndex
+                    st.copy(
+                        project = st.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis()),
+                        activeLayerIndex = nextActiveLayer,
+                        bucketConfig = st.bucketConfig.copy(activeBucketTargetLayerId = createdIdForCurrentFrame)
+                    )
+                }
+                insertAt
+            }
+            addStrokeToSpecificLayer(stroke, frameIndex, targetIdx, isLocalLayer = false)
         }
     }
 
@@ -2053,15 +2283,102 @@ class KodanimaViewModel : ViewModel() {
                     maxY = maxY,
                     capturedStrokes = split.capturedInside,
                     hiddenSourceStrokeIds = split.affectedOriginalIds,
-                    outsideReplacementStrokes = split.stationaryOutside
+                    outsideReplacementStrokes = split.stationaryOutside,
+                    isInverted = false
                 )
             )
         }
     }
 
+    fun invertSelection() {
+        val state = _uiState.value
+        val sel = state.activeSelection
+        if (!sel.isActive || sel.points.size < 3) return
+        val currFrame = state.project.frames.getOrNull(state.currentFrameIndex) ?: return
+        val useLocal = isUsingLocalLayer(state, currFrame)
+        val targetList = if (useLocal) currFrame.localLayers else currFrame.layers
+        val validLayerIdx = (if (useLocal) state.activeLocalLayerIndex else state.activeLayerIndex)
+            .coerceIn(0, targetList.lastIndex)
+        val strokes = targetList.getOrNull(validLayerIdx)?.strokes ?: emptyList()
+
+        val transformedPoly = SelectionGeometryHelper.transformSelectionPolygon(sel)
+        val nextInverted = !sel.isInverted
+        val projW = state.project.resolution.width.toFloat()
+        val projH = state.project.resolution.height.toFloat()
+        val split = SelectionGeometryHelper.splitStrokesBySelection(
+            strokes = strokes,
+            poly = transformedPoly,
+            isInverted = nextInverted,
+            boundsWidth = projW,
+            boundsHeight = projH
+        )
+        val minX = transformedPoly.minOf { it.x }
+        val minY = transformedPoly.minOf { it.y }
+        val maxX = transformedPoly.maxOf { it.x }
+        val maxY = transformedPoly.maxOf { it.y }
+
+        _uiState.update {
+            it.copy(
+                activeSelection = SelectionRegion(
+                    isActive = true,
+                    points = transformedPoly,
+                    minX = minX,
+                    minY = minY,
+                    maxX = maxX,
+                    maxY = maxY,
+                    capturedStrokes = split.capturedInside,
+                    hiddenSourceStrokeIds = split.affectedOriginalIds,
+                    outsideReplacementStrokes = split.stationaryOutside,
+                    isInverted = nextInverted
+                ),
+                statusMessage = if (nextInverted) {
+                    "Seleção invertida: área externa editável e interior protegido."
+                } else {
+                    "Seleção normal restaurada: interior editável."
+                }
+            )
+        }
+    }
+
+    private fun ensureSelectionCaptured(state: EditorUiState): SelectionRegion {
+        val sel = state.activeSelection
+        if (!sel.isActive || sel.points.size < 3) return sel
+        if (sel.capturedStrokes.isNotEmpty() || sel.hiddenSourceStrokeIds.isNotEmpty()) return sel
+        val currFrame = state.project.frames.getOrNull(state.currentFrameIndex) ?: return sel
+        val useLocal = isUsingLocalLayer(state, currFrame)
+        val targetList = if (useLocal) currFrame.localLayers else currFrame.layers
+        if (targetList.isEmpty()) return sel
+        val validLayerIdx = (if (useLocal) state.activeLocalLayerIndex else state.activeLayerIndex)
+            .coerceIn(0, targetList.lastIndex)
+        val strokes = targetList[validLayerIdx].strokes
+        val poly = SelectionGeometryHelper.transformSelectionPolygon(sel)
+        val split = SelectionGeometryHelper.splitStrokesBySelection(
+            strokes = strokes,
+            poly = poly,
+            isInverted = sel.isInverted,
+            boundsWidth = state.project.resolution.width.toFloat(),
+            boundsHeight = state.project.resolution.height.toFloat()
+        )
+        return sel.copy(
+            points = poly,
+            minX = poly.minOf { it.x },
+            minY = poly.minOf { it.y },
+            maxX = poly.maxOf { it.x },
+            maxY = poly.maxOf { it.y },
+            offsetX = 0f,
+            offsetY = 0f,
+            scaleX = 1f,
+            scaleY = 1f,
+            rotationDegrees = 0f,
+            capturedStrokes = split.capturedInside,
+            hiddenSourceStrokeIds = split.affectedOriginalIds,
+            outsideReplacementStrokes = split.stationaryOutside
+        )
+    }
+
     fun flipSelectionH() {
         _uiState.update { state ->
-            val sel = state.activeSelection
+            val sel = ensureSelectionCaptured(state)
             if (!sel.isActive) return@update state
             val cx = sel.centerX + sel.offsetX
             val flippedPts = sel.points.map { it.copy(x = 2 * cx - it.x) }
@@ -2084,7 +2401,7 @@ class KodanimaViewModel : ViewModel() {
 
     fun flipSelectionV() {
         _uiState.update { state ->
-            val sel = state.activeSelection
+            val sel = ensureSelectionCaptured(state)
             if (!sel.isActive) return@update state
             val cy = sel.centerY + sel.offsetY
             val flippedPts = sel.points.map { it.copy(y = 2 * cy - it.y) }
@@ -2106,10 +2423,15 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun copySelection() {
-        val sel = _uiState.value.activeSelection
+        val sel = ensureSelectionCaptured(_uiState.value)
         if (sel.isActive && sel.capturedStrokes.isNotEmpty()) {
             clipboardStrokes = sel.capturedStrokes.map { it.copy(id = UUID.randomUUID().toString()) }
-            _uiState.update { it.copy(statusMessage = "${clipboardStrokes.size} traços copiados!") }
+            _uiState.update {
+                it.copy(
+                    activeSelection = sel,
+                    statusMessage = "${clipboardStrokes.size} traços copiados!"
+                )
+            }
         }
     }
 
@@ -2195,7 +2517,7 @@ class KodanimaViewModel : ViewModel() {
 
     fun deleteSelection() {
         val stateBefore = _uiState.value
-        val sel = stateBefore.activeSelection
+        val sel = ensureSelectionCaptured(stateBefore)
         if (!sel.isActive) return
         val frameIdx = stateBefore.currentFrameIndex
         val currFrame = stateBefore.project.frames.getOrNull(frameIdx) ?: return
@@ -2266,17 +2588,37 @@ class KodanimaViewModel : ViewModel() {
             .coerceIn(0, targetList.lastIndex)
         val myId = stateBefore.userAccount.id
         val transformedPoly = SelectionGeometryHelper.transformSelectionPolygon(sel)
-        val fillStroke = SelectionGeometryHelper.withRecomputedBounds(
-            DrawingStroke(
-                authorId = myId,
-                tool = ToolType.LASSO,
-                color = stateBefore.currentColor,
-                brushSize = 4f,
-                opacity = stateBefore.brushOpacity,
-                points = transformedPoly,
-                isFilled = true
+        val projW = stateBefore.project.resolution.width.toFloat()
+        val projH = stateBefore.project.resolution.height.toFloat()
+        val fillStroke = if (sel.isInverted) {
+            SelectionGeometryHelper.withRecomputedBounds(
+                DrawingStroke(
+                    authorId = myId,
+                    tool = ToolType.RECTANGLE,
+                    color = stateBefore.currentColor,
+                    brushSize = 4f,
+                    opacity = stateBefore.brushOpacity,
+                    points = listOf(StrokePoint(0f, 0f), StrokePoint(projW, projH)),
+                    isFilled = true,
+                    clipPolygon = transformedPoly,
+                    clipInverted = true,
+                    clipBoundsWidth = projW,
+                    clipBoundsHeight = projH
+                )
             )
-        )
+        } else {
+            SelectionGeometryHelper.withRecomputedBounds(
+                DrawingStroke(
+                    authorId = myId,
+                    tool = ToolType.LASSO,
+                    color = stateBefore.currentColor,
+                    brushSize = 4f,
+                    opacity = stateBefore.brushOpacity,
+                    points = transformedPoly,
+                    isFilled = true
+                )
+            )
+        }
         pushUndoOp(CanvasOp.AddStroke(myId, currFrame.id, validLayerIdx, fillStroke, isLocalLayer = useLocal))
         _uiState.update { state ->
             val f = state.project.frames[state.currentFrameIndex]
@@ -2308,7 +2650,7 @@ class KodanimaViewModel : ViewModel() {
 
     fun updateSelectionOffset(dx: Float, dy: Float) {
         _uiState.update { state ->
-            val sel = state.activeSelection
+            val sel = ensureSelectionCaptured(state)
             if (!sel.isActive) return@update state
             state.copy(
                 activeSelection = sel.copy(
@@ -2321,7 +2663,7 @@ class KodanimaViewModel : ViewModel() {
 
     fun rotateSelection(degrees: Float) {
         _uiState.update { state ->
-            val sel = state.activeSelection
+            val sel = ensureSelectionCaptured(state)
             if (!sel.isActive) return@update state
             state.copy(activeSelection = sel.copy(rotationDegrees = (sel.rotationDegrees + degrees) % 360f))
         }
@@ -2329,7 +2671,7 @@ class KodanimaViewModel : ViewModel() {
 
     fun scaleSelection(factor: Float) {
         _uiState.update { state ->
-            val sel = state.activeSelection
+            val sel = ensureSelectionCaptured(state)
             if (!sel.isActive) return@update state
             val newX = (sel.scaleX * factor).coerceIn(0.1f, 10f)
             val newY = (sel.scaleY * factor).coerceIn(0.1f, 10f)
@@ -2563,6 +2905,21 @@ class KodanimaViewModel : ViewModel() {
         val targetList = if (useLocal) currFrame.localLayers else currFrame.layers
         val validLayerIndex = (if (useLocal) stateBefore.activeLocalLayerIndex else stateBefore.activeLayerIndex)
             .coerceIn(0, targetList.lastIndex)
+        addStrokeToSpecificLayer(stroke, frameIndex, validLayerIndex, useLocal)
+    }
+
+    private fun addStrokeToSpecificLayer(
+        stroke: DrawingStroke,
+        frameIndex: Int,
+        layerIndex: Int,
+        isLocalLayer: Boolean
+    ) {
+        val stateBefore = _uiState.value
+        val currFrame = stateBefore.project.frames.getOrNull(frameIndex) ?: return
+        val useLocal = isLocalLayer && currFrame.localLayers.isNotEmpty()
+        val targetList = if (useLocal) currFrame.localLayers else currFrame.layers
+        if (targetList.isEmpty()) return
+        val validLayerIndex = layerIndex.coerceIn(0, targetList.lastIndex)
         val targetLayer = targetList[validLayerIndex]
         if (targetLayer.isLocked || !targetLayer.isVisible) {
             return
@@ -2573,14 +2930,43 @@ class KodanimaViewModel : ViewModel() {
         val selectionClipPoly = if (activeSel.isActive && activeSel.points.size >= 3 && stroke.tool != ToolType.LASSO) {
             SelectionGeometryHelper.transformSelectionPolygon(activeSel)
         } else null
+        val appliedClipPoly = stroke.clipPolygon ?: selectionClipPoly
+        val appliedClipInverted = if (stroke.clipPolygon != null) stroke.clipInverted else (selectionClipPoly != null && activeSel.isInverted)
+        val projW = stateBefore.project.resolution.width.toFloat()
+        val projH = stateBefore.project.resolution.height.toFloat()
         val stampedStroke = SelectionGeometryHelper.withRecomputedBounds(
             stroke.copy(
                 authorId = stroke.authorId.ifBlank { myId },
-                clipPolygon = stroke.clipPolygon ?: selectionClipPoly
+                clipPolygon = appliedClipPoly,
+                clipInverted = appliedClipInverted,
+                clipBoundsWidth = if (stroke.clipBoundsWidth > 0f) stroke.clipBoundsWidth else projW,
+                clipBoundsHeight = if (stroke.clipBoundsHeight > 0f) stroke.clipBoundsHeight else projH
             )
         )
         val optimizedStroke = stampedStroke
 
+        // If the user is drawing/erasing with an active selection whose transform was modified,
+        // settle those pending captured strokes into the layer first so chronological order & Undo remain exact.
+        val hasPendingSelTransform = activeSel.isActive &&
+            stroke.tool != ToolType.LASSO &&
+            (activeSel.offsetX != 0f || activeSel.offsetY != 0f || activeSel.scaleX != 1f || activeSel.scaleY != 1f || activeSel.rotationDegrees != 0f) &&
+            (activeSel.capturedStrokes.isNotEmpty() || activeSel.hiddenSourceStrokeIds.isNotEmpty())
+        val targetOldIds = if (hasPendingSelTransform) {
+            if (activeSel.hiddenSourceStrokeIds.isNotEmpty()) activeSel.hiddenSourceStrokeIds
+            else activeSel.capturedStrokes.map { it.id }.toSet()
+        } else emptySet()
+        val oldSelStrokes = if (hasPendingSelTransform) {
+            targetLayer.strokes.filter { it.id in targetOldIds }
+        } else emptyList()
+        val settledReplacementStrokes = if (hasPendingSelTransform) {
+            activeSel.outsideReplacementStrokes + activeSel.capturedStrokes.map {
+                SelectionGeometryHelper.transformStrokeWithSelection(it, activeSel, myId)
+            }
+        } else emptyList()
+
+        if (hasPendingSelTransform && (oldSelStrokes.isNotEmpty() || settledReplacementStrokes.isNotEmpty())) {
+            pushUndoOp(CanvasOp.ReplaceStrokes(myId, currFrame.id, validLayerIndex, oldSelStrokes, settledReplacementStrokes, isLocalLayer = useLocal))
+        }
         pushUndoOp(CanvasOp.AddStroke(myId, currFrame.id, validLayerIndex, optimizedStroke, isLocalLayer = useLocal))
 
         _uiState.update { state ->
@@ -2588,23 +2974,49 @@ class KodanimaViewModel : ViewModel() {
             val updatedFrame = if (useLocal && f.localLayers.isNotEmpty()) {
                 val safeIdx = validLayerIndex.coerceIn(0, f.localLayers.lastIndex)
                 val l = f.localLayers[safeIdx]
+                val baseStrokes = if (hasPendingSelTransform) {
+                    l.strokes.filter { it.id !in targetOldIds } + settledReplacementStrokes
+                } else l.strokes
                 val updatedLayers = f.localLayers.toMutableList()
-                updatedLayers[safeIdx] = l.copy(strokes = l.strokes + optimizedStroke)
+                updatedLayers[safeIdx] = l.copy(strokes = baseStrokes + optimizedStroke)
                 f.copy(localLayers = updatedLayers)
             } else {
                 val safeIdx = validLayerIndex.coerceIn(0, f.layers.lastIndex)
                 val l = f.layers[safeIdx]
+                val baseStrokes = if (hasPendingSelTransform) {
+                    l.strokes.filter { it.id !in targetOldIds } + settledReplacementStrokes
+                } else l.strokes
                 val updatedLayers = f.layers.toMutableList()
-                updatedLayers[safeIdx] = l.copy(strokes = l.strokes + optimizedStroke)
+                updatedLayers[safeIdx] = l.copy(strokes = baseStrokes + optimizedStroke)
                 f.copy(layers = updatedLayers)
             }
 
             val updatedFrames = state.project.frames.toMutableList()
             updatedFrames[frameIndex] = updatedFrame
 
+            val nextSel = if (activeSel.isActive && stroke.tool != ToolType.LASSO && selectionClipPoly != null) {
+                activeSel.copy(
+                    points = selectionClipPoly,
+                    minX = selectionClipPoly.minOf { it.x },
+                    minY = selectionClipPoly.minOf { it.y },
+                    maxX = selectionClipPoly.maxOf { it.x },
+                    maxY = selectionClipPoly.maxOf { it.y },
+                    offsetX = 0f,
+                    offsetY = 0f,
+                    scaleX = 1f,
+                    scaleY = 1f,
+                    rotationDegrees = 0f,
+                    capturedStrokes = emptyList(),
+                    hiddenSourceStrokeIds = emptySet(),
+                    outsideReplacementStrokes = emptyList()
+                )
+            } else {
+                state.activeSelection
+            }
+
             val updatedProj = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
             multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
-            state.copy(project = updatedProj)
+            state.copy(project = updatedProj, activeSelection = nextSel)
         }
         updateUndoRedoAvailability()
 
@@ -2612,6 +3024,14 @@ class KodanimaViewModel : ViewModel() {
         val currentMultiState = _uiState.value
         if (currentMultiState.multiplayerRole != com.example.model.MultiplayerRole.NONE) {
             shareImportedBrushIfNeeded(currentMultiState.activeBrushPreset)
+            if (hasPendingSelTransform) {
+                if (oldSelStrokes.isNotEmpty()) {
+                    multiplayerEngine.sendUndoRemoveStrokes(myId, frameIndex, validLayerIndex, oldSelStrokes.map { it.id }, isLocalLayer = useLocal)
+                }
+                if (settledReplacementStrokes.isNotEmpty()) {
+                    multiplayerEngine.sendRedoRestoreStrokes(myId, frameIndex, validLayerIndex, settledReplacementStrokes, isLocalLayer = useLocal)
+                }
+            }
             multiplayerEngine.sendStroke(
                 frameIndex = frameIndex,
                 layerIndex = validLayerIndex,
@@ -2841,6 +3261,31 @@ class KodanimaViewModel : ViewModel() {
             val updatedProj = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
             multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
             state.copy(project = updatedProj)
+        }
+    }
+
+    private fun applyRemoteMoveLayer(fromIndex: Int, toIndex: Int) {
+        _uiState.update { state ->
+            val totalLayers = state.project.frames.firstOrNull()?.layers?.size ?: 0
+            if (fromIndex !in 0 until totalLayers || toIndex !in 0 until totalLayers || fromIndex == toIndex) {
+                return@update state
+            }
+            val updatedFrames = state.project.frames.map { frame ->
+                if (fromIndex in frame.layers.indices && toIndex in frame.layers.indices) {
+                    val list = frame.layers.toMutableList()
+                    val item = list.removeAt(fromIndex)
+                    list.add(toIndex, item)
+                    frame.copy(layers = list)
+                } else frame
+            }
+            val nextActive = when (state.activeLayerIndex) {
+                fromIndex -> toIndex
+                toIndex -> fromIndex
+                else -> state.activeLayerIndex
+            }
+            val updatedProj = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(project = updatedProj, activeLayerIndex = nextActive)
         }
     }
 
@@ -3318,6 +3763,112 @@ class KodanimaViewModel : ViewModel() {
             }
             state.copy(project = state.project.copy(frames = updatedFrames))
         }
+    }
+
+    fun addBucketLayer(insertBelowActive: Boolean = true) {
+        pushCurrentFrameToUndo()
+        _uiState.update { state ->
+            val frameIdx = state.currentFrameIndex
+            val currFrame = state.project.frames.getOrNull(frameIdx) ?: return@update state
+            val bucketCount = currFrame.layers.count { it.isBucketLayer }
+            val newName = "Balde ${bucketCount + 1}"
+            val insertAt = if (insertBelowActive) {
+                state.activeLayerIndex.coerceIn(0, currFrame.layers.size)
+            } else {
+                0
+            }
+            var createdCurrentId: String? = null
+            val updatedFrames = state.project.frames.mapIndexed { fIdx, f ->
+                val created = Layer(name = newName, isBucketLayer = true)
+                if (fIdx == frameIdx) createdCurrentId = created.id
+                val list = f.layers.toMutableList()
+                list.add(insertAt.coerceIn(0, list.size), created)
+                f.copy(layers = list)
+            }
+            val nextActive = if (state.activeLayerIndex >= insertAt) state.activeLayerIndex + 1 else state.activeLayerIndex
+            val updatedProj = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(
+                project = updatedProj,
+                activeLayerIndex = nextActive.coerceIn(0, (updatedFrames.firstOrNull()?.layers?.lastIndex ?: 0)),
+                bucketConfig = state.bucketConfig.copy(
+                    paintUnderneathLineArt = true,
+                    activeBucketTargetLayerId = createdCurrentId
+                ),
+                statusMessage = "Camada '$newName' criada como alvo do Balde!"
+            )
+        }
+        updateUndoRedoAvailability()
+    }
+
+    fun setActiveBucketTargetLayer(layerId: String) {
+        _uiState.update { state ->
+            val currFrame = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
+            val targetName = (currFrame.layers + currFrame.localLayers).firstOrNull { it.id == layerId }?.name ?: "Balde"
+            state.copy(
+                bucketConfig = state.bucketConfig.copy(
+                    paintUnderneathLineArt = true,
+                    activeBucketTargetLayerId = layerId
+                ),
+                statusMessage = "Alvo do Balde: $targetName"
+            )
+        }
+    }
+
+    fun toggleTimelineLayerBucketReference(layerIndex: Int) {
+        _uiState.update { state ->
+            val currFrame = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
+            val target = currFrame.layers.getOrNull(layerIndex) ?: return@update state
+            val nextRef = !target.isBucketReference
+            val updatedFrames = state.project.frames.map { frame ->
+                if (layerIndex in frame.layers.indices) {
+                    val upd = frame.layers.mapIndexed { idx, l ->
+                        if (idx == layerIndex) l.copy(isBucketReference = nextRef) else l
+                    }
+                    frame.copy(layers = upd)
+                } else frame
+            }
+            val nextIds = if (nextRef) {
+                state.bucketConfig.selectedReferenceLayerIds + target.id
+            } else {
+                state.bucketConfig.selectedReferenceLayerIds - target.id
+            }
+            state.copy(
+                project = state.project.copy(frames = updatedFrames),
+                bucketConfig = state.bucketConfig.copy(selectedReferenceLayerIds = nextIds)
+            )
+        }
+    }
+
+    fun toggleFrameLocalLayerBucketReference(localIndex: Int) {
+        updateCurrentFrameLocalLayers { locals, _ ->
+            if (localIndex !in locals.indices) return@updateCurrentFrameLocalLayers locals to null
+            val mutable = locals.toMutableList()
+            val prev = mutable[localIndex]
+            mutable[localIndex] = prev.copy(isBucketReference = !prev.isBucketReference)
+            mutable to null
+        }
+    }
+
+    fun addFrameLocalBucketLayer() {
+        pushCurrentFrameToUndo()
+        updateCurrentFrameLocalLayers { locals, activeIdx ->
+            val count = locals.count { it.isBucketLayer }
+            val created = Layer(name = "Sub-Balde ${count + 1}", isBucketLayer = true)
+            val insertAt = activeIdx.coerceIn(0, locals.size)
+            val mutable = locals.toMutableList()
+            mutable.add(insertAt, created)
+            _uiState.update {
+                it.copy(
+                    bucketConfig = it.bucketConfig.copy(
+                        paintUnderneathLineArt = true,
+                        activeBucketTargetLayerId = created.id
+                    )
+                )
+            }
+            mutable to (insertAt + 1).coerceAtMost(mutable.lastIndex)
+        }
+        updateUndoRedoAvailability()
     }
 
     // --- Per-Frame Isolated Sub-Layers ("Camadas do Quadro" + Efeitos de Mesclagem + Recorte) ---
@@ -4219,6 +4770,22 @@ class KodanimaViewModel : ViewModel() {
         }
     }
 
+    fun setFloatingReferenceScaleDirect(scale: Float) {
+        _uiState.update { state ->
+            val ref = state.referenceImage
+            if (!ref.isVisible || ref.isLocked) return@update state
+            state.copy(referenceImage = ref.copy(scale = scale.coerceIn(0.2f, 5.0f)))
+        }
+    }
+
+    fun setFloatingReferenceRotationDirect(degrees: Float) {
+        _uiState.update { state ->
+            val ref = state.referenceImage
+            if (!ref.isVisible || ref.isLocked) return@update state
+            state.copy(referenceImage = ref.copy(rotationDegrees = degrees.coerceIn(-180f, 180f)))
+        }
+    }
+
     fun setFloatingReferenceOpacity(opacity: Float) {
         _uiState.update { state ->
             val ref = state.referenceImage
@@ -4321,13 +4888,53 @@ class KodanimaViewModel : ViewModel() {
 
     // --- Exporting ---
 
+    fun setExportCameraCropOnly(enabled: Boolean) {
+        _uiState.update { it.copy(exportCameraCropOnly = enabled) }
+    }
+
+    private fun renderExportFrameBitmap(
+        proj: AnimationProject,
+        frame: Frame,
+        frameIndex: Int,
+        outW: Int,
+        outH: Int,
+        cropToCamera: Boolean
+    ): Bitmap {
+        val useCam = cropToCamera && proj.camera3D.isEnabled
+        if (useCam || proj.camera3D.postEffects.hasAnyEffect()) {
+            val bmp = KodanimaBitmapPool.acquire(outW, outH, Bitmap.Config.ARGB_8888, android.graphics.Color.TRANSPARENT)
+            Camera3DEngine.renderFrameWithCameraAndEffects(
+                frame = frame,
+                settings = proj.camera3D,
+                frameIndex = frameIndex,
+                projectWidth = proj.resolution.width,
+                projectHeight = proj.resolution.height,
+                targetBitmap = bmp,
+                cropToCamera = useCam,
+                background = proj.canvasBackground,
+                renderTransparentAsSky = false
+            )
+            return bmp
+        }
+        return KodanimaGraphicsEngine.renderFrameToBitmap(
+            frame = frame,
+            width = outW,
+            height = outH,
+            background = proj.canvasBackground
+        )
+    }
+
     fun exportToGif(context: Context) {
         viewModelScope.launch {
             _uiState.update { it.copy(exportState = ExportState.Progress("Renderizando quadros com motor Vulkan/OpenGL...", 0.2f)) }
             try {
-                val proj = _uiState.value.project
-                val w = min(640, proj.resolution.width)
-                val h = (w * proj.resolution.height) / proj.resolution.width
+                val stateNow = _uiState.value
+                val proj = stateNow.project
+                val cropToCam = stateNow.exportCameraCropOnly && proj.camera3D.isEnabled
+                val baseW = if (cropToCam) proj.camera3D.captureWidth else proj.resolution.width
+                val baseH = if (cropToCam) proj.camera3D.captureHeight else proj.resolution.height
+                val w = min(640, baseW).coerceAtLeast(64)
+                val h = ((w.toLong() * baseH) / baseW.coerceAtLeast(1)).toInt().coerceAtLeast(64)
 
                 val gifBytes = withContext(KodanimaDispatchers.backgroundRender) {
                     val framePairs = ArrayList<Pair<Bitmap, Int>>(proj.frames.size)
@@ -4335,7 +4942,7 @@ class KodanimaViewModel : ViewModel() {
                         val total = max(1, proj.frames.size)
                         for (i in proj.frames.indices) {
                             val frame = proj.frames[i]
-                            val bmp = KodanimaGraphicsEngine.renderFrameToBitmap(frame, w, h, android.graphics.Color.WHITE)
+                            val bmp = renderExportFrameBitmap(proj, frame, i, w, h, cropToCam)
                             framePairs.add(bmp to max(1, frame.holdFrames))
                             _uiState.update {
                                 it.copy(exportState = ExportState.Progress("Renderizando quadros: ${i + 1}/$total", 0.2f + 0.4f * (i / total.toFloat())))
@@ -4366,14 +4973,44 @@ class KodanimaViewModel : ViewModel() {
         viewModelScope.launch {
             _uiState.update { it.copy(exportState = ExportState.Progress("Gerando Sprite Sheet...", 0.3f)) }
             try {
-                val proj = _uiState.value.project
-                val cellW = min(320, proj.resolution.width)
-                val cellH = (cellW * proj.resolution.height) / proj.resolution.width
+                val stateNow = _uiState.value
+                val proj = stateNow.project
+                val cropToCam = stateNow.exportCameraCropOnly && proj.camera3D.isEnabled
+                val baseW = if (cropToCam) proj.camera3D.captureWidth else proj.resolution.width
+                val baseH = if (cropToCam) proj.camera3D.captureHeight else proj.resolution.height
+                val cellW = min(320, baseW).coerceAtLeast(32)
+                val cellH = ((cellW.toLong() * baseH) / baseW.coerceAtLeast(1)).toInt().coerceAtLeast(32)
 
                 val pngBytes = withContext(KodanimaDispatchers.backgroundRender) {
                     var sheetBmp: Bitmap? = null
                     try {
-                        sheetBmp = KodanimaGraphicsEngine.generateSpriteSheet(proj.frames, cellW, cellH, columns = 4)
+                        sheetBmp = if (!cropToCam) {
+                            KodanimaGraphicsEngine.generateSpriteSheet(
+                                proj.frames,
+                                cellW,
+                                cellH,
+                                columns = 4,
+                                background = proj.canvasBackground
+                            )
+                        } else {
+                            val cols = 4
+                            val rows = ((proj.frames.size + cols - 1) / cols).coerceAtLeast(1)
+                            val bmp = Bitmap.createBitmap(cellW * cols, cellH * rows, Bitmap.Config.ARGB_8888)
+                            val c = android.graphics.Canvas(bmp)
+                            if (proj.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE) {
+                                c.drawColor(android.graphics.Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
+                            } else {
+                                c.drawColor(proj.canvasBackground.primaryColor.toInt())
+                            }
+                            for (i in proj.frames.indices) {
+                                val cellBmp = renderExportFrameBitmap(proj, proj.frames[i], i, cellW, cellH, true)
+                                val col = i % cols
+                                val row = i / cols
+                                c.drawBitmap(cellBmp, (col * cellW).toFloat(), (row * cellH).toFloat(), null)
+                                KodanimaBitmapPool.release(cellBmp)
+                            }
+                            bmp
+                        }
                         val out = ByteArrayOutputStream()
                         sheetBmp.compress(Bitmap.CompressFormat.PNG, 100, out)
                         out.toByteArray()
@@ -4397,18 +5034,17 @@ class KodanimaViewModel : ViewModel() {
     fun exportCurrentFramePng(context: Context) {
         viewModelScope.launch {
             try {
-                val proj = _uiState.value.project
-                val frameIdx = _uiState.value.currentFrameIndex
+                val stateNow = _uiState.value
+                val proj = stateNow.project
+                val frameIdx = stateNow.currentFrameIndex
                 val curr = proj.frames[frameIdx]
+                val cropToCam = stateNow.exportCameraCropOnly && proj.camera3D.isEnabled
+                val outW = if (cropToCam) proj.camera3D.captureWidth else proj.resolution.width
+                val outH = if (cropToCam) proj.camera3D.captureHeight else proj.resolution.height
                 val pngBytes = withContext(KodanimaDispatchers.backgroundRender) {
                     var bmp: Bitmap? = null
                     try {
-                        bmp = KodanimaGraphicsEngine.renderFrameToBitmap(
-                            curr,
-                            proj.resolution.width,
-                            proj.resolution.height,
-                            android.graphics.Color.WHITE
-                        )
+                        bmp = renderExportFrameBitmap(proj, curr, frameIdx, outW, outH, cropToCam)
                         val out = ByteArrayOutputStream()
                         bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
                         out.toByteArray()
@@ -4433,8 +5069,13 @@ class KodanimaViewModel : ViewModel() {
         viewModelScope.launch {
             _uiState.update { it.copy(exportState = ExportState.Progress("Iniciando codificador nativo H.264...", 0.05f)) }
             try {
-                val proj = _uiState.value.project
-                val file = com.example.engine.AndroidVideoRenderer.renderToMp4(context, proj) { progress, message ->
+                val stateNow = _uiState.value
+                val proj = stateNow.project
+                val file = com.example.engine.AndroidVideoRenderer.renderToMp4(
+                    context = context,
+                    project = proj,
+                    cropToCamera = stateNow.exportCameraCropOnly
+                ) { progress, message ->
                     _uiState.update { it.copy(exportState = ExportState.Progress(message, progress)) }
                 }
                 val filename = file.name
@@ -4453,8 +5094,13 @@ class KodanimaViewModel : ViewModel() {
         viewModelScope.launch {
             _uiState.update { it.copy(exportState = ExportState.Progress("Gerando pacote de quadros PNG...", 0.05f)) }
             try {
-                val proj = _uiState.value.project
-                val file = com.example.engine.AndroidVideoRenderer.exportFramePackZip(context, proj) { progress, message ->
+                val stateNow = _uiState.value
+                val proj = stateNow.project
+                val file = com.example.engine.AndroidVideoRenderer.exportFramePackZip(
+                    context = context,
+                    project = proj,
+                    cropToCamera = stateNow.exportCameraCropOnly
+                ) { progress, message ->
                     _uiState.update { it.copy(exportState = ExportState.Progress(message, progress)) }
                 }
                 val filename = file.name
@@ -4615,42 +5261,69 @@ class KodanimaViewModel : ViewModel() {
     fun deleteLayer(index: Int) = deleteActiveLayer()
 
     fun moveLayerUp(layerIndex: Int) {
+        // layers[0] renders at the bottom (background) and layers.lastIndex renders on top (foreground).
+        // Moving "up" visually shifts the layer toward foreground (layerIndex + 1).
         val currLayers = _uiState.value.project.frames.firstOrNull()?.layers ?: emptyList()
-        if (layerIndex <= 0 || layerIndex >= currLayers.size) return
+        if (layerIndex !in 0 until (currLayers.size - 1)) return
+        val targetIdx = layerIndex + 1
         pushCurrentFrameToUndo()
         _uiState.update { state ->
             val updatedFrames = state.project.frames.map { frame ->
-                if (layerIndex in frame.layers.indices) {
+                if (layerIndex in frame.layers.indices && targetIdx in frame.layers.indices) {
                     val list = frame.layers.toMutableList()
                     val item = list.removeAt(layerIndex)
-                    list.add(layerIndex - 1, item)
+                    list.add(targetIdx, item)
                     frame.copy(layers = list)
                 } else frame
             }
+            val nextActive = when (state.activeLayerIndex) {
+                layerIndex -> targetIdx
+                targetIdx -> layerIndex
+                else -> state.activeLayerIndex
+            }
+            val updatedProj = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
             state.copy(
-                project = state.project.copy(frames = updatedFrames),
-                activeLayerIndex = layerIndex - 1
+                project = updatedProj,
+                activeLayerIndex = nextActive
             )
+        }
+        updateUndoRedoAvailability()
+        if (_uiState.value.multiplayerRole != com.example.model.MultiplayerRole.NONE) {
+            multiplayerEngine.sendMoveLayer(layerIndex, targetIdx)
         }
     }
 
     fun moveLayerDown(layerIndex: Int) {
+        // Moving "down" visually shifts the layer toward background (layerIndex - 1).
         val currLayers = _uiState.value.project.frames.firstOrNull()?.layers ?: emptyList()
-        if (layerIndex < 0 || layerIndex >= currLayers.size - 1) return
+        if (layerIndex <= 0 || layerIndex >= currLayers.size) return
+        val targetIdx = layerIndex - 1
         pushCurrentFrameToUndo()
         _uiState.update { state ->
             val updatedFrames = state.project.frames.map { frame ->
-                if (layerIndex in frame.layers.indices) {
+                if (layerIndex in frame.layers.indices && targetIdx in frame.layers.indices) {
                     val list = frame.layers.toMutableList()
                     val item = list.removeAt(layerIndex)
-                    list.add(layerIndex + 1, item)
+                    list.add(targetIdx, item)
                     frame.copy(layers = list)
                 } else frame
             }
+            val nextActive = when (state.activeLayerIndex) {
+                layerIndex -> targetIdx
+                targetIdx -> layerIndex
+                else -> state.activeLayerIndex
+            }
+            val updatedProj = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
             state.copy(
-                project = state.project.copy(frames = updatedFrames),
-                activeLayerIndex = layerIndex + 1
+                project = updatedProj,
+                activeLayerIndex = nextActive
             )
+        }
+        updateUndoRedoAvailability()
+        if (_uiState.value.multiplayerRole != com.example.model.MultiplayerRole.NONE) {
+            multiplayerEngine.sendMoveLayer(layerIndex, targetIdx)
         }
     }
 
@@ -4911,5 +5584,695 @@ class KodanimaViewModel : ViewModel() {
 
     fun dismissExportState() {
         _uiState.update { it.copy(exportState = ExportState.Idle) }
+    }
+
+    // --- Color Palette Tray ("Palheta de cor") & Quick Floating Palette ---
+
+    fun openPaletteTray() {
+        _uiState.update { it.copy(isPaletteTrayOpen = true, pendingReturnToPaletteTray = false) }
+    }
+
+    fun closePaletteTray() {
+        _uiState.update { it.copy(isPaletteTrayOpen = false) }
+    }
+
+    fun toggleQuickPalette() {
+        _uiState.update { it.copy(isQuickPaletteOpen = !it.isQuickPaletteOpen) }
+    }
+
+    fun closeQuickPalette() {
+        _uiState.update { it.copy(isQuickPaletteOpen = false) }
+    }
+
+    fun toggleQuickPaletteLock() {
+        _uiState.update { it.copy(isQuickPaletteLocked = !it.isQuickPaletteLocked) }
+    }
+
+    fun openColorWheelFromPaletteTray() {
+        _uiState.update {
+            it.copy(
+                isPaletteTrayOpen = false,
+                pendingReturnToPaletteTray = true,
+                activeDialog = EditorDialog.COLOR_PICKER
+            )
+        }
+    }
+
+    fun startEyedropperFromPaletteTray() {
+        _uiState.update { state ->
+            state.copy(
+                toolBeforeEyedropper = if (state.selectedTool == ToolType.EYEDROPPER) ToolType.PEN else state.selectedTool,
+                isPaletteTrayOpen = false,
+                pendingReturnToPaletteTray = true,
+                selectedTool = ToolType.EYEDROPPER,
+                statusMessage = "Toque no canvas para capturar a cor e voltar à palheta"
+            )
+        }
+    }
+
+    fun completeEyedropperColorPick(pickedColor: Long) {
+        _uiState.update { state ->
+            val updatedRecents = if (!state.recentColors.contains(pickedColor)) {
+                listOf(pickedColor) + state.recentColors.take(7)
+            } else state.recentColors
+            val returnToPalette = state.pendingReturnToPaletteTray
+            state.copy(
+                currentColor = pickedColor,
+                recentColors = updatedRecents,
+                pendingReturnToPaletteTray = false,
+                isPaletteTrayOpen = if (returnToPalette) true else state.isPaletteTrayOpen,
+                selectedTool = if (returnToPalette) state.toolBeforeEyedropper else state.selectedTool
+            )
+        }
+    }
+
+    fun selectPaletteSlot(index: Int) {
+        val cfg = _uiState.value.preferences.colorPalette
+        val maxSlots = cfg.maxSlots
+        val clamped = index.coerceIn(0, (maxSlots - 1).coerceAtLeast(0))
+        val slotColor = cfg.swatches.getOrNull(clamped)
+        _uiState.update { state ->
+            state.copy(
+                selectedPaletteSlotIndex = clamped,
+                currentColor = if (slotColor != null && slotColor != 0L) slotColor else state.currentColor
+            )
+        }
+    }
+
+    fun saveCurrentColorToPaletteSlot(slotIndex: Int = _uiState.value.selectedPaletteSlotIndex) {
+        val colorToSave = _uiState.value.currentColor
+        val cfg = _uiState.value.preferences.colorPalette
+        val maxSlots = cfg.maxSlots
+        val clamped = slotIndex.coerceIn(0, (maxSlots - 1).coerceAtLeast(0))
+        val mutable = MutableList(maxSlots) { i -> cfg.swatches.getOrElse(i) { 0L } }
+        mutable[clamped] = colorToSave
+        updatePreferences { prefs ->
+            prefs.copy(colorPalette = prefs.colorPalette.copy(swatches = mutable))
+        }
+        _uiState.update {
+            it.copy(
+                selectedPaletteSlotIndex = clamped,
+                statusMessage = "Cor salva na palheta (espaço ${clamped + 1})!"
+            )
+        }
+    }
+
+    fun removePaletteSlot(slotIndex: Int = _uiState.value.selectedPaletteSlotIndex) {
+        val cfg = _uiState.value.preferences.colorPalette
+        val maxSlots = cfg.maxSlots
+        val clamped = slotIndex.coerceIn(0, (maxSlots - 1).coerceAtLeast(0))
+        val mutable = MutableList(maxSlots) { i -> cfg.swatches.getOrElse(i) { 0L } }
+        mutable[clamped] = 0L
+        updatePreferences { prefs ->
+            prefs.copy(colorPalette = prefs.colorPalette.copy(swatches = mutable))
+        }
+        _uiState.update {
+            it.copy(
+                selectedPaletteSlotIndex = clamped,
+                statusMessage = "Cor removida da palheta."
+            )
+        }
+    }
+
+    fun setPaletteGridSize(cols: Int, rows: Int) {
+        val c = cols.coerceIn(2, 12)
+        val r = rows.coerceIn(1, 8)
+        val total = c * r
+        updatePreferences { prefs ->
+            val oldSwatches = prefs.colorPalette.swatches
+            val resized = List(total) { i -> oldSwatches.getOrElse(i) { 0L } }
+            prefs.copy(colorPalette = ColorPaletteConfig(cols = c, rows = r, swatches = resized))
+        }
+        _uiState.update { state ->
+            state.copy(selectedPaletteSlotIndex = state.selectedPaletteSlotIndex.coerceIn(0, (total - 1).coerceAtLeast(0)))
+        }
+    }
+
+    fun generateColorTheoryPaletteRow(): String {
+        val cfg = _uiState.value.preferences.colorPalette
+        val cols = cfg.cols.coerceIn(2, 12)
+        val rows = cfg.rows.coerceIn(1, 8)
+        val total = cols * rows
+        val activeSlot = _uiState.value.selectedPaletteSlotIndex.coerceIn(0, total - 1)
+        val targetRow = (activeSlot / cols).coerceIn(0, rows - 1)
+
+        val baseColorInt = _uiState.value.currentColor.toInt()
+        val hsv = FloatArray(3)
+        android.graphics.Color.colorToHSV(baseColorInt, hsv)
+        val baseHue = if (hsv[1] < 0.08f) ((0..359).random()).toFloat() else hsv[0]
+        val baseSat = if (hsv[1] < 0.15f) 0.78f else hsv[1].coerceIn(0.35f, 0.98f)
+        val baseVal = if (hsv[2] < 0.25f) 0.88f else hsv[2].coerceIn(0.42f, 0.98f)
+
+        val rules = listOf(
+            "Complementar",
+            "Análoga",
+            "Tríade",
+            "Complementar Dividida",
+            "Tetrádica",
+            "Monocromática"
+        )
+        val chosenRule = rules.random()
+        val rowColors = List(cols) { colIdx ->
+            val frac = if (cols <= 1) 0f else colIdx.toFloat() / (cols - 1).toFloat()
+            var h = baseHue
+            var s = baseSat
+            var v = baseVal
+            when (chosenRule) {
+                "Complementar" -> {
+                    val isComp = colIdx >= cols / 2
+                    h = if (isComp) (baseHue + 180f) % 360f else baseHue
+                    val halfPos = if (isComp) colIdx - cols / 2 else colIdx
+                    val halfSpan = max(1, (cols / 2) - 1).toFloat()
+                    val t = (halfPos / halfSpan).coerceIn(0f, 1f)
+                    v = (0.48f + 0.48f * t).coerceIn(0.25f, 1f)
+                    s = (baseSat * (1.05f - 0.30f * t)).coerceIn(0.25f, 1f)
+                }
+                "Análoga" -> {
+                    h = (baseHue + (frac - 0.5f) * 68f + 360f) % 360f
+                    s = (baseSat * (0.85f + 0.15f * kotlin.math.sin(frac * Math.PI).toFloat())).coerceIn(0.3f, 1f)
+                    v = (0.62f + 0.34f * frac).coerceIn(0.3f, 1f)
+                }
+                "Tríade" -> {
+                    val group = (colIdx * 3) / cols
+                    h = (baseHue + group * 120f) % 360f
+                    v = if (colIdx % 2 == 0) baseVal else (baseVal * 0.72f).coerceIn(0.35f, 0.98f)
+                }
+                "Complementar Dividida" -> {
+                    val offsets = floatArrayOf(0f, 150f, 210f)
+                    h = (baseHue + offsets[colIdx % 3]) % 360f
+                    s = (baseSat * (0.75f + 0.25f * frac)).coerceIn(0.3f, 1f)
+                }
+                "Tetrádica" -> {
+                    val offsets = floatArrayOf(0f, 90f, 180f, 270f)
+                    h = (baseHue + offsets[colIdx % 4]) % 360f
+                    v = (0.58f + 0.38f * ((colIdx / 4f).coerceIn(0f, 1f))).coerceIn(0.35f, 1f)
+                }
+                else -> { // Monocromática
+                    h = baseHue
+                    s = (baseSat * (1.0f - 0.55f * frac)).coerceIn(0.15f, 1f)
+                    v = (0.34f + 0.64f * frac).coerceIn(0.25f, 1f)
+                }
+            }
+            val rgb = android.graphics.Color.HSVToColor(floatArrayOf(h, s, v))
+            rgb.toLong() and 0xFFFFFFFFL or 0xFF000000L
+        }
+
+        val mutable = MutableList(total) { i -> cfg.swatches.getOrElse(i) { 0L } }
+        val rowStart = targetRow * cols
+        for (c in 0 until cols) {
+            mutable[rowStart + c] = rowColors[c]
+        }
+        updatePreferences { prefs ->
+            prefs.copy(colorPalette = prefs.colorPalette.copy(swatches = mutable))
+        }
+        _uiState.update {
+            it.copy(
+                currentColor = rowColors[0],
+                selectedPaletteSlotIndex = rowStart,
+                statusMessage = "Palheta $chosenRule gerada na linha ${targetRow + 1}!"
+            )
+        }
+        return chosenRule
+    }
+
+    // --- 3D Camera Timeline, Automatic Keyframes, Pasta Animada & After Effects Post-Effects ---
+
+    fun toggleCameraTimeline() {
+        _uiState.update { state ->
+            val opening = !state.isCameraTimelineOpen
+            state.copy(
+                isCameraTimelineOpen = opening,
+                isCameraSideView3D = if (opening) state.isCameraSideView3D else false
+            )
+        }
+    }
+
+    fun closeCameraTimeline() {
+        _uiState.update { it.copy(isCameraTimelineOpen = false, isCameraSideView3D = false) }
+    }
+
+    fun toggleCameraEnabled() {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val nextEnabled = !cam.isEnabled
+            val ensureKfs = if (cam.keyframes.isEmpty()) {
+                listOf(Camera3DKeyframe(frameIndex = 0, depthSeparation = cam.layerDepthSpacing))
+            } else cam.keyframes
+            val updatedCam = cam.copy(isEnabled = nextEnabled, keyframes = ensureKfs)
+            state.copy(
+                project = state.project.copy(camera3D = updatedCam, updatedAt = System.currentTimeMillis()),
+                statusMessage = if (nextEnabled) "Câmera 3D ativada na animação!" else "Câmera 3D desativada."
+            )
+        }
+    }
+
+    fun toggleCameraSideView3D() {
+        _uiState.update { state ->
+            val next = !state.isCameraSideView3D
+            state.copy(
+                isCameraSideView3D = next,
+                statusMessage = if (next) "Visão 3D lateral (eixo Z das camadas) ativada!" else "Visão frontal do canvas restaurada."
+            )
+        }
+    }
+
+    fun toggleCameraAutoInterpolate() {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val nextAuto = !cam.autoInterpolate
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(autoInterpolate = nextAuto),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = if (nextAuto) "Interpolação automática entre keyframes ativada." else "Modo degrau manual ativado."
+            )
+        }
+    }
+
+    fun toggleCameraShowCaptureFrame() {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(showCaptureFrame = !cam.showCaptureFrame),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun setCameraToolAction(action: CameraToolAction) {
+        _uiState.update { it.copy(cameraToolAction = action) }
+    }
+
+    fun updateCanvasBackground(bg: CanvasBackgroundSettings) {
+        _uiState.update { state ->
+            state.copy(
+                project = state.project.copy(
+                    canvasBackground = bg,
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun updateCameraAtCurrentFrame(transform: (Camera3DKeyframe) -> Camera3DKeyframe) {
+        _uiState.update { state ->
+            val frameIdx = state.currentFrameIndex
+            val cam = state.project.camera3D
+            val baseKf = Camera3DEngine.evaluateCameraAtFrame(cam, frameIdx).copy(frameIndex = frameIdx)
+            val editedKf = transform(baseKf).let {
+                it.copy(
+                    frameIndex = frameIdx,
+                    zoom = it.zoom.coerceIn(0.25f, 6.0f),
+                    pitchX = it.pitchX.coerceIn(-45f, 45f),
+                    yawY = it.yawY.coerceIn(-45f, 45f),
+                    rotationZ = it.rotationZ.coerceIn(-180f, 180f),
+                    depthSeparation = it.depthSeparation.coerceIn(0f, 140f),
+                    fovDegrees = it.fovDegrees.coerceIn(18f, 120f)
+                )
+            }
+            val updatedList = (cam.keyframes.filterNot { it.frameIndex == frameIdx } + editedKf)
+                .sortedBy { it.frameIndex }
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(isEnabled = true, keyframes = updatedList),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun addOrUpdateCameraKeyframeAtCurrentFrame(easing: CameraEasingCurve? = null) {
+        updateCameraAtCurrentFrame { kf ->
+            if (easing != null) kf.copy(easing = easing) else kf
+        }
+        val frameNum = _uiState.value.currentFrameIndex + 1
+        _uiState.update { it.copy(statusMessage = "Keyframe de câmera salvo no quadro $frameNum!") }
+    }
+
+    fun setCameraFov(fovDegrees: Float) {
+        updateCameraAtCurrentFrame { it.copy(fovDegrees = fovDegrees.coerceIn(18f, 120f)) }
+    }
+
+    fun adjustCameraFov(deltaDegrees: Float) {
+        updateCameraAtCurrentFrame { it.copy(fovDegrees = (it.fovDegrees + deltaDegrees).coerceIn(18f, 120f)) }
+    }
+
+    fun nudgeCameraPan(dx: Float, dy: Float) {
+        updateCameraAtCurrentFrame { it.copy(x = it.x + dx, y = it.y + dy) }
+    }
+
+    fun zoomCameraBy(factor: Float) {
+        updateCameraAtCurrentFrame { it.copy(zoom = (it.zoom * factor).coerceIn(0.25f, 6.0f)) }
+    }
+
+    fun rotateCameraBy(deltaDeg: Float) {
+        updateCameraAtCurrentFrame {
+            var nextRot = it.rotationZ + deltaDeg
+            while (nextRot > 180f) nextRot -= 360f
+            while (nextRot < -180f) nextRot += 360f
+            it.copy(rotationZ = nextRot)
+        }
+    }
+
+    fun tiltOrbitCameraBy(dYaw: Float, dPitch: Float) {
+        updateCameraAtCurrentFrame {
+            it.copy(
+                yawY = (it.yawY + dYaw).coerceIn(-45f, 45f),
+                pitchX = (it.pitchX + dPitch).coerceIn(-45f, 45f)
+            )
+        }
+    }
+
+    fun resetCameraAtCurrentFrame() {
+        updateCameraAtCurrentFrame { kf ->
+            kf.copy(
+                x = 0f,
+                y = 0f,
+                zoom = 1.0f,
+                rotationZ = 0f,
+                pitchX = 0f,
+                yawY = 0f,
+                fovDegrees = 50f
+            )
+        }
+        _uiState.update { it.copy(statusMessage = "Câmera zerada neste quadro.") }
+    }
+
+    fun connectTwoCameraKeyframes() {
+        _uiState.update { state ->
+            val proj = state.project
+            val total = proj.frames.size
+            if (total < 2) {
+                return@update state.copy(statusMessage = "Adicione pelo menos 2 quadros na linha do tempo para interpolar!")
+            }
+            val cam = proj.camera3D
+            val cur = state.currentFrameIndex.coerceIn(0, total - 1)
+            val sorted = cam.keyframes.sortedBy { it.frameIndex }.toMutableList()
+            if (sorted.isEmpty()) {
+                sorted.add(Camera3DKeyframe(frameIndex = 0, depthSeparation = cam.layerDepthSpacing))
+            }
+            if (sorted.none { it.frameIndex == cur }) {
+                val evalCur = Camera3DEngine.evaluateCameraAtFrame(cam, cur).copy(frameIndex = cur)
+                sorted.add(evalCur)
+            }
+            if (sorted.size < 2) {
+                val targetEnd = if (cur == 0) total - 1 else 0
+                val baseFirst = sorted.first()
+                sorted.add(
+                    baseFirst.copy(
+                        frameIndex = targetEnd,
+                        zoom = if (targetEnd > baseFirst.frameIndex) (baseFirst.zoom * 1.25f).coerceAtMost(4f) else 1.0f
+                    )
+                )
+            }
+            val finalKfs = sorted.distinctBy { it.frameIndex }.sortedBy { it.frameIndex }
+            state.copy(
+                project = proj.copy(
+                    camera3D = cam.copy(
+                        isEnabled = true,
+                        autoInterpolate = true,
+                        keyframes = finalKfs
+                    ),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "${finalKfs.size} keyframes conectados com interpolação automática!"
+            )
+        }
+    }
+
+    fun jumpToPrevCameraKeyframe() {
+        val state = _uiState.value
+        val cur = state.currentFrameIndex
+        val prev = state.project.camera3D.keyframes.map { it.frameIndex }.filter { it < cur }.maxOrNull()
+        if (prev != null) goToFrame(prev)
+    }
+
+    fun jumpToNextCameraKeyframe() {
+        val state = _uiState.value
+        val cur = state.currentFrameIndex
+        val next = state.project.camera3D.keyframes.map { it.frameIndex }.filter { it > cur }.minOrNull()
+        if (next != null) goToFrame(next)
+    }
+
+    fun deleteCameraKeyframeAt(frameIndex: Int) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val remaining = cam.keyframes.filterNot { it.frameIndex == frameIndex }
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(keyframes = remaining),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Keyframe removido do quadro ${frameIndex + 1}."
+            )
+        }
+    }
+
+    fun applyCameraBuiltInEffect(effect: CameraBuiltInEffect) {
+        _uiState.update { state ->
+            val proj = state.project
+            val cam = proj.camera3D
+            val generated = Camera3DEngine.buildBuiltInEffectKeyframes(
+                effect = effect,
+                totalFrames = proj.frames.size,
+                projectWidth = proj.resolution.width,
+                projectHeight = proj.resolution.height,
+                depthSpacing = cam.layerDepthSpacing
+            )
+            state.copy(
+                project = proj.copy(
+                    camera3D = cam.copy(
+                        isEnabled = true,
+                        autoInterpolate = true,
+                        keyframes = generated
+                    ),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Efeito de câmera '${effect.labelPt}' aplicado!"
+            )
+        }
+    }
+
+    fun setCameraResolution(width: Int, height: Int) {
+        val safeW = width.coerceIn(160, 3840)
+        val safeH = height.coerceIn(160, 3840)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(captureWidth = safeW, captureHeight = safeH),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Resolução da câmera definida para ${safeW}×${safeH}."
+            )
+        }
+    }
+
+    fun setCameraLayerDepthSpacing(spacing: Float) {
+        val clamped = spacing.coerceIn(0f, 140f)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(
+                        layerDepthSpacing = clamped,
+                        keyframes = cam.keyframes.map { it.copy(depthSeparation = clamped) }
+                    ),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun updateCameraPostEffects(effects: CameraPostEffectSettings) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(postEffects = effects),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun resetCameraPostEffects() {
+        updateCameraPostEffects(CameraPostEffectSettings())
+        _uiState.update { it.copy(statusMessage = "Pós-efeitos de câmera zerados.") }
+    }
+
+    fun resetCameraKeyframesToDefault() {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(keyframes = listOf(Camera3DKeyframe(frameIndex = 0, depthSeparation = cam.layerDepthSpacing))),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Movimento da câmera redefinido."
+            )
+        }
+    }
+
+    fun saveCameraTemplateToFolder(templateName: String) {
+        val state = _uiState.value
+        val cam = state.project.camera3D
+        val cleanName = templateName.trim().ifBlank {
+            "Câmera ${state.preferences.savedCameraTemplates.size + 1}"
+        }
+        val tpl = CameraPresetTemplate(
+            name = cleanName,
+            keyframes = cam.keyframes.ifEmpty { listOf(Camera3DKeyframe(frameIndex = 0)) },
+            postEffects = cam.postEffects,
+            captureWidth = cam.captureWidth,
+            captureHeight = cam.captureHeight
+        )
+        updatePreferences { prefs ->
+            prefs.copy(savedCameraTemplates = listOf(tpl) + prefs.savedCameraTemplates)
+        }
+        _uiState.update {
+            it.copy(statusMessage = "Configuração '$cleanName' salva na Pasta Animada!")
+        }
+    }
+
+    fun applyCameraTemplateFromFolder(template: CameraPresetTemplate) {
+        _uiState.update { state ->
+            val proj = state.project
+            val maxIdx = (proj.frames.size - 1).coerceAtLeast(0)
+            val remappedKfs = if (template.keyframes.isEmpty()) {
+                listOf(Camera3DKeyframe(frameIndex = 0))
+            } else {
+                template.keyframes.map { kf ->
+                    kf.copy(frameIndex = kf.frameIndex.coerceIn(0, maxIdx))
+                }.distinctBy { it.frameIndex }.sortedBy { it.frameIndex }
+            }
+            val updatedCam = proj.camera3D.copy(
+                isEnabled = true,
+                autoInterpolate = true,
+                captureWidth = template.captureWidth,
+                captureHeight = template.captureHeight,
+                keyframes = remappedKfs,
+                postEffects = template.postEffects
+            )
+            state.copy(
+                project = proj.copy(camera3D = updatedCam, updatedAt = System.currentTimeMillis()),
+                statusMessage = "Pasta '${template.name}' aplicada à animação!"
+            )
+        }
+    }
+
+    fun setCameraMode(mode: CameraMode) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val nextSide3D = if (mode == CameraMode.MODE_2D) false else state.isCameraSideView3D
+            state.copy(
+                isCameraSideView3D = nextSide3D,
+                project = state.project.copy(
+                    camera3D = cam.copy(cameraMode = mode, isEnabled = true),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Modo de Câmera: ${mode.labelPt}"
+            )
+        }
+    }
+
+    fun updateKeyframeBezierHandles(
+        frameIndex: Int,
+        p1x: Float,
+        p1y: Float,
+        p2x: Float,
+        p2y: Float
+    ) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val baseKf = cam.keyframes.firstOrNull { it.frameIndex == frameIndex }
+                ?: Camera3DEngine.evaluateCameraAtFrame(cam, frameIndex).copy(frameIndex = frameIndex)
+            val updatedKf = baseKf.copy(
+                easing = CameraEasingCurve.BEZIER_GRAFICO,
+                bezierP1X = p1x.coerceIn(0.01f, 0.99f),
+                bezierP1Y = p1y.coerceIn(-0.4f, 1.4f),
+                bezierP2X = p2x.coerceIn(0.01f, 0.99f),
+                bezierP2Y = p2y.coerceIn(-0.4f, 1.4f)
+            )
+            val nextKfs = (cam.keyframes.filterNot { it.frameIndex == frameIndex } + updatedKf)
+                .sortedBy { it.frameIndex }
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(isEnabled = true, autoInterpolate = true, keyframes = nextKfs),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun applyCameraEffectInRange(
+        effect: CameraBuiltInEffect,
+        startFrame: Int,
+        endFrame: Int,
+        intensity: Float = 1.0f
+    ) {
+        _uiState.update { state ->
+            val proj = state.project
+            val maxIdx = (proj.frames.size - 1).coerceAtLeast(1)
+            val sF = min(startFrame, endFrame).coerceIn(0, maxIdx)
+            val eF = max(startFrame, endFrame).coerceIn(0, maxIdx).let {
+                if (it <= sF) (sF + 1).coerceAtMost(maxIdx) else it
+            }
+            val cam = proj.camera3D
+            val span = CameraEffectSpan(
+                effect = effect,
+                startFrame = sF,
+                endFrame = eF,
+                intensity = intensity.coerceIn(0.2f, 2.5f)
+            )
+            val cleaned = cam.effectSpans.filterNot {
+                it.startFrame == span.startFrame && it.endFrame == span.endFrame && it.effect == span.effect
+            } + span
+            // Ensure anchor keyframes exist around the span so Dope Sheet marks them visibly
+            val existingFrames = cam.keyframes.map { it.frameIndex }.toSet()
+            val extraAnchors = mutableListOf<Camera3DKeyframe>()
+            if (sF !in existingFrames) {
+                extraAnchors.add(Camera3DEngine.evaluateCameraAtFrame(cam, sF).copy(frameIndex = sF))
+            }
+            if (eF !in existingFrames && eF != sF) {
+                extraAnchors.add(Camera3DEngine.evaluateCameraAtFrame(cam, eF).copy(frameIndex = eF))
+            }
+            val nextKfs = (cam.keyframes + extraAnchors).distinctBy { it.frameIndex }.sortedBy { it.frameIndex }
+            state.copy(
+                project = proj.copy(
+                    camera3D = cam.copy(
+                        isEnabled = true,
+                        autoInterpolate = true,
+                        keyframes = nextKfs,
+                        effectSpans = cleaned
+                    ),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Efeito '${effect.labelPt}' aplicado dos quadros ${sF + 1} até ${eF + 1}!"
+            )
+        }
+    }
+
+    fun removeCameraEffectSpan(spanId: String) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(effectSpans = cam.effectSpans.filterNot { it.id == spanId }),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Efeito de câmera removido do intervalo."
+            )
+        }
+    }
+
+    fun deleteCameraTemplate(templateId: String) {
+        updatePreferences { prefs ->
+            prefs.copy(savedCameraTemplates = prefs.savedCameraTemplates.filterNot { it.id == templateId })
+        }
+        _uiState.update { it.copy(statusMessage = "Predefinição removida da Pasta Animada.") }
     }
 }

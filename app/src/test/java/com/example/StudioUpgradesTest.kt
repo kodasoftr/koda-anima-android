@@ -4,23 +4,45 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
+import com.example.engine.Camera3DEngine
 import com.example.engine.FileImportExportManager
 import com.example.engine.KodanimaGraphicsEngine
 import com.example.engine.KritaBrushImporter
 import com.example.engine.PreferencesStorageManager
+import com.example.model.BucketFillConfig
+import com.example.model.BucketReferenceMode
 import com.example.model.BrushDynamicParams
 import com.example.model.BrushPreset
+import com.example.model.Camera3DKeyframe
+import com.example.model.Camera3DSettings
+import com.example.model.CameraBuiltInEffect
+import com.example.model.CameraEasingCurve
+import com.example.model.CameraEffectSpan
+import com.example.model.CameraMode
+import com.example.model.CameraPostEffectSettings
+import com.example.model.CameraToolAction
+import com.example.model.CanvasBackgroundSettings
+import com.example.model.CanvasBackgroundStyle
+import com.example.model.CanvasTexturePattern
+import com.example.model.ColorPaletteConfig
 import com.example.model.DrawingStroke
+import com.example.viewmodel.EditorDialog
+import com.example.model.Frame
 import com.example.model.GestureAction
 import com.example.model.GridRulerSettings
 import com.example.model.KritaBrushEngineKind
+import com.example.model.Layer
 import com.example.model.LayerBlendEffect
 import com.example.model.MultiFingerGesture
 import com.example.model.PerspectiveRulerSettings
 import com.example.model.ProjectResolution
+import com.example.model.ShortcutAction
+import com.example.model.ShortcutRegistry
+import com.example.model.SkyBackdropMode
 import com.example.model.StrokePoint
 import com.example.model.ToolType
 import com.example.model.TouchGestureRegistry
+import com.example.ui.components.computeStage3DZPositions
 import com.example.viewmodel.KodanimaViewModel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -108,7 +130,7 @@ class StudioUpgradesTest {
         assertEquals("G-Pen & Nanquim", parsed.namePt)
         assertEquals(KritaBrushEngineKind.INK_GPEN, parsed.engineKind)
         assertEquals(0.06f, parsed.dynamicParams.spacing, 0.01f)
-        assertTrue("Diameter from MaskGenerator radius=15*2*0.65 (~19.5) should reflect parsed size", parsed.defaultSize in 15f..25f)
+        assertTrue("Diameter from MaskGenerator radius=15*2 (~30px) should reflect parsed size", parsed.defaultSize in 25f..35f)
 
         // JSON serialization roundtrip for LAN BRUSH_DEF transfer
         val json = KritaBrushImporter.brushPresetToJson(parsed)
@@ -815,6 +837,628 @@ class StudioUpgradesTest {
             0.01f
         )
     }
+
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Test
+    fun `inverted selection clips strokes outside polygon, live drawing keeps selection active, and independent eraser size & layer reorder work`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("SelecaoInvertida", ProjectResolution.PRESETS[0], 24)
+
+        // Independent brush vs eraser sizes
+        vm.setBrushSize(18f)
+        vm.setEraserSize(42f)
+        assertEquals(18f, vm.uiState.value.brushSize, 0.01f)
+        assertEquals(42f, vm.uiState.value.eraserSize, 0.01f)
+
+        // Layer reordering: add top layer then move down / up
+        vm.addLayer()
+        val initialTopName = vm.uiState.value.project.frames[0].layers.last().name
+        vm.moveLayerDown(1)
+        assertEquals(initialTopName, vm.uiState.value.project.frames[0].layers[0].name)
+        vm.moveLayerUp(0)
+        assertEquals(initialTopName, vm.uiState.value.project.frames[0].layers[1].name)
+        vm.setActiveLayer(0)
+
+        // Lasso polygon centered at (100,100)..(200,200)
+        val poly = listOf(
+            StrokePoint(100f, 100f, 1f),
+            StrokePoint(200f, 100f, 1f),
+            StrokePoint(200f, 200f, 1f),
+            StrokePoint(100f, 200f, 1f)
+        )
+        vm.setLassoSelection(poly)
+        assertTrue(vm.uiState.value.activeSelection.isActive)
+        assertFalse(vm.uiState.value.activeSelection.isInverted)
+
+        // Normal (non-inverted) selection stamps clipPolygon with clipInverted=false and keeps activeSelection active
+        vm.addStrokeToCurrentLayer(
+            DrawingStroke(
+                tool = ToolType.LINE,
+                color = 0xFFFF0000L,
+                brushSize = 20f,
+                opacity = 1f,
+                points = listOf(
+                    StrokePoint(50f, 150f, 1f),  // outside
+                    StrokePoint(180f, 150f, 1f)  // crosses into inside
+                )
+            )
+        )
+        assertTrue("Selection must stay active while drawing inside it", vm.uiState.value.activeSelection.isActive)
+        val normalStrokes = vm.uiState.value.project.frames[0].layers[0].strokes
+        assertTrue("Clipped stroke must exist on layer", normalStrokes.isNotEmpty())
+        assertNotNull("Stroke must carry selection clipPolygon", normalStrokes.last().clipPolygon)
+        assertFalse("Normal selection must set clipInverted=false", normalStrokes.last().clipInverted)
+
+        val normalBmp = KodanimaGraphicsEngine.renderFrameToBitmap(
+            frame = vm.uiState.value.project.frames[0],
+            width = 300,
+            height = 300,
+            backgroundColor = android.graphics.Color.TRANSPARENT
+        )
+        assertEquals(
+            "Normal selection must block paint outside polygon (50,150)",
+            0,
+            (normalBmp.getPixel(50, 150) ushr 24) and 0xFF
+        )
+        assertTrue(
+            "Normal selection must allow paint inside polygon (150,150)",
+            ((normalBmp.getPixel(150, 150) ushr 24) and 0xFF) > 200
+        )
+        normalBmp.recycle()
+
+        // Invert selection -> now inside (150,150) is protected and outside (50,150) is editable
+        vm.invertSelection()
+        assertTrue(vm.uiState.value.activeSelection.isInverted)
+        vm.addStrokeToCurrentLayer(
+            DrawingStroke(
+                tool = ToolType.LINE,
+                color = 0xFF00FF00L,
+                brushSize = 20f,
+                opacity = 1f,
+                points = listOf(
+                    StrokePoint(50f, 150f, 1f),  // outside -> allowed!
+                    StrokePoint(180f, 150f, 1f)  // inside -> blocked!
+                )
+            )
+        )
+        assertTrue("Inverted selection must remain active after stroke", vm.uiState.value.activeSelection.isActive)
+        val afterInvertedStrokes = vm.uiState.value.project.frames[0].layers[0].strokes
+        val greenStroke = afterInvertedStrokes.lastOrNull { it.color == 0xFF00FF00L }
+        assertNotNull("Inverted selection must commit outside portion of stroke", greenStroke)
+        assertTrue("Inverted stroke must set clipInverted=true", greenStroke!!.clipInverted)
+
+        val invertedBmp = KodanimaGraphicsEngine.renderFrameToBitmap(
+            frame = vm.uiState.value.project.frames[0],
+            width = 300,
+            height = 300,
+            backgroundColor = android.graphics.Color.TRANSPARENT
+        )
+        val outPixel = invertedBmp.getPixel(50, 150)
+        val inPixel = invertedBmp.getPixel(150, 150)
+        assertTrue(
+            "Inverted selection must paint green outside polygon (50,150)",
+            android.graphics.Color.green(outPixel) > 200 && android.graphics.Color.red(outPixel) < 50
+        )
+        assertTrue(
+            "Inverted selection must protect red interior (150,150) from green stroke",
+            android.graphics.Color.red(inPixel) > 200 && android.graphics.Color.green(inPixel) < 50
+        )
+        invertedBmp.recycle()
+    }
+
+    @Test
+    fun `color palette tray grid config, theory dice, instant color wheel & grid ruler behind-layer flag work`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+
+        // Instant color preview without polluting recents until dismiss
+        val recentsBefore = vm.uiState.value.recentColors.size
+        vm.setColor(0xFF123456L, recordToRecents = false)
+        assertEquals(0xFF123456L, vm.uiState.value.currentColor)
+        assertEquals(recentsBefore, vm.uiState.value.recentColors.size)
+        vm.recordRecentColor(0xFF123456L)
+        assertEquals(0xFF123456L, vm.uiState.value.recentColors.first())
+
+        // Color Palette Tray open/grid/save/remove/dice
+        vm.openPaletteTray()
+        assertTrue(vm.uiState.value.isPaletteTrayOpen)
+        vm.setPaletteGridSize(cols = 6, rows = 3)
+        assertEquals(18, vm.uiState.value.preferences.colorPalette.maxSlots)
+
+        vm.selectPaletteSlot(2)
+        vm.setColor(0xFFE91E63L, recordToRecents = false)
+        vm.saveCurrentColorToPaletteSlot(2)
+        assertEquals(0xFFE91E63L, vm.uiState.value.preferences.colorPalette.swatches[2])
+
+        val rule = vm.generateColorTheoryPaletteRow()
+        assertTrue(rule.isNotBlank())
+        val row0Colors = vm.uiState.value.preferences.colorPalette.swatches.take(6)
+        assertTrue("Color theory dice must populate entire horizontal row", row0Colors.all { it != 0L })
+
+        vm.removePaletteSlot(2)
+        assertEquals(0L, vm.uiState.value.preferences.colorPalette.swatches[2])
+        vm.closePaletteTray()
+        assertFalse(vm.uiState.value.isPaletteTrayOpen)
+
+        // Grid ruler behind active layer default & toggle
+        val defaultGrid = GridRulerSettings()
+        assertTrue("Grid ruler should default behind active layer", defaultGrid.renderBehindActiveLayer)
+        vm.updateGridRulerSettings(defaultGrid.copy(isEnabled = true, renderBehindActiveLayer = false))
+        assertFalse(vm.uiState.value.gridRulerSettings.renderBehindActiveLayer)
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `3D camera interpolation, built-in effects, animated preset folder & post-effects render reliably`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("Camera3DProj", ProjectResolution.PRESETS[0], 24)
+        vm.addFrame()
+        vm.addFrame()
+        vm.addFrame() // 4 frames (0..3)
+
+        // Built-in ZOOM_IN generates keyframes smoothly across frame range
+        vm.applyCameraBuiltInEffect(CameraBuiltInEffect.ZOOM_IN)
+        val cam = vm.uiState.value.project.camera3D
+        assertTrue(cam.isEnabled)
+        assertTrue(cam.autoInterpolate)
+        val kf0 = Camera3DEngine.evaluateCameraAtFrame(cam, 0)
+        val kfMid = Camera3DEngine.evaluateCameraAtFrame(cam, 1)
+        val kfEnd = Camera3DEngine.evaluateCameraAtFrame(cam, 3)
+        assertEquals(1.0f, kf0.zoom, 0.01f)
+        assertTrue("Intermediate frame must interpolate smoothly between 1.0 and 1.48", kfMid.zoom in 1.05f..1.45f)
+        assertEquals(1.48f, kfEnd.zoom, 0.01f)
+
+        // Save camera configuration + After Effects post-effects to persistent Pasta Animada
+        val postFx = CameraPostEffectSettings(vignette = 0.6f, bloom = 0.35f, sepia = 0.25f)
+        vm.updateCameraPostEffects(postFx)
+        vm.setCameraResolution(1280, 720)
+        vm.saveCameraTemplateToFolder("Zoom Drama")
+        val savedList = vm.uiState.value.preferences.savedCameraTemplates
+        assertEquals(1, savedList.size)
+        val savedTpl = savedList.first()
+        assertEquals("Zoom Drama", savedTpl.name)
+        assertEquals(1280, savedTpl.captureWidth)
+        assertEquals(0.6f, savedTpl.postEffects.vignette, 0.01f)
+
+        // Reset camera then re-apply saved template from Pasta Animada
+        vm.resetCameraKeyframesToDefault()
+        vm.resetCameraPostEffects()
+        assertEquals(0f, vm.uiState.value.project.camera3D.postEffects.vignette, 0.001f)
+        vm.applyCameraTemplateFromFolder(savedTpl)
+        assertEquals(0.6f, vm.uiState.value.project.camera3D.postEffects.vignette, 0.01f)
+        assertEquals(1280, vm.uiState.value.project.camera3D.captureWidth)
+
+        // Render a frame with 3D camera + post-effects onto a target Bitmap
+        val outBmp = Bitmap.createBitmap(160, 90, Bitmap.Config.ARGB_8888)
+        Camera3DEngine.renderFrameWithCameraAndEffects(
+            frame = vm.uiState.value.project.frames[1],
+            settings = vm.uiState.value.project.camera3D,
+            frameIndex = 1,
+            projectWidth = 200,
+            projectHeight = 120,
+            targetBitmap = outBmp
+        )
+        // Corner pixel should be darkened noticeably by vignette=0.6f
+        val centerPixel = outBmp.getPixel(80, 45)
+        val cornerPixel = outBmp.getPixel(2, 2)
+        val centerLuma = android.graphics.Color.red(centerPixel) + android.graphics.Color.green(centerPixel) + android.graphics.Color.blue(centerPixel)
+        val cornerLuma = android.graphics.Color.red(cornerPixel) + android.graphics.Color.green(cornerPixel) + android.graphics.Color.blue(cornerPixel)
+        assertTrue("After Effects vignette must darken corners ($cornerLuma) relative to center ($centerLuma)", cornerLuma < centerLuma)
+        outBmp.recycle()
+
+        vm.deleteCameraTemplate(savedTpl.id)
+        assertTrue(vm.uiState.value.preferences.savedCameraTemplates.isEmpty())
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `grid ruler line count and thickness clamp, and camera 2D mode, bezier handles, effect spans & export crop flag work`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("Camera2D3D", ProjectResolution.PRESETS[0], 24)
+        vm.addFrame()
+        vm.addFrame()
+        vm.addFrame() // 4 frames
+
+        // 1. GridRuler line count & thickness bounds
+        vm.updateGridRulerSettings(
+            GridRulerSettings(
+                isEnabled = true,
+                useLineCount = true,
+                lineCountX = 1,
+                lineCountY = 99,
+                lineThicknessDp = 12.0f
+            )
+        )
+        val grid = vm.uiState.value.gridRulerSettings
+        assertTrue(grid.useLineCount)
+        assertEquals(2, grid.lineCountX)
+        assertEquals(64, grid.lineCountY)
+        assertEquals(6.0f, grid.lineThicknessDp, 0.001f)
+
+        // 2. Bezier Graph Solver & Keyframe handles
+        val slowStartY = Camera3DEngine.solveCubicBezierY(0.25f, p1x = 0.8f, p1y = 0.05f, p2x = 0.9f, p2y = 0.2f)
+        val fastStartY = Camera3DEngine.solveCubicBezierY(0.25f, p1x = 0.1f, p1y = 0.85f, p2x = 0.2f, p2y = 0.95f)
+        assertTrue("Steep initial Bezier ($fastStartY) must exceed flat initial Bezier ($slowStartY)", fastStartY > slowStartY + 0.2f)
+
+        vm.updateKeyframeBezierHandles(frameIndex = 0, p1x = 0.15f, p1y = 0.9f, p2x = 0.3f, p2y = 1.0f)
+        val kf0Updated = vm.uiState.value.project.camera3D.keyframes.first { it.frameIndex == 0 }
+        assertEquals(CameraEasingCurve.BEZIER_GRAFICO, kf0Updated.easing)
+        assertEquals(0.15f, kf0Updated.bezierP1X, 0.001f)
+        assertEquals(0.9f, kf0Updated.bezierP1Y, 0.001f)
+
+        // 3. Ranged CameraEffectSpan (frames 1..3) applies only in range
+        vm.applyCameraEffectInRange(CameraBuiltInEffect.ZOOM_IN, startFrame = 1, endFrame = 3, intensity = 1.2f)
+        val spans = vm.uiState.value.project.camera3D.effectSpans
+        assertEquals(1, spans.size)
+        val camBeforeRange = Camera3DEngine.evaluateCameraAtFrame(vm.uiState.value.project.camera3D, 0)
+        val camAtRangeEnd = Camera3DEngine.evaluateCameraAtFrame(vm.uiState.value.project.camera3D, 3)
+        assertTrue("Ranged ZOOM_IN should boost zoom at endFrame ($camAtRangeEnd) vs frame 0 ($camBeforeRange)", camAtRangeEnd.zoom > camBeforeRange.zoom + 0.2f)
+
+        vm.removeCameraEffectSpan(spans.first().id)
+        assertTrue(vm.uiState.value.project.camera3D.effectSpans.isEmpty())
+
+        // 4. CameraMode.MODE_2D zeroes 3D pitch & yaw cleanly while keeping 2D zoom/pan/rotate
+        vm.applyCameraBuiltInEffect(CameraBuiltInEffect.ORBITA_3D)
+        val cam3DVal = Camera3DEngine.evaluateCameraAtFrame(vm.uiState.value.project.camera3D, 0)
+        assertTrue("ORBITA_3D in MODE_3D should have non-zero yaw", kotlin.math.abs(cam3DVal.yawY) > 1f)
+        vm.setCameraMode(CameraMode.MODE_2D)
+        val cam2DVal = Camera3DEngine.evaluateCameraAtFrame(vm.uiState.value.project.camera3D, 0)
+        assertEquals(0f, cam2DVal.pitchX, 0.001f)
+        assertEquals(0f, cam2DVal.yawY, 0.001f)
+        assertFalse(vm.uiState.value.isCameraSideView3D)
+
+        // 5. Export camera crop toggle & cropToCamera=false preserves full canvas
+        vm.setExportCameraCropOnly(false)
+        assertFalse(vm.uiState.value.exportCameraCropOnly)
+        vm.setExportCameraCropOnly(true)
+        assertTrue(vm.uiState.value.exportCameraCropOnly)
+
+        // Draw dot in corner (10,10) that would be cropped out under zoom=2.0 when cropToCamera=true
+        vm.addStrokeToCurrentLayer(
+            DrawingStroke(
+                tool = ToolType.RECTANGLE,
+                color = 0xFFFF0000L,
+                brushSize = 4f,
+                isFilled = true,
+                points = listOf(StrokePoint(0f, 0f), StrokePoint(30f, 30f))
+            )
+        )
+        val zoomedCam = Camera3DSettings(
+            isEnabled = true,
+            cameraMode = CameraMode.MODE_2D,
+            keyframes = listOf(Camera3DKeyframe(frameIndex = 0, zoom = 3.0f))
+        )
+        val uncropped = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
+        Camera3DEngine.renderFrameWithCameraAndEffects(
+            frame = vm.uiState.value.project.frames[0],
+            settings = zoomedCam,
+            frameIndex = 0,
+            projectWidth = 200,
+            projectHeight = 200,
+            targetBitmap = uncropped,
+            cropToCamera = false
+        )
+        assertTrue(
+            "When cropToCamera=false, corner artwork at (15,15) must remain visible even at zoom=3.0",
+            android.graphics.Color.red(uncropped.getPixel(15, 15)) > 200 && android.graphics.Color.green(uncropped.getPixel(15, 15)) < 50
+        )
+        uncropped.recycle()
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `advanced bucket tool supports expandPixels, multi-layer reference, paint underneath and quick palette round-trips`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("BaldeEPalheta", ProjectResolution.PRESETS[0], 24)
+
+        // 1. Add Bucket layer underneath active line art layer & frame-local bucket layer
+        val initialLayersCount = vm.uiState.value.project.frames[0].layers.size
+        vm.addBucketLayer(insertBelowActive = true)
+        val f0 = vm.uiState.value.project.frames[0]
+        assertEquals(initialLayersCount + 1, f0.layers.size)
+        assertTrue(f0.layers[0].isBucketLayer)
+        assertTrue(vm.uiState.value.bucketConfig.paintUnderneathLineArt)
+        assertEquals(f0.layers[0].id, vm.uiState.value.bucketConfig.activeBucketTargetLayerId)
+
+        // Toggle reference on Line Art layer (index 1)
+        vm.toggleTimelineLayerBucketReference(1)
+        assertTrue(vm.uiState.value.project.frames[0].layers[1].isBucketReference)
+        assertTrue(f0.layers[1].id in vm.uiState.value.bucketConfig.selectedReferenceLayerIds)
+
+        // Frame-local bucket sub-layer creation & reference toggle
+        vm.addFrameLocalBucketLayer()
+        val localsAfter = vm.uiState.value.project.frames[0].localLayers
+        assertEquals(1, localsAfter.size)
+        assertTrue(localsAfter[0].isBucketLayer)
+        vm.toggleFrameLocalLayerBucketReference(0)
+        assertTrue(vm.uiState.value.project.frames[0].localLayers[0].isBucketReference)
+
+        // 2. Flood-fill expansion check (expandPixels=2 emits more fill pixels than expandPixels=0)
+        val fillBmp = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
+        fillBmp.eraseColor(android.graphics.Color.BLACK)
+        val paintWhite = android.graphics.Paint().apply { color = android.graphics.Color.WHITE }
+        android.graphics.Canvas(fillBmp).drawRect(30f, 30f, 70f, 70f, paintWhite)
+        val normalSpans = KodanimaGraphicsEngine.createFloodFillSpans(fillBmp, 50, 50, tolerance = 20, expandPixels = 0)
+        val expandedSpans = KodanimaGraphicsEngine.createFloodFillSpans(fillBmp, 50, 50, tolerance = 20, expandPixels = 2)
+        val normalWidthSum = normalSpans.chunked(2).sumOf { (a, b) -> (b.x - a.x).toDouble() }
+        val expandedWidthSum = expandedSpans.chunked(2).sumOf { (a, b) -> (b.x - a.x).toDouble() }
+        assertTrue("Expanded flood fill ($expandedWidthSum) must cover more pixels than exact fill ($normalWidthSum)", expandedWidthSum > normalWidthSum + 100.0)
+        fillBmp.recycle()
+
+        // 3. Selected-layer reference bitmap includes ONLY chosen layers
+        val layerA = Layer(
+            id = "ref-layer-a",
+            name = "A",
+            strokes = listOf(DrawingStroke(tool = ToolType.RECTANGLE, color = 0xFFFF0000L, isFilled = true, points = listOf(StrokePoint(5f, 5f), StrokePoint(40f, 40f))))
+        )
+        val layerB = Layer(
+            id = "ref-layer-b",
+            name = "B",
+            strokes = listOf(DrawingStroke(tool = ToolType.RECTANGLE, color = 0xFF0000FFL, isFilled = true, points = listOf(StrokePoint(60f, 60f), StrokePoint(95f, 95f))))
+        )
+        val testFrame = Frame(layers = listOf(layerA, layerB))
+        val onlyABmp = KodanimaGraphicsEngine.renderSelectedLayersToBitmap(testFrame, 100, 100, setOf("ref-layer-a"), android.graphics.Color.WHITE)
+        assertTrue(android.graphics.Color.red(onlyABmp.getPixel(20, 20)) > 200)
+        assertEquals("Unselected Layer B region must stay WHITE", android.graphics.Color.WHITE, onlyABmp.getPixel(80, 80))
+        onlyABmp.recycle()
+
+        // 4. Quick Palette toggle + Q shortcut + lock + Wheel/Eyedropper return to Palette Tray
+        assertFalse(vm.uiState.value.isQuickPaletteOpen)
+        val handledQ = vm.handlePhysicalKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_Q), context)
+        assertTrue("Q shortcut must toggle floating Quick Palette", handledQ)
+        assertTrue(vm.uiState.value.isQuickPaletteOpen)
+        vm.toggleQuickPaletteLock()
+        assertTrue(vm.uiState.value.isQuickPaletteLocked)
+
+        // Wheel round-trip from Palette Tray
+        vm.openPaletteTray()
+        vm.openColorWheelFromPaletteTray()
+        assertFalse(vm.uiState.value.isPaletteTrayOpen)
+        assertEquals(EditorDialog.COLOR_PICKER, vm.uiState.value.activeDialog)
+        assertTrue(vm.uiState.value.pendingReturnToPaletteTray)
+        vm.closeDialog()
+        assertTrue("Closing Color Wheel opened from Palette Tray must reopen Palette Tray", vm.uiState.value.isPaletteTrayOpen)
+        assertFalse(vm.uiState.value.pendingReturnToPaletteTray)
+
+        // Eyedropper round-trip from Palette Tray
+        vm.selectTool(ToolType.BRUSH)
+        vm.startEyedropperFromPaletteTray()
+        assertEquals(ToolType.EYEDROPPER, vm.uiState.value.selectedTool)
+        assertFalse(vm.uiState.value.isPaletteTrayOpen)
+        vm.completeEyedropperColorPick(0xFF33AAFFL)
+        assertEquals(0xFF33AAFFL, vm.uiState.value.currentColor)
+        assertTrue("Picking a color with Eyedropper from Palette Tray must reopen Palette Tray", vm.uiState.value.isPaletteTrayOpen)
+        assertEquals(ToolType.BRUSH, vm.uiState.value.selectedTool)
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `camera FOV interpolation, connect two keyframes, camera toolbar controls, canvas sky background roundtrip and 3-finger swipe up Zen work`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("Estudio3DFov", ProjectResolution.PRESETS[0], 24)
+        vm.addFrame()
+        vm.addFrame()
+        vm.addFrame() // 4 frames (0..3)
+
+        // 1. FOV interpolation between keyframes
+        vm.goToFrame(0)
+        vm.setCameraFov(28f)
+        vm.goToFrame(3)
+        vm.setCameraFov(82f)
+        val kf0 = Camera3DEngine.evaluateCameraAtFrame(vm.uiState.value.project.camera3D, 0)
+        val kfMid = Camera3DEngine.evaluateCameraAtFrame(vm.uiState.value.project.camera3D, 1)
+        val kfEnd = Camera3DEngine.evaluateCameraAtFrame(vm.uiState.value.project.camera3D, 3)
+        assertEquals(28f, kf0.fovDegrees, 0.01f)
+        assertEquals(82f, kfEnd.fovDegrees, 0.01f)
+        assertTrue("Interpolated midpoint FOV (${kfMid.fovDegrees}) must sit between 28° and 82°", kfMid.fovDegrees in 35f..75f)
+
+        // 2. Nudge / Zoom / Rotate / Orbit / AdjustFOV / Reset / ToolAction
+        vm.setCameraToolAction(CameraToolAction.ORBIT_3D)
+        assertEquals(CameraToolAction.ORBIT_3D, vm.uiState.value.cameraToolAction)
+        vm.nudgeCameraPan(24f, -12f)
+        vm.zoomCameraBy(1.5f)
+        vm.rotateCameraBy(15f)
+        vm.tiltOrbitCameraBy(10f, -6f)
+        vm.adjustCameraFov(-5f)
+        val editedEnd = vm.uiState.value.project.camera3D.keyframes.first { it.frameIndex == 3 }
+        assertEquals(24f, editedEnd.x, 0.01f)
+        assertEquals(-12f, editedEnd.y, 0.01f)
+        assertEquals(1.5f, editedEnd.zoom, 0.01f)
+        assertEquals(15f, editedEnd.rotationZ, 0.01f)
+        assertEquals(10f, editedEnd.yawY, 0.01f)
+        assertEquals(-6f, editedEnd.pitchX, 0.01f)
+        assertEquals(77f, editedEnd.fovDegrees, 0.01f)
+
+        vm.resetCameraAtCurrentFrame()
+        val resetEnd = vm.uiState.value.project.camera3D.keyframes.first { it.frameIndex == 3 }
+        assertEquals(0f, resetEnd.x, 0.01f)
+        assertEquals(1.0f, resetEnd.zoom, 0.01f)
+        assertEquals(50f, resetEnd.fovDegrees, 0.01f)
+
+        // 3. connectTwoCameraKeyframes creates & enables interpolation cleanly from a blank camera track
+        vm.resetCameraKeyframesToDefault()
+        vm.goToFrame(0)
+        vm.connectTwoCameraKeyframes()
+        val connectedCam = vm.uiState.value.project.camera3D
+        assertTrue(connectedCam.isEnabled)
+        assertTrue(connectedCam.autoInterpolate)
+        assertTrue("connectTwoCameraKeyframes must ensure >= 2 keyframes", connectedCam.keyframes.size >= 2)
+
+        // 4. Canvas Background + Sky Backdrop persistence & transparent render
+        val customBg = CanvasBackgroundSettings(
+            style = CanvasBackgroundStyle.TRANSPARENTE,
+            primaryColor = 0xFF102030L,
+            secondaryColor = 0xFF405060L,
+            gradientAngleDeg = 45f,
+            texturePattern = CanvasTexturePattern.GRADE_FINA,
+            textureIntensity = 0.42f,
+            skyMode = SkyBackdropMode.ESTRELAS_NOTURNO,
+            skyTopColor = 0xFF0A0D18L,
+            skyBottomColor = 0xFF1C2438L
+        )
+        vm.updateCanvasBackground(customBg)
+        assertEquals(CanvasBackgroundStyle.TRANSPARENTE, vm.uiState.value.project.canvasBackground.style)
+
+        val json = FileImportExportManager.projectToJson(vm.uiState.value.project, compact = true)
+        val restored = FileImportExportManager.projectFromJson(json)
+        assertEquals(CanvasBackgroundStyle.TRANSPARENTE, restored.canvasBackground.style)
+        assertEquals(SkyBackdropMode.ESTRELAS_NOTURNO, restored.canvasBackground.skyMode)
+        assertEquals(CanvasTexturePattern.GRADE_FINA, restored.canvasBackground.texturePattern)
+        assertEquals(0xFF0A0D18L, restored.canvasBackground.skyTopColor)
+        assertTrue(restored.camera3D.keyframes.any { it.fovDegrees in 18f..120f })
+
+        val transparentBmp = KodanimaGraphicsEngine.renderFrameToBitmap(
+            frame = vm.uiState.value.project.frames[0],
+            width = 64,
+            height = 64,
+            backgroundColor = android.graphics.Color.WHITE,
+            background = customBg
+        )
+        assertEquals(
+            "TRANSPARENTE paper style must keep empty pixels transparent",
+            0,
+            (transparentBmp.getPixel(32, 32) ushr 24) and 0xFF
+        )
+        transparentBmp.recycle()
+
+        // 5. Three-finger swipe up gesture & CAMERA_* shortcuts
+        assertEquals(GestureAction.TOGGLE_ZEN_FULLSCREEN, MultiFingerGesture.THREE_FINGER_SWIPE_UP.defaultAction)
+        assertEquals(GestureAction.TOGGLE_ZEN_FULLSCREEN, TouchGestureRegistry.defaultMap()[MultiFingerGesture.THREE_FINGER_SWIPE_UP])
+        assertFalse(vm.uiState.value.isZenModeActive)
+        vm.executeMultiFingerGesture(MultiFingerGesture.THREE_FINGER_SWIPE_UP)
+        assertTrue("3-finger swipe up must enter Zen/Focus mode", vm.uiState.value.isZenModeActive)
+        vm.executeMultiFingerGesture(MultiFingerGesture.THREE_FINGER_SWIPE_UP)
+        assertFalse("3-finger swipe up again must exit Zen/Focus mode", vm.uiState.value.isZenModeActive)
+
+        val defaultShortcuts = ShortcutRegistry.defaultMap()
+        assertNotNull(defaultShortcuts[ShortcutAction.CAMERA_TOGGLE_MODE])
+        assertNotNull(defaultShortcuts[ShortcutAction.CAMERA_ADD_KEYFRAME])
+        assertNotNull(defaultShortcuts[ShortcutAction.CAMERA_TOGGLE_3D_VIEW])
+        assertNotNull(defaultShortcuts[ShortcutAction.CAMERA_FOV_WIDE])
+        assertNotNull(defaultShortcuts[ShortcutAction.CAMERA_RESET])
+
+        // Neutral naming verification in CameraMode & SkyBackdropMode
+        assertFalse(CameraMode.MODE_2D.labelPt.contains("Clip", ignoreCase = true))
+        assertFalse(CameraMode.MODE_3D.labelPt.contains("Blender", ignoreCase = true))
+        SkyBackdropMode.entries.forEach { sky ->
+            assertFalse(sky.labelPt.contains("Blender", ignoreCase = true))
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `stage 3D places camera strictly in front of layers and background behind all layers`() {
+        val layout = computeStage3DZPositions(layerCount = 3, depthStep = 40f, cameraFrontGap = 100f)
+        assertEquals(3, layout.layerZs.size)
+        val bottomZ = layout.layerZs[0]
+        val midZ = layout.layerZs[1]
+        val topZ = layout.layerZs[2]
+        assertTrue("Camera apex (${layout.cameraApexZ}) must be strictly in front of top layer ($topZ)", layout.cameraApexZ < topZ)
+        assertTrue("Top layer ($topZ) must sit closer to camera than middle layer ($midZ)", topZ < midZ)
+        assertTrue("Middle layer ($midZ) must sit closer to camera than bottom layer ($bottomZ)", midZ < bottomZ)
+        assertTrue("Background paper (${layout.backgroundPlaneZ}) must sit strictly behind bottom layer ($bottomZ)", layout.backgroundPlaneZ > bottomZ)
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `krita importer handles raw XML kpp, single quotes, scientific floats, 3bpp gbr, standalone gih and png tips, and corrupt bundle entries`() {
+        // 1. Raw XML .kpp with single quotes, escaped &quot; in name, and scientific notation spacing
+        val rawPresetXml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Preset name='Pincel &quot;Pro&quot;' paintopid='paintbrush'>
+                <param name='brush_definition'><![CDATA[<Brush diameter='24.5' spacing='1.5e-2' filename='my%20custom%20tip.gbr'/>]]></param>
+                <param name='OpacityValue'>0.85</param>
+            </Preset>
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+
+        val rawParsed = KritaBrushImporter.parseRawPresetXmlBytes(rawPresetXml, "raw_test.kpp", presetId = 2001)
+        assertNotNull("Raw XML .kpp without PNG wrapper must parse", rawParsed)
+        assertEquals("Pincel \"Pro\"", rawParsed!!.namePt)
+        assertEquals(24.5f, rawParsed.defaultSize, 0.05f)
+        assertEquals(0.85f, rawParsed.defaultOpacity, 0.01f)
+        assertEquals(0.02f, rawParsed.dynamicParams.spacing, 0.01f) // 1.5e-2 coerced to 0.02f minimum
+
+        // 2. Build a 4x4 3-bpp (RGB) .gbr brush tip
+        val gbrName = "Tip RGB\u0000".toByteArray(Charsets.UTF_8)
+        val gbrHeaderSize = 28 + gbrName.size
+        val gbrOut = ByteArrayOutputStream()
+        val hdrBuf = ByteBuffer.allocate(28).order(ByteOrder.BIG_ENDIAN)
+            .putInt(gbrHeaderSize)
+            .putInt(2) // version 2
+            .putInt(4) // width
+            .putInt(4) // height
+            .putInt(3) // 3 bpp RGB
+            .putInt(0x47494D50) // "GIMP"
+            .putInt(25) // spacing 0.25
+        gbrOut.write(hdrBuf.array())
+        gbrOut.write(gbrName)
+        repeat(16) { idx ->
+            val lum = if (idx in setOf(5, 6, 9, 10)) 0 else 255 // dark dot center -> high alpha
+            gbrOut.write(lum)
+            gbrOut.write(lum)
+            gbrOut.write(lum)
+        }
+        val gbr3Bytes = gbrOut.toByteArray()
+        val parsedGbr3 = KritaBrushImporter.parseGbrBytes(gbr3Bytes, "rgb_tip.gbr", presetId = 2002)
+        assertNotNull("3-bpp .gbr must parse", parsedGbr3)
+        assertNotNull("3-bpp .gbr must produce a valid tipStampBase64", parsedGbr3!!.dynamicParams.tipStampBase64)
+
+        // 3. Standalone .gih hose wrapper around that .gbr block
+        val gihHeader = "4 GIMP Hose Test\n1 1 cellwidth:4 cellheight:4\n".toByteArray(Charsets.US_ASCII)
+        val gihBytes = ByteArray(gihHeader.size + gbr3Bytes.size).apply {
+            System.arraycopy(gihHeader, 0, this, 0, gihHeader.size)
+            System.arraycopy(gbr3Bytes, 0, this, gihHeader.size, gbr3Bytes.size)
+        }
+        val parsedGih = KritaBrushImporter.parseGihPresetBytes(gihBytes, "hose_test.gih", presetId = 2003)
+        assertNotNull("Standalone .gih must parse", parsedGih)
+        assertNotNull(parsedGih!!.dynamicParams.tipStampBase64)
+
+        // 4. Standalone .png brush tip
+        val tipBmp = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888)
+        tipBmp.eraseColor(android.graphics.Color.BLACK)
+        val pngBytes = ByteArrayOutputStream().apply {
+            tipBmp.compress(Bitmap.CompressFormat.PNG, 100, this)
+        }.toByteArray()
+        tipBmp.recycle()
+        val parsedPngTip = KritaBrushImporter.parsePngTipPresetBytes(pngBytes, "soft_dot.png", presetId = 2004)
+        assertNotNull("Standalone .png tip must parse", parsedPngTip)
+        assertNotNull(parsedPngTip!!.dynamicParams.tipStampBase64)
+
+        // 5. Bundle with 1 corrupt PNG-header .kpp, 1 valid XML .kpp pointing to URL-encoded tip in brushes/
+        val zipOut = ByteArrayOutputStream()
+        ZipOutputStream(zipOut).use { zos ->
+            zos.putNextEntry(ZipEntry("paintoppresets/broken.kpp"))
+            zos.write(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01))
+            zos.closeEntry()
+
+            zos.putNextEntry(ZipEntry("brushes/my custom tip.gbr"))
+            zos.write(gbr3Bytes)
+            zos.closeEntry()
+
+            zos.putNextEntry(ZipEntry("paintoppresets/valid.kpp"))
+            zos.write(rawPresetXml)
+            zos.closeEntry()
+        }
+        val bundleResults = KritaBrushImporter.parseBundleBytes(zipOut.toByteArray(), startingId = 3000)
+        assertEquals("Bundle must still import valid presets even when another .kpp is corrupt", 1, bundleResults.size)
+        val linkedBrush = bundleResults.first()
+        assertEquals("Pincel \"Pro\"", linkedBrush.namePt)
+        assertEquals("predefined", linkedBrush.dynamicParams.shapeKind)
+        assertNotNull("Bundle must resolve URL-encoded brush tip filename", linkedBrush.dynamicParams.tipStampBase64)
+    }
 }
+
+
 
 

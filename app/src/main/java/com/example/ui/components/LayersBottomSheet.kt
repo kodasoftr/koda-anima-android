@@ -20,6 +20,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Visibility
@@ -79,6 +81,11 @@ fun LayersBottomSheet(
     onUpdateAssetScale: (String, Double) -> Unit = { _, _ -> },
     onResetAssetTransform: (String) -> Unit = {},
     onToggleVideoTransformMode: (() -> Unit)? = null,
+    onMoveLayerUp: ((Int) -> Unit)? = null,
+    onMoveLayerDown: ((Int) -> Unit)? = null,
+    onAddBucketLayer: (() -> Unit)? = null,
+    onSelectBucketTargetLayer: ((String) -> Unit)? = null,
+    onToggleBucketReference: ((Int) -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -164,12 +171,61 @@ fun LayersBottomSheet(
                                         Spacer(modifier = Modifier.width(8.dp))
                                     }
                                     Column {
-                                        Text(
-                                            text = layer.name,
-                                            fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
-                                            color = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                                            fontSize = 14.sp
-                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                        ) {
+                                            Text(
+                                                text = layer.name,
+                                                fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
+                                                color = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                                fontSize = 14.sp
+                                            )
+                                            if (layer.isBucketLayer) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(5.dp))
+                                                        .background(Color(0xFF00D2FF).copy(alpha = 0.22f))
+                                                        .border(0.8.dp, Color(0xFF00D2FF), RoundedCornerShape(5.dp))
+                                                        .clickable(enabled = onSelectBucketTargetLayer != null) {
+                                                            onSelectBucketTargetLayer?.invoke(layer.id)
+                                                        }
+                                                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                                                ) {
+                                                    Text(
+                                                        text = "BALDE",
+                                                        fontSize = 8.5.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = Color(0xFF00D2FF)
+                                                    )
+                                                }
+                                            }
+                                            if (onToggleBucketReference != null) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(5.dp))
+                                                        .background(
+                                                            if (layer.isBucketReference) NeonGreen.copy(alpha = 0.22f)
+                                                            else MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)
+                                                        )
+                                                        .border(
+                                                            0.8.dp,
+                                                            if (layer.isBucketReference) NeonGreen else MaterialTheme.colorScheme.outlineVariant,
+                                                            RoundedCornerShape(5.dp)
+                                                        )
+                                                        .clickable { onToggleBucketReference(originalIndex) }
+                                                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                                                        .testTag("layer_ref_toggle_$originalIndex")
+                                                ) {
+                                                    Text(
+                                                        text = if (layer.isBucketReference) "Ref ✓" else "Ref",
+                                                        fontSize = 8.5.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = if (layer.isBucketReference) NeonGreen else MaterialTheme.colorScheme.onSurfaceVariant
+                                                    )
+                                                }
+                                            }
+                                        }
                                         Text(
                                             text = "${layer.strokes.size} traços",
                                             fontSize = 11.sp,
@@ -179,6 +235,40 @@ fun LayersBottomSheet(
                                 }
 
                                 Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (onMoveLayerUp != null) {
+                                        val canMoveUp = originalIndex < layers.lastIndex
+                                        IconButton(
+                                            onClick = { onMoveLayerUp(originalIndex) },
+                                            enabled = canMoveUp,
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .testTag("layer_move_up_$originalIndex")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.KeyboardArrowUp,
+                                                contentDescription = "Subir camada",
+                                                tint = if (canMoveUp) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                    if (onMoveLayerDown != null) {
+                                        val canMoveDown = originalIndex > 0
+                                        IconButton(
+                                            onClick = { onMoveLayerDown(originalIndex) },
+                                            enabled = canMoveDown,
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .testTag("layer_move_down_$originalIndex")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.KeyboardArrowDown,
+                                                contentDescription = "Descer camada",
+                                                tint = if (canMoveDown) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
                                     IconButton(
                                         onClick = { onToggleLock(originalIndex) },
                                         modifier = Modifier.size(36.dp)
@@ -276,6 +366,21 @@ fun LayersBottomSheet(
                     Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("Nova Camada", fontWeight = FontWeight.Bold)
+                }
+
+                if (onAddBucketLayer != null) {
+                    OutlinedButton(
+                        onClick = onAddBucketLayer,
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("add_bucket_layer_button"),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF00D2FF)),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF00D2FF).copy(alpha = 0.7f))
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Balde", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
             }
 
