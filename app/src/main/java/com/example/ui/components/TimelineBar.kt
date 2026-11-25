@@ -6,6 +6,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
@@ -14,9 +15,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -25,6 +28,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Audiotrack
@@ -67,12 +71,15 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.engine.MediaAssetManager
+import com.example.engine.TimelineTrackEngine
+import com.example.model.AnimationProject
 import com.example.model.Frame
 import com.example.model.KodanimaTheme
+import com.example.model.Layer
 import com.example.model.SpecialMediaAsset
 import com.example.ui.theme.NeonGreen
 import com.example.ui.theme.NeonPink
@@ -113,9 +120,19 @@ fun TimelineBar(
     onEndScrub: () -> Unit = {},
     onionSkinOpacity: Float = 0.25f,
     onChangeOnionSkinOpacity: ((Float) -> Unit)? = null,
+    layers: List<Layer> = frames.getOrNull(currentFrameIndex)?.layers ?: emptyList(),
+    activeLayerIndex: Int = 0,
+    currentTimelineTick: Int = currentFrameIndex,
+    playbackTimeMs: Long? = null,
+    onSelectLayerCel: (layerIndex: Int, frameIndex: Int, tick: Int) -> Unit = { _, fIdx, _ -> onSelectFrame(fIdx) },
+    onSetLayerCelHold: (layerIndex: Int, frameIndex: Int, holdTicks: Int) -> Unit = { _, fIdx, hold -> onSetFrameHold(fIdx, hold) },
+    onMoveLayerCel: (layerIndex: Int, frameIndex: Int, targetTick: Int) -> Unit = { _, _, _ -> },
+    onAddCelAtTick: (layerIndex: Int, tick: Int) -> Unit = { _, _ -> onAddFrame() },
+    onSelectTick: ((Int) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
+    val tracksVerticalScrollState = rememberScrollState()
     val density = LocalDensity.current
 
     val panelColor = Color(theme.panel)
@@ -129,40 +146,60 @@ fun TimelineBar(
     // Mini "Modificar tempo" tray & Onion Skin quick opacity tray
     var showTimingTray by remember { mutableStateOf(false) }
     var showOnionOpacityTray by remember { mutableStateOf(false) }
+    var editingLayerIdx by remember { mutableIntStateOf(activeLayerIndex) }
     var editingFrameIdx by remember { mutableIntStateOf(currentFrameIndex) }
-    var draftHold by remember { mutableIntStateOf(frames.getOrNull(currentFrameIndex)?.holdFrames ?: 1) }
+    var draftHold by remember {
+        mutableIntStateOf(
+            frames.getOrNull(currentFrameIndex)?.layers?.getOrNull(activeLayerIndex)?.celHoldTicks
+                ?: frames.getOrNull(currentFrameIndex)?.holdFrames
+                ?: 1
+        )
+    }
+
+    // Per-cel live stretch & move drag feedback (never leaks into sibling timeline layers)
+    var draggingCel by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    var liveDraggingHold by remember { mutableStateOf<Int?>(null) }
+    var movingCel by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    var liveMoveTick by remember { mutableStateOf<Int?>(null) }
 
     val audioAsset = mediaAssets.firstOrNull { it.type == "audio" }
     val safeFps = max(1, fps)
-    val totalTicks = remember(frames) { MediaAssetManager.computeTotalTicks(frames) }
+    val trackProject = remember(frames, safeFps) {
+        AnimationProject(fps = safeFps, frames = frames)
+    }
+    val effectiveLayers = remember(layers, frames) {
+        layers.ifEmpty { frames.firstOrNull()?.layers ?: listOf(Layer(name = "Camada 1")) }
+    }
+    val totalTicks = remember(trackProject) {
+        TimelineTrackEngine.computeTotalTicks(trackProject, includeCameraRunway = false)
+    }
     val animDurationMs = remember(totalTicks, safeFps) { (totalTicks * 1000L) / safeFps }
     val audioDurationMs = ((audioAsset?.durationSeconds ?: 0.0) * 1000.0).toLong()
     val timelineTotalMs = max(animDurationMs, audioDurationMs).coerceAtLeast(1000L)
 
-    // Each timeline tick = 34.dp so holdFrames visibly stretches/shrinks blocks cleanly
-    val dpPerTick = 34f
-    val gapDp = 3f
-    val totalTrackWidthDp = remember(frames, timelineTotalMs, safeFps) {
-        val framesDp = frames.sumOf { (max(1, it.holdFrames) * dpPerTick + gapDp).toDouble() }.toFloat()
-        val audioMinTicks = ((audioDurationMs * safeFps) / 1000f).coerceAtLeast(0f)
-        max(framesDp, audioMinTicks * dpPerTick).coerceAtLeast(240f)
+    // Exact uniform tick width so ruler, all independent layer tracks, and Cyan Pinca match 1:1
+    val dpPerTick = 32f
+    val minRulerTicks = remember(totalTicks, timelineTotalMs, safeFps) {
+        val audioTicks = ((audioDurationMs * safeFps) / 1000f).roundToInt()
+        maxOf(totalTicks + 6, audioTicks + 4, 10)
     }
+    val totalTrackWidthDp = (minRulerTicks * dpPerTick).coerceAtLeast(240f)
     val totalTrackWidthPx = with(density) { totalTrackWidthDp.dp.toPx() }
 
-    val currentTimeMs = activeScrubTimeMs ?: remember(frames, currentFrameIndex, safeFps) {
-        MediaAssetManager.computeTimeMsForFrame(frames, currentFrameIndex, safeFps)
+    val currentTimeMs = activeScrubTimeMs ?: playbackTimeMs ?: TimelineTrackEngine.tickToTimeMs(currentTimelineTick, safeFps)
+    val pinçaTickFloat = remember(activeScrubTimeMs, playbackTimeMs, currentTimelineTick, safeFps, minRulerTicks) {
+        val raw = (activeScrubTimeMs ?: playbackTimeMs)?.let {
+            TimelineTrackEngine.timeMsToTickFloat(it, safeFps)
+        } ?: currentTimelineTick.toFloat()
+        raw.coerceIn(0f, (minRulerTicks - 1).toFloat())
     }
 
     var viewportWidthPx by remember { mutableFloatStateOf(0f) }
 
-    // Keep Pinça & active frame smoothly visible during playback / stepping
-    LaunchedEffect(currentFrameIndex, isPlaying) {
-        if (currentFrameIndex in frames.indices && activeScrubTimeMs == null) {
-            var xAccDp = 0f
-            for (i in 0 until currentFrameIndex) {
-                xAccDp += max(1, frames[i].holdFrames) * dpPerTick + gapDp
-            }
-            val targetPx = with(density) { xAccDp.dp.toPx() }.toInt()
+    // Keep Pinca & active tick smoothly visible during playback / stepping
+    LaunchedEffect(currentTimelineTick, isPlaying) {
+        if (activeScrubTimeMs == null) {
+            val targetPx = with(density) { (currentTimelineTick * dpPerTick).dp.toPx() }.toInt()
             val halfView = (viewportWidthPx * 0.35f).toInt()
             scrollState.animateScrollTo((targetPx - halfView).coerceAtLeast(0))
         }
@@ -197,6 +234,7 @@ fun TimelineBar(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                         verticalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
+                        val editLayerName = effectiveLayers.getOrNull(editingLayerIdx)?.name ?: "Camada ${editingLayerIdx + 1}"
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
@@ -208,10 +246,12 @@ fun TimelineBar(
                             ) {
                                 Icon(Icons.Default.Schedule, contentDescription = null, tint = accentColor, modifier = Modifier.size(14.dp))
                                 Text(
-                                    text = "Modificar tempo • Quadro ${editingFrameIdx + 1}",
+                                    text = "$editLayerName • Quadro ${editingFrameIdx + 1}",
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = accentColor
+                                    color = accentColor,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                                 val sec = String.format(java.util.Locale.US, "%.2fs", draftHold.toFloat() / safeFps)
                                 Text(
@@ -251,18 +291,18 @@ fun TimelineBar(
                                         .clip(RoundedCornerShape(6.dp))
                                         .background(panelColor)
                                         .border(1.dp, subtleBorder, RoundedCornerShape(6.dp))
-                                        .clickable { draftHold = (draftHold + 1).coerceAtMost(120) },
+                                        .clickable { draftHold = (draftHold + 1).coerceAtMost(240) },
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Icon(Icons.Default.Add, contentDescription = "Aumentar tempo", tint = textColor, modifier = Modifier.size(14.dp))
                                 }
 
-                                // Apply & close tray
+                                // Apply & close tray (updates ONLY editingLayerIdx)
                                 Surface(
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(6.dp))
                                         .clickable {
-                                            onSetFrameHold(editingFrameIdx, draftHold)
+                                            onSetLayerCelHold(editingLayerIdx, editingFrameIdx, draftHold)
                                             showTimingTray = false
                                         }
                                         .testTag("mobile_apply_timing_button"),
@@ -308,7 +348,7 @@ fun TimelineBar(
                                         )
                                         .clickable {
                                             draftHold = presetHold
-                                            onSetFrameHold(editingFrameIdx, presetHold)
+                                            onSetLayerCelHold(editingLayerIdx, editingFrameIdx, presetHold)
                                             showTimingTray = false
                                         }
                                         .padding(horizontal = 9.dp, vertical = 4.dp)
@@ -604,265 +644,478 @@ fun TimelineBar(
                 }
             }
 
-            // Scrollable Ruler + Pinça Scrubbing + Proportional Frames + Audio Waveform Track
-            Box(
+            // Scrollable Ruler + Independent Per-Layer Cel Tracks + Audio Waveform + Aligned Cyan Pinca
+            val rowH = 30f
+            val tracksBoxMaxH = 92f
+            val tracksHeightDp = (effectiveLayers.size.coerceAtLeast(1) * rowH).coerceAtMost(tracksBoxMaxH)
+            val totalPinçaHeightDp = 20f + 2f + tracksHeightDp + if (audioAsset != null) 25f else 0f
+
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 6.dp)
-                    .onSizeChanged { viewportWidthPx = it.width.toFloat() }
-                    .horizontalScroll(scrollState)
             ) {
-                val contentWidthDp = totalTrackWidthDp.dp
-                val pinçaFraction = (currentTimeMs.toFloat() / timelineTotalMs.toFloat()).coerceIn(0f, 1f)
-                val animWidthDp = remember(frames) {
-                    frames.sumOf { (max(1, it.holdFrames) * dpPerTick + gapDp).toDouble() }.toFloat().coerceAtLeast(100f)
-                }
-                val animWidthPx = with(density) { animWidthDp.dp.toPx() }
-                // Align Pinça cleanly with animation ticks when scrubbing inside animation range
-                val pinçaXFractionOfTimeline = if (timelineTotalMs > 0L) {
-                    (currentTimeMs.toFloat() / max(1L, animDurationMs).toFloat()) * (animWidthPx / totalTrackWidthPx.coerceAtLeast(1f))
-                } else pinçaFraction
-                val pinçaXPosPx = (currentTimeMs.toDouble() * safeFps / 1000.0 * with(density) { (dpPerTick + gapDp * 0.25f).dp.toPx() })
-                    .toFloat()
-                    .coerceIn(0f, totalTrackWidthPx)
-
-                Box(modifier = Modifier.width(contentWidthDp)) {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        // 1. Time Ruler ("Régua") with tap/drag Pinça audio scrubbing
+                // Pinned Left Layer Rail (stays visible while scrolling horizontally)
+                Column(
+                    modifier = Modifier
+                        .width(60.dp)
+                        .padding(end = 3.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(20.dp)
+                            .clip(RoundedCornerShape(topStart = 6.dp))
+                            .background(bgColor.copy(alpha = 0.9f)),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        Text(
+                            text = "T${currentTimelineTick + 1}",
+                            fontSize = 8.5.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = secondaryAccent,
+                            modifier = Modifier.padding(horizontal = 5.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = tracksBoxMaxH.dp)
+                            .verticalScroll(tracksVerticalScrollState),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        effectiveLayers.indices.reversed().forEach { lIdx ->
+                            val layerObj = effectiveLayers[lIdx]
+                            val isActiveLayer = lIdx == activeLayerIndex
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height((rowH - 2f).dp)
+                                    .clip(RoundedCornerShape(5.dp))
+                                    .background(if (isActiveLayer) accentColor.copy(alpha = 0.22f) else bgColor.copy(alpha = 0.6f))
+                                    .border(
+                                        width = if (isActiveLayer) 1.dp else 0.5.dp,
+                                        color = if (isActiveLayer) accentColor else subtleBorder,
+                                        shape = RoundedCornerShape(5.dp)
+                                    )
+                                    .clickable {
+                                        val resolved = TimelineTrackEngine.resolvePreferredFrameIndexAtTick(
+                                            trackProject, lIdx, currentTimelineTick, currentFrameIndex
+                                        )
+                                        onSelectLayerCel(lIdx, resolved, currentTimelineTick)
+                                    }
+                                    .padding(horizontal = 4.dp)
+                                    .testTag("mobile_layer_row_$lIdx"),
+                                contentAlignment = Alignment.CenterStart
+                            ) {
+                                Text(
+                                    text = layerObj.name,
+                                    fontSize = 8.sp,
+                                    fontWeight = if (isActiveLayer) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isActiveLayer) accentColor else textColor.copy(alpha = 0.8f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                    if (audioAsset != null) {
+                        Spacer(modifier = Modifier.height(3.dp))
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(20.dp)
-                                .clip(RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp))
-                                .background(bgColor.copy(alpha = 0.88f))
-                                .pointerInput(safeFps, totalTrackWidthPx) {
-                                    detectTapGestures { pos ->
-                                        val pxPerSec = safeFps * with(density) { dpPerTick.dp.toPx() }
-                                        val ms = ((pos.x / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
-                                        onScrubToMs(ms)
-                                        onEndScrub()
+                                .height(22.dp)
+                                .clip(RoundedCornerShape(5.dp))
+                                .background(NeonGreen.copy(alpha = 0.14f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Default.Audiotrack, contentDescription = null, tint = NeonGreen, modifier = Modifier.size(12.dp))
+                        }
+                    }
+                }
+
+                // Right Scrollable Ruler + Decoupled Per-Layer Cels + Cyan Pinca Needle
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .onSizeChanged { viewportWidthPx = it.width.toFloat() }
+                        .horizontalScroll(scrollState)
+                ) {
+                    val contentWidthDp = totalTrackWidthDp.dp
+                    val pinçaXPosPx = with(density) { ((pinçaTickFloat + 0.5f) * dpPerTick).dp.toPx() }
+                        .coerceIn(0f, totalTrackWidthPx)
+
+                    Box(modifier = Modifier.width(contentWidthDp)) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            // 1. Time Ruler ("Régua") with tap/drag Pinça scrubbing
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(20.dp)
+                                    .clip(RoundedCornerShape(topEnd = 6.dp))
+                                    .background(bgColor.copy(alpha = 0.88f))
+                                    .pointerInput(safeFps, totalTrackWidthPx, onSelectTick) {
+                                        detectTapGestures { pos ->
+                                            val stepPx = with(density) { dpPerTick.dp.toPx() }.coerceAtLeast(1f)
+                                            val tick = (pos.x / stepPx).toInt().coerceIn(0, (minRulerTicks - 1).coerceAtLeast(0))
+                                            if (onSelectTick != null) {
+                                                onSelectTick(tick)
+                                            } else {
+                                                val ms = TimelineTrackEngine.tickToTimeMs(tick, safeFps)
+                                                onScrubToMs(ms)
+                                                onEndScrub()
+                                            }
+                                        }
+                                    }
+                                    .pointerInput(safeFps, totalTrackWidthPx) {
+                                        detectHorizontalDragGestures(
+                                            onDragStart = { startPos ->
+                                                val pxPerSec = safeFps * with(density) { dpPerTick.dp.toPx() }
+                                                val ms = ((startPos.x / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
+                                                onScrubToMs(ms)
+                                            },
+                                            onHorizontalDrag = { change, _ ->
+                                                change.consume()
+                                                val pxPerSec = safeFps * with(density) { dpPerTick.dp.toPx() }
+                                                val ms = ((change.position.x / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
+                                                onScrubToMs(ms)
+                                            },
+                                            onDragEnd = { onEndScrub() },
+                                            onDragCancel = { onEndScrub() }
+                                        )
+                                    }
+                                    .testTag("mobile_timeline_ruler")
+                            ) {
+                                Canvas(modifier = Modifier.fillMaxSize()) {
+                                    val stepPx = with(density) { dpPerTick.dp.toPx() }
+                                    val totalMarks = (size.width / stepPx).toInt().coerceAtLeast(1)
+                                    for (t in 0..totalMarks) {
+                                        val x = t * stepPx
+                                        val isSecondMark = t % safeFps == 0
+                                        val isHalfSec = (t * 2) % safeFps == 0
+                                        val tickH = when {
+                                            isSecondMark -> size.height * 0.72f
+                                            isHalfSec -> size.height * 0.45f
+                                            else -> size.height * 0.25f
+                                        }
+                                        drawLine(
+                                            color = if (isSecondMark) secondaryAccent.copy(alpha = 0.9f) else textColor.copy(alpha = 0.35f),
+                                            start = Offset(x, size.height - tickH),
+                                            end = Offset(x, size.height),
+                                            strokeWidth = if (isSecondMark) 1.6f else 1f
+                                        )
                                     }
                                 }
+                                val totalSecMarks = ((minRulerTicks - 1) / safeFps).coerceAtLeast(0)
+                                for (sec in 0..totalSecMarks) {
+                                    val xDp = (sec * safeFps * dpPerTick).dp
+                                    Text(
+                                        text = "${sec}s",
+                                        fontSize = 8.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = secondaryAccent.copy(alpha = 0.9f),
+                                        modifier = Modifier.offset(x = xDp + 2.dp, y = 1.dp)
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(2.dp))
+
+                            // 2. Decoupled Per-Timeline-Layer Cel Tracks (stretch & move independently!)
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = tracksBoxMaxH.dp)
+                                    .verticalScroll(tracksVerticalScrollState),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                effectiveLayers.indices.reversed().forEach { lIdx ->
+                                    val layerCels = remember(trackProject, lIdx) {
+                                        TimelineTrackEngine.computeLayerCels(trackProject, lIdx)
+                                    }
+                                    val isActiveLayer = lIdx == activeLayerIndex
+
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height((rowH - 2f).dp)
+                                            .clip(RoundedCornerShape(5.dp))
+                                            .background(
+                                                if (isActiveLayer) bgColor.copy(alpha = 0.7f) else bgColor.copy(alpha = 0.42f)
+                                            )
+                                            .pointerInput(lIdx, trackProject, safeFps, minRulerTicks) {
+                                                val tickPx = with(density) { dpPerTick.dp.toPx() }.coerceAtLeast(1f)
+                                                detectTapGestures { tapOffset ->
+                                                    val tick = (tapOffset.x / tickPx).toInt().coerceIn(0, (minRulerTicks - 1).coerceAtLeast(0))
+                                                    onAddCelAtTick(lIdx, tick)
+                                                }
+                                            }
+                                    ) {
+                                        layerCels.forEach { cel ->
+                                            val isDraggingThis = draggingCel == (lIdx to cel.frameIndex)
+                                            val isMovingThis = movingCel == (lIdx to cel.frameIndex)
+                                            val displayDur = if (isDraggingThis && liveDraggingHold != null) {
+                                                liveDraggingHold!!
+                                            } else {
+                                                cel.durationTicks
+                                            }
+                                            val displayStart = if (isMovingThis && liveMoveTick != null) {
+                                                liveMoveTick!!
+                                            } else {
+                                                cel.startTick
+                                            }
+                                            val isTickCovered = currentTimelineTick in cel.startTick until cel.endTickExclusive
+                                            val isSelected = isActiveLayer && (cel.frameIndex == currentFrameIndex || isTickCovered)
+                                            val strokeCount = cel.layer.strokes.size
+                                            val cellWidthDp = (displayDur * dpPerTick - 2f).coerceAtLeast(24f).dp
+                                            val borderColor = when {
+                                                isMovingThis -> NeonGreen
+                                                isSelected -> accentColor
+                                                isTickCovered -> secondaryAccent.copy(alpha = 0.7f)
+                                                else -> subtleBorder
+                                            }
+                                            val cellBg = when {
+                                                isMovingThis -> NeonGreen.copy(alpha = 0.25f)
+                                                isSelected -> accentColor.copy(alpha = 0.30f)
+                                                isTickCovered -> secondaryAccent.copy(alpha = 0.14f)
+                                                else -> panelColor.copy(alpha = 0.75f)
+                                            }
+
+                                            Box(
+                                                modifier = Modifier
+                                                    .offset(x = (displayStart * dpPerTick).dp)
+                                                    .width(cellWidthDp)
+                                                    .fillMaxHeight()
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(cellBg)
+                                                    .border(if (isSelected || isMovingThis) 1.4.dp else 0.7.dp, borderColor, RoundedCornerShape(5.dp))
+                                                    .pointerInput(lIdx, cel.frameIndex, cel.startTick) {
+                                                        var accum = 0f
+                                                        val tickPx = with(density) { dpPerTick.dp.toPx() }.coerceAtLeast(1f)
+                                                        detectDragGesturesAfterLongPress(
+                                                            onDragStart = {
+                                                                accum = 0f
+                                                                movingCel = lIdx to cel.frameIndex
+                                                                liveMoveTick = cel.startTick
+                                                            },
+                                                            onDrag = { change, dragAmount ->
+                                                                change.consume()
+                                                                accum += dragAmount.x
+                                                                val deltaTicks = (accum / tickPx).roundToInt()
+                                                                liveMoveTick = (cel.startTick + deltaTicks).coerceIn(0, 4096)
+                                                            },
+                                                            onDragEnd = {
+                                                                val dest = liveMoveTick ?: cel.startTick
+                                                                movingCel = null
+                                                                liveMoveTick = null
+                                                                if (dest != cel.startTick) {
+                                                                    onMoveLayerCel(lIdx, cel.frameIndex, dest)
+                                                                }
+                                                            },
+                                                            onDragCancel = {
+                                                                movingCel = null
+                                                                liveMoveTick = null
+                                                            }
+                                                        )
+                                                    }
+                                                    .clickable {
+                                                        onSelectLayerCel(lIdx, cel.frameIndex, cel.startTick)
+                                                        if (editingLayerIdx == lIdx && editingFrameIdx == cel.frameIndex && showTimingTray) {
+                                                            showTimingTray = false
+                                                        } else {
+                                                            editingLayerIdx = lIdx
+                                                            editingFrameIdx = cel.frameIndex
+                                                            draftHold = cel.durationTicks
+                                                            showTimingTray = true
+                                                        }
+                                                    }
+                                                    .then(
+                                                        if (lIdx == activeLayerIndex) Modifier.testTag("timeline_frame_${cel.frameIndex}")
+                                                        else Modifier.testTag("timeline_layer_${lIdx}_cel_${cel.frameIndex}")
+                                                    )
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier
+                                                        .align(Alignment.Center)
+                                                        .padding(start = 3.dp, end = 9.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                                                ) {
+                                                    Text(
+                                                        text = "${cel.frameIndex + 1}",
+                                                        fontSize = 10.sp,
+                                                        fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
+                                                        color = if (isSelected) accentColor else textColor
+                                                    )
+                                                    if (displayDur > 1) {
+                                                        Text(
+                                                            text = "${displayDur}q",
+                                                            fontSize = 8.5.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = secondaryAccent
+                                                        )
+                                                    }
+                                                    if (strokeCount > 0) {
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .size(4.dp)
+                                                                .clip(CircleShape)
+                                                                .background(if (isSelected) accentColor else textColor.copy(alpha = 0.45f))
+                                                        )
+                                                    }
+                                                }
+
+                                                // Independent right-edge stretch handle (stretches ONLY this cel on this layer!)
+                                                Box(
+                                                    modifier = Modifier
+                                                        .align(Alignment.CenterEnd)
+                                                        .width(10.dp)
+                                                        .fillMaxHeight()
+                                                        .background(
+                                                            if (isDraggingThis || isSelected) secondaryAccent.copy(alpha = 0.35f)
+                                                            else textColor.copy(alpha = 0.08f)
+                                                        )
+                                                        .pointerInput(lIdx, cel.frameIndex, cel.durationTicks) {
+                                                            var accum = 0f
+                                                            val tickPx = with(density) { dpPerTick.dp.toPx() }.coerceAtLeast(1f)
+                                                            detectHorizontalDragGestures(
+                                                                onDragStart = {
+                                                                    accum = 0f
+                                                                    draggingCel = lIdx to cel.frameIndex
+                                                                    liveDraggingHold = cel.durationTicks
+                                                                },
+                                                                onHorizontalDrag = { change, dragAmount ->
+                                                                    change.consume()
+                                                                    accum += dragAmount
+                                                                    val delta = (accum / tickPx).roundToInt()
+                                                                    liveDraggingHold = (cel.durationTicks + delta).coerceIn(1, 240)
+                                                                },
+                                                                onDragEnd = {
+                                                                    val finalHold = liveDraggingHold ?: cel.durationTicks
+                                                                    draggingCel = null
+                                                                    liveDraggingHold = null
+                                                                    if (finalHold != cel.durationTicks) {
+                                                                        onSetLayerCelHold(lIdx, cel.frameIndex, finalHold)
+                                                                    }
+                                                                },
+                                                                onDragCancel = {
+                                                                    draggingCel = null
+                                                                    liveDraggingHold = null
+                                                                }
+                                                            )
+                                                        }
+                                                        .testTag("mobile_stretch_${lIdx}_${cel.frameIndex}"),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .width(2.dp)
+                                                            .height(10.dp)
+                                                            .clip(RoundedCornerShape(1.dp))
+                                                            .background(if (isSelected) secondaryAccent else textColor.copy(alpha = 0.45f))
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Audio Track Row ("Gravetinhos") for Lip-Sync visual reference when audio is present
+                            if (audioAsset != null) {
+                                Spacer(modifier = Modifier.height(3.dp))
+                                val audioWidthDp = (((audioAsset.durationSeconds.coerceAtLeast(1.0) * safeFps) * dpPerTick)
+                                    .toFloat()
+                                    .coerceIn(80f, totalTrackWidthDp)).dp
+                                Box(
+                                    modifier = Modifier
+                                        .width(audioWidthDp)
+                                        .height(22.dp)
+                                        .clip(RoundedCornerShape(5.dp))
+                                        .background(NeonGreen.copy(alpha = 0.14f))
+                                        .border(0.8.dp, NeonGreen.copy(alpha = 0.55f), RoundedCornerShape(5.dp))
+                                        .testTag("mobile_audio_waveform_track")
+                                ) {
+                                    val peaks = audioAsset.waveformPeaks
+                                    Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 3.dp, vertical = 2.dp)) {
+                                        val count = peaks.size.coerceAtLeast(24)
+                                        val barW = (size.width / count).coerceAtLeast(1.5f)
+                                        val midY = size.height * 0.5f
+                                        for (i in 0 until count) {
+                                            val amp = if (peaks.isNotEmpty()) peaks[i % peaks.size].coerceIn(0.06f, 1f) else 0.25f
+                                            val halfH = (amp * size.height * 0.48f).coerceAtLeast(1.5f)
+                                            val x = i * barW + barW * 0.4f
+                                            drawLine(
+                                                color = if (audioAsset.audioMuted) Color.Gray else NeonGreen.copy(alpha = 0.9f),
+                                                start = Offset(x, midY - halfH),
+                                                end = Offset(x, midY + halfH),
+                                                strokeWidth = max(1.4f, barW * 0.58f)
+                                            )
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier
+                                            .align(Alignment.CenterStart)
+                                            .padding(horizontal = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Audiotrack,
+                                            contentDescription = null,
+                                            tint = NeonGreen,
+                                            modifier = Modifier.size(10.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // Cyan Playhead "Pinça" Needle spanning ruler + all layer tracks + audio track (draggable for scrubbing)
+                        Box(
+                            modifier = Modifier
+                                .offset { IntOffset((pinçaXPosPx - 10f).roundToInt(), 0) }
+                                .width(20.dp)
+                                .height(totalPinçaHeightDp.dp)
                                 .pointerInput(safeFps, totalTrackWidthPx) {
                                     detectHorizontalDragGestures(
-                                        onDragStart = { startPos ->
+                                        onDragStart = {
                                             val pxPerSec = safeFps * with(density) { dpPerTick.dp.toPx() }
-                                            val ms = ((startPos.x / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
+                                            val ms = ((pinçaXPosPx / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
                                             onScrubToMs(ms)
                                         },
-                                        onHorizontalDrag = { change, _ ->
+                                        onHorizontalDrag = { change, dragAmount ->
                                             change.consume()
                                             val pxPerSec = safeFps * with(density) { dpPerTick.dp.toPx() }
-                                            val ms = ((change.position.x / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
+                                            val currentPx = (currentTimeMs / 1000f) * pxPerSec
+                                            val nextPx = (currentPx + dragAmount).coerceIn(0f, totalTrackWidthPx)
+                                            val ms = ((nextPx / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
                                             onScrubToMs(ms)
                                         },
                                         onDragEnd = { onEndScrub() },
                                         onDragCancel = { onEndScrub() }
                                     )
                                 }
-                                .testTag("mobile_timeline_ruler")
+                                .testTag("mobile_timeline_pinca")
                         ) {
                             Canvas(modifier = Modifier.fillMaxSize()) {
-                                val stepPx = with(density) { dpPerTick.dp.toPx() }
-                                val totalMarks = (size.width / stepPx).toInt().coerceAtLeast(1)
-                                for (t in 0..totalMarks) {
-                                    val x = t * stepPx
-                                    val isSecondMark = t % safeFps == 0
-                                    val isHalfSec = (t * 2) % safeFps == 0
-                                    val tickH = when {
-                                        isSecondMark -> size.height * 0.72f
-                                        isHalfSec -> size.height * 0.45f
-                                        else -> size.height * 0.25f
-                                    }
-                                    drawLine(
-                                        color = if (isSecondMark) secondaryAccent.copy(alpha = 0.9f) else textColor.copy(alpha = 0.35f),
-                                        start = Offset(x, size.height - tickH),
-                                        end = Offset(x, size.height),
-                                        strokeWidth = if (isSecondMark) 1.6f else 1f
-                                    )
+                                val cx = size.width * 0.5f
+                                val headPath = Path().apply {
+                                    moveTo(cx - 7f, 0f)
+                                    lineTo(cx + 7f, 0f)
+                                    lineTo(cx + 7f, 9f)
+                                    lineTo(cx, 16f)
+                                    lineTo(cx - 7f, 9f)
+                                    close()
                                 }
-                            }
-                            val totalSecMarks = (timelineTotalMs / 1000L).toInt().coerceAtLeast(0)
-                            for (sec in 0..totalSecMarks) {
-                                val xDp = (sec * safeFps * dpPerTick).dp
-                                Text(
-                                    text = "${sec}s",
-                                    fontSize = 8.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = secondaryAccent.copy(alpha = 0.9f),
-                                    modifier = Modifier
-                                        .offset(x = xDp + 2.dp, y = 1.dp)
+                                drawPath(headPath, color = secondaryAccent)
+                                drawLine(
+                                    color = secondaryAccent,
+                                    start = Offset(cx, 15f),
+                                    end = Offset(cx, size.height),
+                                    strokeWidth = 2.4f
                                 )
                             }
-                        }
-
-                        Spacer(modifier = Modifier.height(2.dp))
-
-                        // 2. Proportional Frames Track (width grows/shrinks based on holdFrames)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(38.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(gapDp.dp)
-                        ) {
-                            frames.forEachIndexed { index, frame ->
-                                val isSelected = index == currentFrameIndex
-                                val hold = max(1, frame.holdFrames)
-                                val cellWidthDp = (hold * dpPerTick).coerceIn(34f, 408f).dp
-                                val strokeCount = frame.layers.sumOf { it.strokes.size } + frame.localLayers.sumOf { it.strokes.size }
-                                val borderColor by animateColorAsState(
-                                    targetValue = if (isSelected) accentColor else subtleBorder,
-                                    label = "frameBorderColor"
-                                )
-                                val cellBg = if (isSelected) accentColor.copy(alpha = 0.28f) else bgColor.copy(alpha = 0.6f)
-
-                                Box(
-                                    modifier = Modifier
-                                        .width(cellWidthDp)
-                                        .height(38.dp)
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(cellBg)
-                                        .border(if (isSelected) 1.5.dp else 0.7.dp, borderColor, RoundedCornerShape(6.dp))
-                                        .clickable {
-                                            onSelectFrame(index)
-                                            if (editingFrameIdx == index && showTimingTray) {
-                                                showTimingTray = false
-                                            } else {
-                                                editingFrameIdx = index
-                                                draftHold = hold
-                                                showTimingTray = true
-                                            }
-                                        }
-                                        .testTag("timeline_frame_$index"),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(3.dp),
-                                        modifier = Modifier.padding(horizontal = 4.dp)
-                                    ) {
-                                        Text(
-                                            text = "${index + 1}",
-                                            fontSize = 12.sp,
-                                            fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
-                                            color = if (isSelected) accentColor else textColor
-                                        )
-                                        if (hold > 1) {
-                                            Text(
-                                                text = "${hold}q",
-                                                fontSize = 9.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = secondaryAccent
-                                            )
-                                        }
-                                        if (strokeCount > 0) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .size(4.dp)
-                                                    .clip(CircleShape)
-                                                    .background(if (isSelected) accentColor else textColor.copy(alpha = 0.45f))
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 3. Audio Track Row ("Gravetinhos") for Lip-Sync visual reference when audio is present
-                        if (audioAsset != null) {
-                            Spacer(modifier = Modifier.height(3.dp))
-                            val audioWidthDp = (((audioAsset.durationSeconds.coerceAtLeast(1.0) * safeFps) * dpPerTick)
-                                .toFloat()
-                                .coerceIn(80f, totalTrackWidthDp)).dp
-                            Box(
-                                modifier = Modifier
-                                    .width(audioWidthDp)
-                                    .height(22.dp)
-                                    .clip(RoundedCornerShape(5.dp))
-                                    .background(NeonGreen.copy(alpha = 0.14f))
-                                    .border(0.8.dp, NeonGreen.copy(alpha = 0.55f), RoundedCornerShape(5.dp))
-                                    .testTag("mobile_audio_waveform_track")
-                            ) {
-                                val peaks = audioAsset.waveformPeaks
-                                Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 3.dp, vertical = 2.dp)) {
-                                    val count = peaks.size.coerceAtLeast(24)
-                                    val barW = (size.width / count).coerceAtLeast(1.5f)
-                                    val midY = size.height * 0.5f
-                                    for (i in 0 until count) {
-                                        val amp = if (peaks.isNotEmpty()) peaks[i % peaks.size].coerceIn(0.06f, 1f) else 0.25f
-                                        val halfH = (amp * size.height * 0.48f).coerceAtLeast(1.5f)
-                                        val x = i * barW + barW * 0.4f
-                                        drawLine(
-                                            color = if (audioAsset.audioMuted) Color.Gray else NeonGreen.copy(alpha = 0.9f),
-                                            start = Offset(x, midY - halfH),
-                                            end = Offset(x, midY + halfH),
-                                            strokeWidth = max(1.4f, barW * 0.58f)
-                                        )
-                                    }
-                                }
-                                Row(
-                                    modifier = Modifier
-                                        .align(Alignment.CenterStart)
-                                        .padding(horizontal = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        Icons.Default.Audiotrack,
-                                        contentDescription = null,
-                                        tint = NeonGreen,
-                                        modifier = Modifier.size(10.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // Cyan Playhead "Pinça" Needle spanning ruler + frames + audio track (draggable for audio scrubbing)
-                    val trackHeightDp = if (audioAsset != null) 85.dp else 60.dp
-                    Box(
-                        modifier = Modifier
-                            .offset { IntOffset((pinçaXPosPx - 10f).roundToInt(), 0) }
-                            .width(20.dp)
-                            .height(trackHeightDp)
-                            .pointerInput(safeFps, totalTrackWidthPx) {
-                                detectHorizontalDragGestures(
-                                    onDragStart = {
-                                        val pxPerSec = safeFps * with(density) { dpPerTick.dp.toPx() }
-                                        val ms = ((pinçaXPosPx / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
-                                        onScrubToMs(ms)
-                                    },
-                                    onHorizontalDrag = { change, dragAmount ->
-                                        change.consume()
-                                        val pxPerSec = safeFps * with(density) { dpPerTick.dp.toPx() }
-                                        val currentPx = (currentTimeMs / 1000f) * pxPerSec
-                                        val nextPx = (currentPx + dragAmount).coerceIn(0f, totalTrackWidthPx)
-                                        val ms = ((nextPx / pxPerSec.coerceAtLeast(1f)) * 1000f).toLong().coerceAtLeast(0L)
-                                        onScrubToMs(ms)
-                                    },
-                                    onDragEnd = { onEndScrub() },
-                                    onDragCancel = { onEndScrub() }
-                                )
-                            }
-                            .testTag("mobile_timeline_pinca")
-                    ) {
-                        Canvas(modifier = Modifier.fillMaxSize()) {
-                            val cx = size.width * 0.5f
-                            val headPath = Path().apply {
-                                moveTo(cx - 7f, 0f)
-                                lineTo(cx + 7f, 0f)
-                                lineTo(cx + 7f, 9f)
-                                lineTo(cx, 16f)
-                                lineTo(cx - 7f, 9f)
-                                close()
-                            }
-                            drawPath(headPath, color = secondaryAccent)
-                            drawLine(
-                                color = secondaryAccent,
-                                start = Offset(cx, 15f),
-                                end = Offset(cx, size.height),
-                                strokeWidth = 2.4f
-                            )
                         }
                     }
                 }

@@ -4,13 +4,16 @@ import android.graphics.Bitmap
 import android.graphics.Canvas as AndroidCanvas
 import android.graphics.Color as AndroidColor
 import android.graphics.DashPathEffect
+import android.graphics.LinearGradient
 import android.graphics.Matrix as AndroidMatrix
 import android.graphics.Paint as AndroidPaint
 import android.graphics.Path as AndroidPath
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
+import android.graphics.RadialGradient
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Shader
 import android.view.MotionEvent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
@@ -38,6 +41,7 @@ import androidx.compose.material.icons.filled.CenterFocusWeak
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.Loop
 import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.Videocam
@@ -84,13 +88,17 @@ import com.example.engine.HardwareCapabilitiesEngine
 import com.example.engine.KodanimaBitmapPool
 import com.example.engine.KodanimaGraphicsEngine
 import com.example.engine.MediaAssetManager
+import com.example.engine.ProjectedObjectBounds
 import com.example.engine.SelectionGeometryHelper
+import com.example.engine.TimelineTrackEngine
 import com.example.model.AnimationProject
 import com.example.model.BezierNode
 import com.example.model.Camera3DKeyframe
 import com.example.model.Camera3DSettings
 import com.example.model.CameraMode
 import com.example.model.CameraToolAction
+import com.example.model.CameraViewportNavTarget
+import com.example.model.Canvas3DBackgroundRenderMode
 import com.example.model.CanvasBackgroundSettings
 import com.example.model.CanvasBackgroundStyle
 import com.example.model.DrawingStroke
@@ -104,8 +112,11 @@ import com.example.model.PerspectiveRulerSettings
 import com.example.model.PressureCurve
 import com.example.model.PressureMode
 import com.example.model.ReferenceImageState
+import com.example.model.SceneObject3D
 import com.example.model.SelectionRegion
 import com.example.model.SkyBackdropMode
+import com.example.model.StageSelection
+import com.example.model.StageTargetType
 import com.example.model.StrokePoint
 import com.example.model.TabletDriverSettings
 import com.example.model.ToolType
@@ -133,6 +144,12 @@ private class CanvasBitmapCache {
         val layer: Layer,
         val bitmap: Bitmap,
         val key: LayerSliceCacheKey
+    )
+
+    data class Stage3DObjectCacheEntry(
+        val bitmap: Bitmap,
+        val bounds: ProjectedObjectBounds?,
+        val key: Any?
     )
 
     var cacheW: Int = 0
@@ -167,10 +184,23 @@ private class CanvasBitmapCache {
     // Per-layer cached transparent bitmaps for real 3D Stage viewport
     val stage3DLayerBitmaps: MutableMap<String, Bitmap> = mutableMapOf()
     val stage3DLayerKeys: MutableMap<String, LayerSliceCacheKey> = mutableMapOf()
+    val stage3DObjectEntries: MutableMap<String, Stage3DObjectCacheEntry> = mutableMapOf()
     var stage3DBgBitmap: Bitmap? = null
     var stage3DBgKey: Any? = null
     var stage3DPovBitmap: Bitmap? = null
     var stage3DPovKey: Any? = null
+
+    // "Mostrar 3D no Canvas" cached background bitmaps (Static 2D, Play pre-render frames, Real-time 3D)
+    var canvas3DBgStaticBitmap: Bitmap? = null
+    var canvas3DBgStaticKey: Any? = null
+    val canvas3DBgPlayFrames: LinkedHashMap<Int, Bitmap> = LinkedHashMap()
+    var canvas3DBgPlayKey: Any? = null
+    var canvas3DBgRealtimeBitmap: Bitmap? = null
+    var canvas3DBgRealtimeKey: Any? = null
+
+    // Full-screen off-canvas 3D scene cache (matches active camera view outside paper bounds)
+    var offCanvas3DBitmap: Bitmap? = null
+    var offCanvas3DKey: Any? = null
 
     fun ensureSize(w: Int, h: Int) {
         if (w == cacheW && h == cacheH) return
@@ -286,12 +316,32 @@ private class CanvasBitmapCache {
         stage3DLayerBitmaps.values.forEach { KodanimaBitmapPool.release(it) }
         stage3DLayerBitmaps.clear()
         stage3DLayerKeys.clear()
+        stage3DObjectEntries.values.forEach { KodanimaBitmapPool.release(it.bitmap) }
+        stage3DObjectEntries.clear()
         KodanimaBitmapPool.release(stage3DBgBitmap)
         stage3DBgBitmap = null
         stage3DBgKey = null
         KodanimaBitmapPool.release(stage3DPovBitmap)
         stage3DPovBitmap = null
         stage3DPovKey = null
+    }
+
+    fun releaseOffCanvas3D() {
+        KodanimaBitmapPool.release(offCanvas3DBitmap)
+        offCanvas3DBitmap = null
+        offCanvas3DKey = null
+    }
+
+    fun releaseCanvas3DBg() {
+        KodanimaBitmapPool.release(canvas3DBgStaticBitmap)
+        canvas3DBgStaticBitmap = null
+        canvas3DBgStaticKey = null
+        canvas3DBgPlayFrames.values.forEach { KodanimaBitmapPool.release(it) }
+        canvas3DBgPlayFrames.clear()
+        canvas3DBgPlayKey = null
+        KodanimaBitmapPool.release(canvas3DBgRealtimeBitmap)
+        canvas3DBgRealtimeBitmap = null
+        canvas3DBgRealtimeKey = null
     }
 
     fun releaseAll() {
@@ -302,6 +352,8 @@ private class CanvasBitmapCache {
         KodanimaBitmapPool.release(aboveLayersBitmap); aboveLayersBitmap = null; aboveKey = null
         clearAboveAdvanced()
         releaseStage3D()
+        releaseCanvas3DBg()
+        releaseOffCanvas3D()
         endActiveSessions()
         cacheW = 0
         cacheH = 0
@@ -316,7 +368,7 @@ private class LiveViewportTransform(
 )
 
 private data class OnionCacheKey(
-    val frameIndex: Int,
+    val timelineTick: Int,
     val enabled: Boolean,
     val settings: OnionSkinSettings,
     val prevLayers: List<List<Layer>>,
@@ -446,6 +498,113 @@ private class CanvasOverlayScratch {
     ).apply {
         xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
     }
+
+    // Reusable checkerboard & post-effect / viewfinder paints (zero draw-frame allocations)
+    val checkerLightPaint = AndroidPaint().apply {
+        color = AndroidColor.rgb(245, 246, 250)
+        style = AndroidPaint.Style.FILL
+    }
+    val checkerDarkPaint = AndroidPaint().apply {
+        color = AndroidColor.rgb(212, 217, 228)
+        style = AndroidPaint.Style.FILL
+    }
+    val fxSepiaPaint = AndroidPaint().apply { style = AndroidPaint.Style.FILL }
+    val fxBloomPaint = AndroidPaint()
+    var fxBloomKeyW = -1f
+    var fxBloomKeyH = -1f
+    var fxBloomKeyAlpha = -1
+    val fxChromaticPaint = AndroidPaint().apply { style = AndroidPaint.Style.STROKE }
+    val fxVignettePaint = AndroidPaint()
+    var fxVignetteKeyW = -1f
+    var fxVignetteKeyH = -1f
+    var fxVignetteKeyAlpha = -1
+
+    val camOutsideMaskPaint = AndroidPaint().apply {
+        color = AndroidColor.argb(115, 8, 12, 22)
+        style = AndroidPaint.Style.FILL
+    }
+    val camOuterBorderPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.argb(165, 92, 110, 140)
+        style = AndroidPaint.Style.STROKE
+    }
+    val camActiveBorderPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.rgb(41, 121, 255)
+        style = AndroidPaint.Style.STROKE
+    }
+    val camSafeBoxPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.argb(150, 0, 210, 255)
+        style = AndroidPaint.Style.STROKE
+    }
+    val camCornerPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.rgb(255, 145, 0)
+        style = AndroidPaint.Style.STROKE
+    }
+    val camBadgeBgPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.argb(205, 16, 20, 34)
+        style = AndroidPaint.Style.FILL
+    }
+    val camBadgeTextPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.WHITE
+        isFakeBoldText = true
+    }
+
+    // Reusable 3D Stage & Camera POV viewport paints, geometry buffers & matrices
+    val povMattePaint = AndroidPaint()
+    var povMatteKeyH = -1f
+    val povFramePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.rgb(255, 167, 38)
+        style = AndroidPaint.Style.STROKE
+    }
+    val povInfoPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.WHITE
+        isFakeBoldText = true
+    }
+    val stageGridPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.STROKE }
+    val stageOriginPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.argb(190, 255, 167, 38)
+        style = AndroidPaint.Style.STROKE
+    }
+    val stagePolyMatrix = AndroidMatrix()
+    val stageSrcPts = FloatArray(8)
+    val stageDstPts = FloatArray(8)
+    val stageLayerBmpPaint = AndroidPaint(
+        AndroidPaint.ANTI_ALIAS_FLAG or AndroidPaint.FILTER_BITMAP_FLAG or AndroidPaint.DITHER_FLAG
+    )
+    val stageCardStrokePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.STROKE }
+    val stageLabelPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.WHITE
+        isFakeBoldText = true
+    }
+    val stageLabelBgPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.argb(175, 14, 17, 24)
+        style = AndroidPaint.Style.FILL
+    }
+    val stageCardPath = AndroidPath()
+    val stageRayPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.STROKE }
+    var stageRayDashDensity = -1f
+    val stageFrustumStrokePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.STROKE }
+    val stageFrustumFillPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.argb(230, 255, 145, 0)
+        style = AndroidPaint.Style.FILL
+    }
+    val stageGizmoPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.STROKE }
+    val stageGizmoHandleFillPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.FILL }
+    val stageGizmoTextPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.WHITE
+        isFakeBoldText = true
+        textAlign = AndroidPaint.Align.CENTER
+    }
+    val stageSelObjStrokePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.rgb(0, 230, 118)
+        style = AndroidPaint.Style.STROKE
+    }
+    val stageAxisLinePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG)
+    val stageAxisDotPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.FILL }
+    val stageAxisTextPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.WHITE
+        isFakeBoldText = true
+        textAlign = AndroidPaint.Align.CENTER
+    }
 }
 
 @OptIn(ExperimentalComposeUiApi::class)
@@ -518,7 +677,15 @@ fun CanvasView(
     isCameraModeActive: Boolean = false,
     cameraToolAction: CameraToolAction = CameraToolAction.PAN_2D,
     onCameraTransformDelta: ((dx: Float, dy: Float, zoomFactor: Float, rotDelta: Float, fovDelta: Float, dYaw: Float, dPitch: Float) -> Unit)? = null,
+    cameraViewportNavTarget: CameraViewportNavTarget = CameraViewportNavTarget.CAMERA,
+    stageSelection: StageSelection = StageSelection(),
+    stageFocusNonce: Int = 0,
+    onStageTargetSelected: ((StageSelection) -> Unit)? = null,
+    onSelectedStageObjectDelta: ((dx: Float, dy: Float, dz: Float, dRotX: Float, dRotY: Float, dRotZ: Float, scaleFactor: Float) -> Unit)? = null,
     theme: KodanimaTheme = KodanimaTheme.ROXO_BLACK,
+    currentTimelineTick: Int = currentFrameIndex,
+    playbackTimeMs: Long? = null,
+    isPlaying: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val currentPoints = remember { mutableStateListOf<StrokePoint>() }
@@ -562,10 +729,14 @@ fun CanvasView(
     val videoAsset = remember(project.mediaAssets) {
         project.mediaAssets.firstOrNull { it.type == "video" || it.type == "gif" }
     }
-    val effectiveMediaTimeMs = remember(activeScrubTimeMs, project.frames, currentFrameIndex, project.fps) {
-        activeScrubTimeMs ?: MediaAssetManager.computeTimeMsForFrame(
-            project.frames,
-            currentFrameIndex,
+    val effectiveTickFloat = remember(activeScrubTimeMs, playbackTimeMs, currentTimelineTick, project.fps) {
+        (activeScrubTimeMs ?: playbackTimeMs)?.let {
+            TimelineTrackEngine.timeMsToTickFloat(it, project.fps)
+        } ?: currentTimelineTick.toFloat()
+    }
+    val effectiveMediaTimeMs = remember(activeScrubTimeMs, playbackTimeMs, currentTimelineTick, project.fps) {
+        activeScrubTimeMs ?: playbackTimeMs ?: TimelineTrackEngine.tickToTimeMs(
+            currentTimelineTick,
             project.fps
         )
     }
@@ -612,11 +783,17 @@ fun CanvasView(
     var isDraggingStage3DCam by remember { mutableStateOf(false) }
     var active3DGizmoAxis by remember { mutableIntStateOf(0) } // 0=none, 1=X, 2=Y, 3=Z, 4=Free
     var lastOrbitTouchPos by remember { mutableStateOf(Offset.Zero) }
+    var stage3DDownPos by remember { mutableStateOf(Offset.Zero) }
+    var stage3DMovedPastSlop by remember { mutableStateOf(false) }
     val stage3DGizmo = remember { Stage3DCamGizmoState() }
+    val stage3DObjectBounds = remember { HashMap<String, ProjectedObjectBounds>() }
+    val stage3DLayerBounds = remember { HashMap<String, RectF>() }
 
-    // Camera Mode 1-finger drag state
+    // Camera Mode 1-finger drag state & Canvas-navigation pan in 2D Camera mode
     var isDraggingCameraTool by remember { mutableStateOf(false) }
     var lastCameraDragPos by remember { mutableStateOf(Offset.Zero) }
+    var isCameraCanvasPanning by remember { mutableStateOf(false) }
+    var lastCamCanvasPanPos by remember { mutableStateOf(Offset.Zero) }
 
     // PC Middle-mouse / Alt+Drag temporary viewport pan
     var isMiddleMousePanning by remember { mutableStateOf(false) }
@@ -684,7 +861,15 @@ fun CanvasView(
     val cacheH = (project.resolution.height * cacheScale).roundToInt().coerceAtLeast(1)
 
     // Precompute cached offscreen bitmaps cleanly before DrawScope
-    val currFrame = project.frames.getOrNull(currentFrameIndex)
+    val currFrame = remember(project, currentTimelineTick, activeLayerIndex, currentFrameIndex) {
+        if (project.frames.isEmpty()) null
+        else TimelineTrackEngine.composeFrameAtTick(
+            project = project,
+            tick = currentTimelineTick,
+            activeLayerIndex = activeLayerIndex,
+            fallbackFrameIndex = currentFrameIndex
+        )
+    }
     val timelineLayers = currFrame?.layers ?: emptyList()
     val localLayers = currFrame?.localLayers ?: emptyList()
     val combinedLayers = remember(timelineLayers, localLayers) { timelineLayers + localLayers }
@@ -709,10 +894,11 @@ fun CanvasView(
         } else null
     }
 
-    // Rebuild static caches only when underlying frame/layer/onion skin/selection split changes (ZERO work on pan/zoom/move)
+    // Rebuild static caches only when underlying frame/layer/onion skin/selection split changes (ZERO work on pan/zoom/move or sub-tick playback interpolation)
     LaunchedEffect(
         cacheW,
         cacheH,
+        currentTimelineTick,
         currentFrameIndex,
         activeGlobalLayerIdx,
         currFrame,
@@ -720,6 +906,7 @@ fun CanvasView(
         project.onionSkin,
         project.canvasBackground,
         project.camera3D,
+        isCameraModeActive,
         isCameraSideView3D,
         stage3DMode,
         densityMult,
@@ -729,20 +916,22 @@ fun CanvasView(
     ) {
         cacheHolder.ensureSize(cacheW, cacheH)
 
-        // 1. Onion Skin Cache (includes timeline layers + per-frame localLayers)
-        val prevList = if (onionSkinEnabled && project.onionSkin.isEnabled) {
-            (project.onionSkin.prevFramesCount downTo 1).mapNotNull { step ->
-                project.frames.getOrNull(currentFrameIndex - step)?.let { it.layers + it.localLayers }
+        // 1. Onion Skin Cache (per-layer independent cel stepping so stretched held cels never ghost over themselves)
+        val prevCount = project.onionSkin.prevFramesCount
+        val nextCount = project.onionSkin.nextFramesCount
+        val prevList = if (onionSkinEnabled && project.onionSkin.isEnabled && prevCount > 0) {
+            (prevCount downTo 1).map { step ->
+                TimelineTrackEngine.resolveOnionSkinLayersAtTick(project, currentTimelineTick, -step)
             }
         } else emptyList()
-        val nextList = if (onionSkinEnabled && project.onionSkin.isEnabled) {
-            (1..project.onionSkin.nextFramesCount).mapNotNull { step ->
-                project.frames.getOrNull(currentFrameIndex + step)?.let { it.layers + it.localLayers }
+        val nextList = if (onionSkinEnabled && project.onionSkin.isEnabled && nextCount > 0) {
+            (1..nextCount).map { step ->
+                TimelineTrackEngine.resolveOnionSkinLayersAtTick(project, currentTimelineTick, step)
             }
         } else emptyList()
 
         val oKey = OnionCacheKey(
-            currentFrameIndex,
+            currentTimelineTick,
             onionSkinEnabled && project.onionSkin.isEnabled,
             project.onionSkin,
             prevList,
@@ -753,16 +942,14 @@ fun CanvasView(
         )
         if (cacheHolder.onionKey != oKey) {
             val bmp = cacheHolder.acquireOrReuse(cacheHolder.onionBitmap, AndroidColor.TRANSPARENT)
-            if (oKey.enabled && (prevList.isNotEmpty() || nextList.isNotEmpty())) {
+            if (oKey.enabled && (prevList.any { it.isNotEmpty() } || nextList.any { it.isNotEmpty() })) {
                 val c = AndroidCanvas(bmp)
                 c.scale(cacheScale, cacheScale)
                 val onionOpacity = project.onionSkin.opacity
 
                 val prevFilter = KodanimaGraphicsEngine.createOnionSkinColorFilter(project.onionSkin.prevColor)
-                val prevCount = project.onionSkin.prevFramesCount
-                for (step in prevCount downTo 1) {
-                    val f = project.frames.getOrNull(currentFrameIndex - step) ?: continue
-                    val fLayers = f.layers + f.localLayers
+                prevList.forEachIndexed { idx, fLayers ->
+                    val step = prevCount - idx
                     val alpha = (onionOpacity * (1f - (step - 1) * 0.25f)).coerceAtLeast(0.1f)
                     for (l in fLayers) {
                         if (l.isVisible) {
@@ -775,10 +962,8 @@ fun CanvasView(
                 }
 
                 val nextFilter = KodanimaGraphicsEngine.createOnionSkinColorFilter(project.onionSkin.nextColor)
-                val nextCount = project.onionSkin.nextFramesCount
-                for (step in 1..nextCount) {
-                    val f = project.frames.getOrNull(currentFrameIndex + step) ?: continue
-                    val fLayers = f.layers + f.localLayers
+                nextList.forEachIndexed { idx, fLayers ->
+                    val step = idx + 1
                     val alpha = (onionOpacity * (1f - (step - 1) * 0.25f)).coerceAtLeast(0.1f)
                     for (l in fLayers) {
                         if (l.isVisible) {
@@ -931,8 +1116,8 @@ fun CanvasView(
             cacheHolder.aboveAdvancedIsActive = true
         }
 
-        // 3. Per-layer transparent bitmaps + paper plane for interactive 3D Stage Viewport
-        if (isCameraSideView3D) {
+        // 3. Per-layer transparent bitmaps + paper plane for interactive 3D Stage & animated 2D Camera layers
+        if (isCameraSideView3D || isCameraModeActive) {
             val bgKey = Pair(project.canvasBackground, Pair(cacheW, cacheH))
             if (project.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE) {
                 KodanimaBitmapPool.release(cacheHolder.stage3DBgBitmap)
@@ -984,7 +1169,7 @@ fun CanvasView(
                 val maxPovDim = min(maxCacheDim, 1024).coerceAtLeast(320)
                 val povW = if (camAsp >= 1f) maxPovDim else (maxPovDim * camAsp).roundToInt().coerceAtLeast(160)
                 val povH = if (camAsp >= 1f) (maxPovDim / camAsp).roundToInt().coerceAtLeast(160) else maxPovDim
-                val povKey = listOf(currFrame, project.camera3D, currentFrameIndex, project.canvasBackground, povW, povH)
+                val povKey = listOf(currFrame, project.camera3D, currentTimelineTick, project.canvasBackground, povW, povH)
                 if (cacheHolder.stage3DPovKey != povKey || cacheHolder.stage3DPovBitmap?.isRecycled != false) {
                     val existingPov = cacheHolder.stage3DPovBitmap
                     val povBmp = if (existingPov != null && !existingPov.isRecycled && existingPov.width == povW && existingPov.height == povH) {
@@ -996,13 +1181,14 @@ fun CanvasView(
                     Camera3DEngine.renderFrameWithCameraAndEffects(
                         frame = currFrame,
                         settings = project.camera3D.copy(isEnabled = true),
-                        frameIndex = currentFrameIndex,
+                        frameIndex = currentTimelineTick,
                         projectWidth = project.resolution.width,
                         projectHeight = project.resolution.height,
                         targetBitmap = povBmp,
                         cropToCamera = true,
                         background = project.canvasBackground,
-                        renderTransparentAsSky = true
+                        renderTransparentAsSky = true,
+                        tickFloat = effectiveTickFloat
                     )
                     cacheHolder.stage3DPovBitmap = povBmp
                     cacheHolder.stage3DPovKey = povKey
@@ -1010,6 +1196,191 @@ fun CanvasView(
             }
         }
         activeStrokeVersion++
+    }
+
+    // "Mostrar 3D no Canvas": Static 2D cache & Pre-render on Play (tracks paused scrubbing tick without cancelling active playback cache)
+    val canvas3DPausedTickKey = if (isPlaying) -1 else currentTimelineTick
+    LaunchedEffect(
+        cacheW,
+        cacheH,
+        project.resolution,
+        project.canvasBackground,
+        project.camera3D,
+        project.fps,
+        isCameraSideView3D,
+        isPlaying,
+        canvas3DPausedTickKey
+    ) {
+        if (!project.canvasBackground.show3DInCanvas || isCameraSideView3D) {
+            if (cacheHolder.canvas3DBgStaticBitmap != null || cacheHolder.canvas3DBgPlayFrames.isNotEmpty() || cacheHolder.canvas3DBgRealtimeBitmap != null) {
+                cacheHolder.releaseCanvas3DBg()
+                activeStrokeVersion++
+            }
+            return@LaunchedEffect
+        }
+        val bgBaseKey = listOf(
+            cacheW,
+            cacheH,
+            project.resolution,
+            project.canvasBackground,
+            project.camera3D.scene3DObjects,
+            project.camera3D.keyframes,
+            project.camera3D.effectSpans,
+            project.camera3D.cameraMode,
+            project.camera3D.autoInterpolate,
+            project.camera3D.isEnabled,
+            project.camera3D.layerDepthSpacing,
+            project.fps
+        )
+        when (project.canvasBackground.canvas3DRenderMode) {
+            Canvas3DBackgroundRenderMode.STATIC_2D_CACHE -> {
+                val staticKey = Pair(bgBaseKey, canvas3DPausedTickKey)
+                val cachedPair = cacheHolder.canvas3DBgStaticKey as? Pair<*, *>
+                val sameBaseWhilePlaying = isPlaying &&
+                    cachedPair?.first == bgBaseKey &&
+                    cacheHolder.canvas3DBgStaticBitmap?.isRecycled == false
+                if (!sameBaseWhilePlaying && (cacheHolder.canvas3DBgStaticKey != staticKey || cacheHolder.canvas3DBgStaticBitmap?.isRecycled != false)) {
+                    val renderTick = if (isPlaying) 0f else effectiveTickFloat
+                    val bmp = withContext(Dispatchers.Default) {
+                        Camera3DEngine.renderCanvas3DBackgroundBitmap(
+                            outW = cacheW,
+                            outH = cacheH,
+                            project = project,
+                            tickFloat = renderTick,
+                            fps = project.fps,
+                            reuseBitmap = cacheHolder.canvas3DBgStaticBitmap
+                        )
+                    }
+                    cacheHolder.canvas3DBgStaticBitmap = bmp
+                    cacheHolder.canvas3DBgStaticKey = staticKey
+                    activeStrokeVersion++
+                }
+            }
+            Canvas3DBackgroundRenderMode.PRE_RENDER_ON_PLAY -> {
+                val staticKey = Pair(bgBaseKey, canvas3DPausedTickKey)
+                if (!isPlaying && (cacheHolder.canvas3DBgStaticKey != staticKey || cacheHolder.canvas3DBgStaticBitmap?.isRecycled != false)) {
+                    val bmp = withContext(Dispatchers.Default) {
+                        Camera3DEngine.renderCanvas3DBackgroundBitmap(
+                            outW = cacheW,
+                            outH = cacheH,
+                            project = project,
+                            tickFloat = effectiveTickFloat,
+                            fps = project.fps,
+                            reuseBitmap = cacheHolder.canvas3DBgStaticBitmap
+                        )
+                    }
+                    cacheHolder.canvas3DBgStaticBitmap = bmp
+                    cacheHolder.canvas3DBgStaticKey = staticKey
+                    activeStrokeVersion++
+                }
+                val totalTicks = TimelineTrackEngine.computeTotalTicks(
+                    project,
+                    includeCameraRunway = project.camera3D.isEnabled
+                ).coerceIn(1, 240)
+                if (isPlaying && (cacheHolder.canvas3DBgPlayKey != bgBaseKey || cacheHolder.canvas3DBgPlayFrames.size < totalTicks)) {
+                    val renderedMap = withContext(Dispatchers.Default) {
+                        val map = LinkedHashMap<Int, Bitmap>(totalTicks)
+                        for (t in 0 until totalTicks) {
+                            map[t] = Camera3DEngine.renderCanvas3DBackgroundBitmap(
+                                outW = cacheW,
+                                outH = cacheH,
+                                project = project,
+                                tickFloat = t.toFloat(),
+                                fps = project.fps
+                            )
+                        }
+                        map
+                    }
+                    cacheHolder.canvas3DBgPlayFrames.values.forEach { KodanimaBitmapPool.release(it) }
+                    cacheHolder.canvas3DBgPlayFrames.clear()
+                    cacheHolder.canvas3DBgPlayFrames.putAll(renderedMap)
+                    cacheHolder.canvas3DBgPlayKey = bgBaseKey
+                    activeStrokeVersion++
+                }
+            }
+            Canvas3DBackgroundRenderMode.REALTIME_3D -> Unit
+        }
+    }
+
+    // "Mostrar 3D no Canvas" Mode 3: Real-time 3D update for animated characters/objects
+    LaunchedEffect(
+        cacheW,
+        cacheH,
+        project.resolution,
+        project.canvasBackground,
+        project.camera3D,
+        project.fps,
+        isCameraSideView3D,
+        effectiveTickFloat
+    ) {
+        if (!project.canvasBackground.show3DInCanvas ||
+            isCameraSideView3D ||
+            project.canvasBackground.canvas3DRenderMode != Canvas3DBackgroundRenderMode.REALTIME_3D
+        ) return@LaunchedEffect
+        val bgBaseKey = listOf(
+            cacheW,
+            cacheH,
+            project.resolution,
+            project.canvasBackground,
+            project.camera3D.scene3DObjects,
+            project.camera3D.keyframes,
+            project.camera3D.effectSpans,
+            project.camera3D.cameraMode,
+            project.camera3D.autoInterpolate,
+            project.camera3D.isEnabled,
+            project.camera3D.layerDepthSpacing,
+            project.fps
+        )
+        val rtKey = Pair(bgBaseKey, (effectiveTickFloat * 20f).roundToInt())
+        if (cacheHolder.canvas3DBgRealtimeKey != rtKey || cacheHolder.canvas3DBgRealtimeBitmap?.isRecycled != false) {
+            val bmp = withContext(Dispatchers.Default) {
+                Camera3DEngine.renderCanvas3DBackgroundBitmap(
+                    outW = cacheW,
+                    outH = cacheH,
+                    project = project,
+                    tickFloat = effectiveTickFloat,
+                    fps = project.fps,
+                    reuseBitmap = cacheHolder.canvas3DBgRealtimeBitmap
+                )
+            }
+            cacheHolder.canvas3DBgRealtimeBitmap = bmp
+            cacheHolder.canvas3DBgRealtimeKey = rtKey
+            activeStrokeVersion++
+        }
+    }
+
+    val stageUnitScaleRef = remember { mutableFloatStateOf(0.16f) }
+
+    // Center 3D viewport on currently selected stage element when focus is requested
+    LaunchedEffect(stageFocusNonce) {
+        if (stageFocusNonce > 0) {
+            val camSet = project.camera3D
+            val kf = Camera3DEngine.evaluateCameraAtTick(camSet, effectiveTickFloat)
+            view3DZoom = 1.32f
+            val focusScale = stageUnitScaleRef.floatValue * 1.32f
+            when (stageSelection.type) {
+                StageTargetType.CAMERA -> {
+                    view3DPanX = (-kf.x * focusScale).coerceIn(-900f, 900f)
+                    view3DPanY = (-kf.y * focusScale).coerceIn(-900f, 900f)
+                }
+                StageTargetType.OBJECT_3D -> {
+                    val obj = camSet.scene3DObjects.firstOrNull { it.id == stageSelection.id }
+                    if (obj != null) {
+                        val tf = Camera3DEngine.evaluateObjectTransformAtTick(obj.keyframes, effectiveTickFloat, camSet.autoInterpolate)
+                        view3DPanX = (-tf.x * focusScale).coerceIn(-900f, 900f)
+                        view3DPanY = (-tf.y * focusScale).coerceIn(-900f, 900f)
+                    } else {
+                        view3DPanX = 0f
+                        view3DPanY = 0f
+                    }
+                }
+                StageTargetType.LAYER -> {
+                    val tf = Camera3DEngine.evaluateLayerTransformAtTick(camSet.layerTransformTracks, stageSelection.id, effectiveTickFloat, camSet.autoInterpolate)
+                    view3DPanX = (-tf.x * focusScale).coerceIn(-900f, 900f)
+                    view3DPanY = (-tf.y * focusScale).coerceIn(-900f, 900f)
+                }
+            }
+        }
     }
 
     // Precompute trigonometric rotation coefficients once per rotation change
@@ -1057,11 +1428,200 @@ fun CanvasView(
         val screenToProjScaleX = projWidth / boxW
         val effectiveToolSize = if (selectedTool == ToolType.ERASER) eraserSize else brushSize
         val camSettings = project.camera3D
-        val evaluatedCameraKf = remember(camSettings, currentFrameIndex) {
-            Camera3DEngine.evaluateCameraAtFrame(camSettings, currentFrameIndex)
+        val evaluatedCameraKf = remember(camSettings, effectiveTickFloat) {
+            Camera3DEngine.evaluateCameraAtTick(camSettings, effectiveTickFloat)
+        }
+
+        // Background-thread 3D rasterization for off-canvas backdrop (matches active camera angle & framing at 60fps UI)
+        LaunchedEffect(
+            isCameraSideView3D,
+            isCameraModeActive,
+            camSettings.isEnabled,
+            camSettings.scene3DObjects,
+            camSettings.autoInterpolate,
+            evaluatedCameraKf,
+            currentTimelineTick,
+            effectiveTickFloat,
+            containerWidth,
+            containerHeight,
+            boxW,
+            boxH,
+            projWidth,
+            zoom,
+            panX,
+            panY,
+            rotation,
+            project.fps
+        ) {
+            val hasVisible3DObjs = camSettings.scene3DObjects.any { it.isVisible }
+            if (isCameraSideView3D || (!isCameraModeActive && !camSettings.isEnabled) || !hasVisible3DObjs || containerWidth <= 20f || containerHeight <= 20f) {
+                if (cacheHolder.offCanvas3DBitmap != null) {
+                    cacheHolder.releaseOffCanvas3D()
+                    activeStrokeVersion++
+                }
+                return@LaunchedEffect
+            }
+            val rW = (containerWidth * 0.50f).roundToInt().coerceIn(240, 840)
+            val rH = (containerHeight * 0.50f).roundToInt().coerceIn(180, 840)
+            val resScale = rW / containerWidth.coerceAtLeast(1f)
+            val fovScale = (tan(Math.toRadians(25.0)) / tan(Math.toRadians(evaluatedCameraKf.fovDegrees.coerceIn(18f, 120f) * 0.5)))
+                .toFloat().coerceIn(0.35f, 2.8f)
+            val worldUnitScale = (boxW / projWidth.coerceAtLeast(1f)) * zoom * resScale * evaluatedCameraKf.zoom
+            val camYaw3D = -evaluatedCameraKf.yawY
+            val camPitch3D = evaluatedCameraKf.pitchX
+            val camRoll3D = rotation - evaluatedCameraKf.rotationZ
+            val camPanX3D = evaluatedCameraKf.x * worldUnitScale
+            val camPanY3D = evaluatedCameraKf.y * worldUnitScale
+            val vpCx3D = (containerWidth * 0.5f + panX) * resScale
+            val vpCy3D = (containerHeight * 0.5f + panY) * resScale
+            val focal3D = max(boxW, boxH) * zoom * resScale * 0.85f * fovScale
+            val animTimeSec = effectiveTickFloat / max(1, project.fps).toFloat()
+            val offKey = listOf(
+                rW, rH, camSettings.scene3DObjects, currentTimelineTick,
+                camSettings.autoInterpolate, camYaw3D, camPitch3D, camRoll3D,
+                camPanX3D, camPanY3D, focal3D, vpCx3D, vpCy3D, worldUnitScale,
+                (effectiveTickFloat * 20f).roundToInt()
+            )
+            if (cacheHolder.offCanvas3DKey != offKey || cacheHolder.offCanvas3DBitmap?.isRecycled != false) {
+                val bmp = withContext(Dispatchers.Default) {
+                    val res = Camera3DEngine.renderSceneObjectsSoftware3D(
+                        outW = rW,
+                        outH = rH,
+                        sceneObjects = camSettings.scene3DObjects,
+                        frameIndex = currentTimelineTick,
+                        autoInterpolate = camSettings.autoInterpolate,
+                        camYawDeg = camYaw3D,
+                        camPitchDeg = camPitch3D,
+                        camRollDeg = camRoll3D,
+                        camPanX = camPanX3D,
+                        camPanY = camPanY3D,
+                        focalPx = focal3D,
+                        vpCx = vpCx3D,
+                        vpCy = vpCy3D,
+                        worldUnitScale = worldUnitScale,
+                        tickFloat = effectiveTickFloat,
+                        animTimeSec = animTimeSec,
+                        reuseBitmap = cacheHolder.offCanvas3DBitmap
+                    )
+                    res?.first
+                }
+                if (bmp != null) {
+                    cacheHolder.offCanvas3DBitmap = bmp
+                    cacheHolder.offCanvas3DKey = offKey
+                    activeStrokeVersion++
+                }
+            }
+        }
+
+        // Background-thread 3D object rasterization for interactive 3D Stage viewport (zero draw-thread rasterization)
+        LaunchedEffect(
+            isCameraSideView3D,
+            stage3DMode,
+            camSettings.scene3DObjects,
+            camSettings.autoInterpolate,
+            evaluatedCameraKf,
+            currentTimelineTick,
+            effectiveTickFloat,
+            containerWidth,
+            containerHeight,
+            projWidth,
+            view3DYaw,
+            view3DPitch,
+            view3DPanX,
+            view3DPanY,
+            view3DZoom,
+            stageSelection,
+            project.fps
+        ) {
+            if (!isCameraSideView3D || stage3DMode == Stage3DInteractionMode.CAMERA_POV || containerWidth <= 20f || containerHeight <= 20f) {
+                return@LaunchedEffect
+            }
+            val visible3DObjs = camSettings.scene3DObjects.filter { it.isVisible }
+            val validIds = visible3DObjs.map { it.id }.toSet()
+            val staleObjIds = cacheHolder.stage3DObjectEntries.keys.filter { it !in validIds }
+            staleObjIds.forEach { staleId ->
+                cacheHolder.stage3DObjectEntries.remove(staleId)?.let { KodanimaBitmapPool.release(it.bitmap) }
+            }
+            if (visible3DObjs.isEmpty()) {
+                if (staleObjIds.isNotEmpty()) activeStrokeVersion++
+                return@LaunchedEffect
+            }
+            val maxStageDim = 680f
+            val scaleDown = min(1f, maxStageDim / max(containerWidth, containerHeight).coerceAtLeast(1f))
+            val rW = (containerWidth * scaleDown).roundToInt().coerceAtLeast(64)
+            val rH = (containerHeight * scaleDown).roundToInt().coerceAtLeast(64)
+            val invScale = 1f / scaleDown
+            val fovScale = (tan(Math.toRadians(25.0)) / tan(Math.toRadians(evaluatedCameraKf.fovDegrees.coerceIn(18f, 120f) * 0.5)))
+                .toFloat().coerceIn(0.35f, 2.6f)
+            val focal = max(containerWidth, containerHeight) * 0.85f * fovScale
+            val vpCx = containerWidth * 0.5f + view3DPanX
+            val vpCy = containerHeight * 0.50f + view3DPanY
+            val stageProjScale = computeStage3DProjScale(containerWidth, containerHeight, projWidth, view3DZoom)
+            val selectedId = if (stageSelection.type == StageTargetType.OBJECT_3D) stageSelection.id else null
+            val animTimeSec = effectiveTickFloat / max(1, project.fps).toFloat()
+            val tickBucket = (effectiveTickFloat * 20f).roundToInt()
+            var anyUpdated = staleObjIds.isNotEmpty()
+
+            for (obj in visible3DObjs) {
+                val objKey = listOf(
+                    obj, currentTimelineTick, camSettings.autoInterpolate,
+                    rW, rH, view3DYaw, view3DPitch, focal, vpCx, vpCy, stageProjScale,
+                    selectedId == obj.id, tickBucket
+                )
+                val existing = cacheHolder.stage3DObjectEntries[obj.id]
+                if (existing != null && !existing.bitmap.isRecycled && existing.key == objKey) {
+                    continue
+                }
+                val rendered = withContext(Dispatchers.Default) {
+                    Camera3DEngine.renderSceneObjectsSoftware3D(
+                        outW = rW,
+                        outH = rH,
+                        sceneObjects = listOf(obj),
+                        frameIndex = currentTimelineTick,
+                        autoInterpolate = camSettings.autoInterpolate,
+                        camYawDeg = view3DYaw,
+                        camPitchDeg = view3DPitch,
+                        camRollDeg = 0f,
+                        camPanX = 0f,
+                        camPanY = 0f,
+                        focalPx = focal * scaleDown,
+                        vpCx = vpCx * scaleDown,
+                        vpCy = vpCy * scaleDown,
+                        worldUnitScale = stageProjScale * scaleDown,
+                        selectedObjectId = if (selectedId == obj.id) obj.id else null,
+                        tickFloat = effectiveTickFloat,
+                        animTimeSec = animTimeSec,
+                        reuseBitmap = existing?.bitmap
+                    )
+                }
+                if (rendered != null) {
+                    val (bmp, bMap) = rendered
+                    val b = bMap[obj.id]
+                    val scaledBounds = if (b != null) {
+                        ProjectedObjectBounds(
+                            id = b.id,
+                            centerX = b.centerX * invScale,
+                            centerY = b.centerY * invScale,
+                            minX = b.minX * invScale,
+                            minY = b.minY * invScale,
+                            maxX = b.maxX * invScale,
+                            maxY = b.maxY * invScale,
+                            avgDepth = b.avgDepth - focal * 0.8f
+                        )
+                    } else null
+                    cacheHolder.stage3DObjectEntries[obj.id] = CanvasBitmapCache.Stage3DObjectCacheEntry(
+                        bitmap = bmp,
+                        bounds = scaledBounds,
+                        key = objKey
+                    )
+                    anyUpdated = true
+                }
+            }
+            if (anyUpdated) activeStrokeVersion++
         }
 
         SideEffect {
+            stageUnitScaleRef.floatValue = computeStage3DProjScale(containerWidth, containerHeight, projWidth, 1f)
             if (!isTransforming) {
                 liveTf.zoom = zoom
                 liveTf.panX = panX
@@ -1125,6 +1685,10 @@ fun CanvasView(
         val curTabletSettings by rememberUpdatedState(tabletSettings)
         val curOnTransformChange by rememberUpdatedState(onTransformChange)
         val curOnCameraDelta by rememberUpdatedState(onCameraTransformDelta)
+        val curCamNavTarget by rememberUpdatedState(cameraViewportNavTarget)
+        val curStageSelection by rememberUpdatedState(stageSelection)
+        val curOnStageTargetSelected by rememberUpdatedState(onStageTargetSelected)
+        val curOnStageObjectDelta by rememberUpdatedState(onSelectedStageObjectDelta)
         val curOnStrokeCompleted by rememberUpdatedState(onStrokeCompleted)
         val curOnEyedropper by rememberUpdatedState(onEyedropperColorPicked)
         val curOnBucket by rememberUpdatedState(onBucketFill)
@@ -1457,7 +2021,10 @@ fun CanvasView(
                                                     view3DYaw = (view3DYaw + angleDiff * 0.55f) % 360f
                                                 }
                                             }
-                                            curIsCameraMode && curCamSettings.isEnabled && curOnCameraDelta != null -> {
+                                            curIsCameraMode &&
+                                                curCamSettings.isEnabled &&
+                                                curCamNavTarget == CameraViewportNavTarget.CAMERA &&
+                                                curOnCameraDelta != null -> {
                                                 val scaleProjX = projWidth / (boxW * liveTf.zoom.coerceAtLeast(0.05f))
                                                 curOnCameraDelta!!.invoke(
                                                     panDelta.x * scaleProjX,
@@ -1573,6 +2140,7 @@ fun CanvasView(
                                 isDrawingActive = false
                                 isMovingSelection = false
                                 isDraggingCameraTool = false
+                                isCameraCanvasPanning = false
                                 isOrbiting3D = false
                                 isDraggingStage3DCam = false
                                 active3DGizmoAxis = 0
@@ -1636,15 +2204,22 @@ fun CanvasView(
                             MotionEvent.ACTION_DOWN -> {
                                 curOnFocusActive?.invoke()
 
-                                // Interactive 3D Studio Viewport: Gizmo X/Y/Z handles, Direct 3D Camera Move/POV, or Stage Orbit
+                                // Interactive 3D Studio Viewport: Gizmo X/Y/Z handles, Direct 3D Transform, Tap-to-Select, or Stage Orbit
                                 if (curIsSideView3D) {
                                     lastOrbitTouchPos = Offset(motionEvent.x, motionEvent.y)
+                                    stage3DDownPos = Offset(motionEvent.x, motionEvent.y)
+                                    stage3DMovedPastSlop = false
                                     if (curStage3DMode == Stage3DInteractionMode.CAMERA_POV) {
                                         isDraggingStage3DCam = true
                                         active3DGizmoAxis = 4
                                         return@pointerInteropFilter true
                                     }
-                                    if (stage3DGizmo.valid && curOnCameraDelta != null) {
+                                    val canManipulateSelected = if (curStageSelection.type == StageTargetType.CAMERA) {
+                                        curOnCameraDelta != null
+                                    } else {
+                                        curOnStageObjectDelta != null
+                                    }
+                                    if (stage3DGizmo.valid && canManipulateSelected) {
                                         val gHitR = 24f * density.density
                                         val gHitRSq = gHitR * gHitR
                                         fun distSq(ax: Float, ay: Float): Float {
@@ -1665,7 +2240,7 @@ fun CanvasView(
                                             return@pointerInteropFilter true
                                         }
                                     }
-                                    if (curStage3DMode == Stage3DInteractionMode.MOVE_CAMERA && curOnCameraDelta != null) {
+                                    if (curStage3DMode == Stage3DInteractionMode.MOVE_CAMERA && canManipulateSelected) {
                                         active3DGizmoAxis = 4
                                         isDraggingStage3DCam = true
                                         return@pointerInteropFilter true
@@ -1681,10 +2256,18 @@ fun CanvasView(
                                     return@pointerInteropFilter true
                                 }
 
-                                // Interactive Camera Tool drag when Camera Mode & Camera are active
-                                if (curIsCameraMode && curCamSettings.isEnabled && curOnCameraDelta != null) {
-                                    isDraggingCameraTool = true
-                                    lastCameraDragPos = Offset(motionEvent.x, motionEvent.y)
+                                // In 2D Camera Mode: either move Camera OR freely navigate the 2D Canvas (no accidental strokes)
+                                if (curIsCameraMode) {
+                                    if (curCamNavTarget == CameraViewportNavTarget.CAMERA &&
+                                        curCamSettings.isEnabled &&
+                                        curOnCameraDelta != null
+                                    ) {
+                                        isDraggingCameraTool = true
+                                        lastCameraDragPos = Offset(motionEvent.x, motionEvent.y)
+                                    } else {
+                                        isCameraCanvasPanning = true
+                                        lastCamCanvasPanPos = Offset(motionEvent.x, motionEvent.y)
+                                    }
                                     return@pointerInteropFilter true
                                 }
 
@@ -1830,42 +2413,81 @@ fun CanvasView(
                                 true
                             }
                             MotionEvent.ACTION_MOVE -> {
-                                if (isDraggingStage3DCam && curIsSideView3D && curOnCameraDelta != null) {
+                                if (curIsSideView3D) {
+                                    val moveDist = hypot(motionEvent.x - stage3DDownPos.x, motionEvent.y - stage3DDownPos.y)
+                                    if (moveDist > 9f * density.density) stage3DMovedPastSlop = true
+                                }
+                                if (isDraggingStage3DCam && curIsSideView3D) {
                                     val dx = motionEvent.x - lastOrbitTouchPos.x
                                     val dy = motionEvent.y - lastOrbitTouchPos.y
                                     val projStepScale = (projWidth / max(boxW, 300f) / view3DZoom.coerceAtLeast(0.35f)).coerceIn(0.4f, 4.5f)
-                                    when (active3DGizmoAxis) {
-                                        1 -> {
-                                            val projAlong = dx * stage3DGizmo.xDirScreenX + dy * stage3DGizmo.xDirScreenY
-                                            curOnCameraDelta!!.invoke(projAlong * projStepScale * 1.4f, 0f, 1f, 0f, 0f, 0f, 0f)
-                                        }
-                                        2 -> {
-                                            val projAlong = dx * stage3DGizmo.yDirScreenX + dy * stage3DGizmo.yDirScreenY
-                                            curOnCameraDelta!!.invoke(0f, projAlong * projStepScale * 1.4f, 1f, 0f, 0f, 0f, 0f)
-                                        }
-                                        3 -> {
-                                            val projAlong = dx * stage3DGizmo.zDirScreenX + dy * stage3DGizmo.zDirScreenY
-                                            val zFactor = (1f + projAlong * 0.006f).coerceIn(0.85f, 1.18f)
-                                            curOnCameraDelta!!.invoke(0f, 0f, zFactor, 0f, 0f, 0f, 0f)
-                                        }
-                                        else -> {
-                                            if (isShiftHeld || isMiddleMouse) {
-                                                val zFactor = (1f - dy * 0.005f).coerceIn(0.85f, 1.18f)
+                                    val isCamTarget = curStageSelection.type == StageTargetType.CAMERA || curStage3DMode == Stage3DInteractionMode.CAMERA_POV
+                                    if (isCamTarget && curOnCameraDelta != null) {
+                                        when (active3DGizmoAxis) {
+                                            1 -> {
+                                                val projAlong = dx * stage3DGizmo.xDirScreenX + dy * stage3DGizmo.xDirScreenY
+                                                curOnCameraDelta!!.invoke(projAlong * projStepScale * 1.4f, 0f, 1f, 0f, 0f, 0f, 0f)
+                                            }
+                                            2 -> {
+                                                val projAlong = dx * stage3DGizmo.yDirScreenX + dy * stage3DGizmo.yDirScreenY
+                                                curOnCameraDelta!!.invoke(0f, projAlong * projStepScale * 1.4f, 1f, 0f, 0f, 0f, 0f)
+                                            }
+                                            3 -> {
+                                                val projAlong = dx * stage3DGizmo.zDirScreenX + dy * stage3DGizmo.zDirScreenY
+                                                val zFactor = (1f + projAlong * 0.006f).coerceIn(0.85f, 1.18f)
                                                 curOnCameraDelta!!.invoke(0f, 0f, zFactor, 0f, 0f, 0f, 0f)
-                                            } else {
+                                            }
+                                            else -> {
+                                                if (isShiftHeld || isMiddleMouse) {
+                                                    val zFactor = (1f - dy * 0.005f).coerceIn(0.85f, 1.18f)
+                                                    curOnCameraDelta!!.invoke(0f, 0f, zFactor, 0f, 0f, 0f, 0f)
+                                                } else {
+                                                    when (curCameraToolAction) {
+                                                        CameraToolAction.PAN_2D ->
+                                                            curOnCameraDelta!!.invoke(dx * projStepScale, dy * projStepScale, 1f, 0f, 0f, 0f, 0f)
+                                                        CameraToolAction.ZOOM -> {
+                                                            val zFactor = (1f - dy * 0.005f).coerceIn(0.85f, 1.18f)
+                                                            curOnCameraDelta!!.invoke(0f, 0f, zFactor, 0f, 0f, 0f, 0f)
+                                                        }
+                                                        CameraToolAction.ROTATE_Z ->
+                                                            curOnCameraDelta!!.invoke(0f, 0f, 1f, dx * 0.35f, 0f, 0f, 0f)
+                                                        CameraToolAction.FOV_LENS ->
+                                                            curOnCameraDelta!!.invoke(0f, 0f, 1f, 0f, -dy * 0.18f, 0f, 0f)
+                                                        CameraToolAction.ORBIT_3D ->
+                                                            curOnCameraDelta!!.invoke(0f, 0f, 1f, 0f, 0f, dx * 0.25f, -dy * 0.25f)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if (!isCamTarget && curOnStageObjectDelta != null) {
+                                        val objStep = 2.6f * projStepScale
+                                        when (active3DGizmoAxis) {
+                                            1 -> {
+                                                val projAlong = dx * stage3DGizmo.xDirScreenX + dy * stage3DGizmo.xDirScreenY
+                                                curOnStageObjectDelta!!.invoke(projAlong * objStep, 0f, 0f, 0f, 0f, 0f, 1f)
+                                            }
+                                            2 -> {
+                                                val projAlong = dx * stage3DGizmo.yDirScreenX + dy * stage3DGizmo.yDirScreenY
+                                                curOnStageObjectDelta!!.invoke(0f, projAlong * objStep, 0f, 0f, 0f, 0f, 1f)
+                                            }
+                                            3 -> {
+                                                val projAlong = dx * stage3DGizmo.zDirScreenX + dy * stage3DGizmo.zDirScreenY
+                                                curOnStageObjectDelta!!.invoke(0f, 0f, projAlong * objStep, 0f, 0f, 0f, 1f)
+                                            }
+                                            else -> {
                                                 when (curCameraToolAction) {
                                                     CameraToolAction.PAN_2D ->
-                                                        curOnCameraDelta!!.invoke(dx * projStepScale, dy * projStepScale, 1f, 0f, 0f, 0f, 0f)
+                                                        curOnStageObjectDelta!!.invoke(dx * objStep * 0.7f, dy * objStep * 0.7f, 0f, 0f, 0f, 0f, 1f)
                                                     CameraToolAction.ZOOM -> {
-                                                        val zFactor = (1f - dy * 0.005f).coerceIn(0.85f, 1.18f)
-                                                        curOnCameraDelta!!.invoke(0f, 0f, zFactor, 0f, 0f, 0f, 0f)
+                                                        val sf = (1f - dy * 0.006f).coerceIn(0.85f, 1.18f)
+                                                        curOnStageObjectDelta!!.invoke(0f, 0f, 0f, 0f, 0f, 0f, sf)
                                                     }
                                                     CameraToolAction.ROTATE_Z ->
-                                                        curOnCameraDelta!!.invoke(0f, 0f, 1f, dx * 0.35f, 0f, 0f, 0f)
-                                                    CameraToolAction.FOV_LENS ->
-                                                        curOnCameraDelta!!.invoke(0f, 0f, 1f, 0f, -dy * 0.18f, 0f, 0f)
+                                                        curOnStageObjectDelta!!.invoke(0f, 0f, 0f, 0f, 0f, dx * 0.45f, 1f)
                                                     CameraToolAction.ORBIT_3D ->
-                                                        curOnCameraDelta!!.invoke(0f, 0f, 1f, 0f, 0f, dx * 0.25f, -dy * 0.25f)
+                                                        curOnStageObjectDelta!!.invoke(0f, 0f, 0f, -dy * 0.45f, dx * 0.45f, 0f, 1f)
+                                                    CameraToolAction.FOV_LENS ->
+                                                        curOnStageObjectDelta!!.invoke(0f, 0f, -dy * objStep * 0.6f, 0f, 0f, 0f, 1f)
                                                 }
                                             }
                                         }
@@ -1893,6 +2515,15 @@ fun CanvasView(
                                     liveTf.panY += dy
                                     curOnTransformChange(1.0f, dx, dy, 0f)
                                     lastMiddlePanPos = Offset(motionEvent.x, motionEvent.y)
+                                    return@pointerInteropFilter true
+                                }
+                                if (isCameraCanvasPanning) {
+                                    val dx = motionEvent.x - lastCamCanvasPanPos.x
+                                    val dy = motionEvent.y - lastCamCanvasPanPos.y
+                                    liveTf.panX += dx
+                                    liveTf.panY += dy
+                                    curOnTransformChange(1.0f, dx, dy, 0f)
+                                    lastCamCanvasPanPos = Offset(motionEvent.x, motionEvent.y)
                                     return@pointerInteropFilter true
                                 }
                                 if (isDraggingCameraTool && curIsCameraMode && curOnCameraDelta != null) {
@@ -2032,17 +2663,46 @@ fun CanvasView(
                                 true
                             }
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                                if (isDraggingStage3DCam) {
+                                if (isDraggingStage3DCam || isOrbiting3D) {
+                                    val wasTap = motionEvent.actionMasked == MotionEvent.ACTION_UP &&
+                                        !stage3DMovedPastSlop &&
+                                        curStage3DMode != Stage3DInteractionMode.CAMERA_POV
                                     isDraggingStage3DCam = false
-                                    active3DGizmoAxis = 0
-                                    return@pointerInteropFilter true
-                                }
-                                if (isOrbiting3D) {
                                     isOrbiting3D = false
+                                    active3DGizmoAxis = 0
+                                    if (wasTap && curOnStageTargetSelected != null) {
+                                        val tx = motionEvent.x
+                                        val ty = motionEvent.y
+                                        val camApexHitR = 26f * density.density
+                                        val hitCam = stage3DGizmo.valid &&
+                                            hypot(tx - stage3DGizmo.apexX, ty - stage3DGizmo.apexY) <= camApexHitR
+                                        if (hitCam) {
+                                            curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.CAMERA, "camera"))
+                                        } else {
+                                            val pad = 12f * density.density
+                                            val hitObj = stage3DObjectBounds.values
+                                                .filter { b -> tx in (b.minX - pad)..(b.maxX + pad) && ty in (b.minY - pad)..(b.maxY + pad) }
+                                                .minByOrNull { it.avgDepth }
+                                            if (hitObj != null) {
+                                                curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.OBJECT_3D, hitObj.id))
+                                            } else {
+                                                val hitLayerId = stage3DLayerBounds.entries.lastOrNull { (_, r) ->
+                                                    tx in (r.left - pad)..(r.right + pad) && ty in (r.top - pad)..(r.bottom + pad)
+                                                }?.key
+                                                if (hitLayerId != null) {
+                                                    curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.LAYER, hitLayerId))
+                                                }
+                                            }
+                                        }
+                                    }
                                     return@pointerInteropFilter true
                                 }
                                 if (isMiddleMousePanning) {
                                     isMiddleMousePanning = false
+                                    return@pointerInteropFilter true
+                                }
+                                if (isCameraCanvasPanning) {
+                                    isCameraCanvasPanning = false
                                     return@pointerInteropFilter true
                                 }
                                 if (isDraggingCameraTool) {
@@ -2174,8 +2834,17 @@ fun CanvasView(
                                         }
                                         return@pointerInteropFilter true
                                     }
-                                    if (isAltHeld && curIsCameraMode && curCamSettings.isEnabled && curOnCameraDelta != null) {
-                                        curOnCameraDelta!!.invoke(0f, 0f, 1f, 0f, if (vScroll > 0f) -2.5f else 2.5f, 0f, 0f)
+                                    if (curIsCameraMode &&
+                                        curCamSettings.isEnabled &&
+                                        curCamNavTarget == CameraViewportNavTarget.CAMERA &&
+                                        curOnCameraDelta != null
+                                    ) {
+                                        if (isAltHeld) {
+                                            curOnCameraDelta!!.invoke(0f, 0f, 1f, 0f, if (vScroll > 0f) -2.5f else 2.5f, 0f, 0f)
+                                        } else {
+                                            val zF = if (vScroll > 0f) 1.09f else 0.91f
+                                            curOnCameraDelta!!.invoke(0f, 0f, zF, 0f, 0f, 0f, 0f)
+                                        }
                                         return@pointerInteropFilter true
                                     }
                                     if (curTabletSettings.mouseScrollZoomEnabled) {
@@ -2225,7 +2894,7 @@ fun CanvasView(
                             evaluatedKf = evaluatedCameraKf,
                             bgSettings = project.canvasBackground,
                             povBitmap = cacheHolder.stage3DPovBitmap,
-                            accentColorInt = themeAccentColor.toInt()
+                            scratch = overlayScratch
                         )
                     } else {
                         drawInteractive3DStageViewport(
@@ -2241,6 +2910,7 @@ fun CanvasView(
                             bgBitmap = cacheHolder.stage3DBgBitmap,
                             layers = combinedLayers,
                             layerBitmaps = cacheHolder.stage3DLayerBitmaps,
+                            objectEntries = cacheHolder.stage3DObjectEntries,
                             view3DYaw = view3DYaw,
                             view3DPitch = view3DPitch,
                             view3DPanX = view3DPanX,
@@ -2248,14 +2918,46 @@ fun CanvasView(
                             view3DZoom = view3DZoom,
                             accentColorInt = themeAccentColor.toInt(),
                             isMoveCameraMode = stage3DMode == Stage3DInteractionMode.MOVE_CAMERA,
-                            gizmoOut = stage3DGizmo
+                            stageSelection = stageSelection,
+                            gizmoOut = stage3DGizmo,
+                            objectBoundsOut = stage3DObjectBounds,
+                            layerBoundsOut = stage3DLayerBounds,
+                            scratch = overlayScratch,
+                            tickFloat = effectiveTickFloat
                         )
                     }
                     @Suppress("UNUSED_EXPRESSION")
                     trigger
                 }
             } else {
-                // Main Hardware-Accelerated 2D Drawing Canvas (square corners, transforms execute on GPU RenderThread)
+                // Full-screen off-canvas backdrop (renders Sky + pre-rasterized 3D Objects aligned with active camera)
+                if (isCameraModeActive || camSettings.isEnabled) {
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("camera_offcanvas_backdrop")
+                    ) {
+                        val trigger = activeStrokeVersion
+                        val nativeCanvas = drawContext.canvas.nativeCanvas
+                        KodanimaGraphicsEngine.drawSkyBackdropToCanvas(
+                            nativeCanvas,
+                            size.width,
+                            size.height,
+                            project.canvasBackground
+                        )
+                        val objBmp = cacheHolder.offCanvas3DBitmap
+                        if (camSettings.scene3DObjects.any { it.isVisible } && objBmp != null && !objBmp.isRecycled) {
+                            overlayScratch.srcRect.set(0, 0, objBmp.width, objBmp.height)
+                            overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
+                            overlayScratch.bitmapPaint.isFilterBitmap = true
+                            nativeCanvas.drawBitmap(objBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                        }
+                        @Suppress("UNUSED_EXPRESSION")
+                        trigger
+                    }
+                }
+
+                // Main Hardware-Accelerated 2D Drawing Canvas (transforms execute on GPU RenderThread)
                 Box(
                     modifier = Modifier
                         .graphicsLayer {
@@ -2269,7 +2971,7 @@ fun CanvasView(
                             width = with(density) { boxWidthPx.toDp() },
                             height = with(density) { boxHeightPx.toDp() }
                         )
-                        .shadow(16.dp, RectangleShape)
+                        .shadow(if (isCameraModeActive) 6.dp else 16.dp, RectangleShape)
                         .clip(RectangleShape)
                         .background(Color.Transparent)
                 ) {
@@ -2292,15 +2994,37 @@ fun CanvasView(
                     val trigger = activeStrokeVersion
                     val nativeCanvas = drawContext.canvas.nativeCanvas
                     val screenPxPerProjPx = (size.width / projWidth) * zoom
-                    // Keep silky bilinear AA smoothing normally; switch to crisp MediBang nearest-neighbor pixels on deep zoom
+                    // Keep silky bilinear AA smoothing normally; switch to crisp nearest-neighbor pixels on deep zoom
                     overlayScratch.bitmapPaint.isFilterBitmap = screenPxPerProjPx < 4.0f
                     overlayScratch.srcRect.set(0, 0, cacheW, cacheH)
                     overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
 
                     val isBgTransparent = project.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE
+                    val show3DBg = project.canvasBackground.show3DInCanvas
                     if (!effectiveFloatingRefBelow) {
-                        if (isBgTransparent) {
-                            drawTransparencyCheckerboard(nativeCanvas, size.width, size.height, density.density)
+                        if (show3DBg) {
+                            val bg3DBmp = when (project.canvasBackground.canvas3DRenderMode) {
+                                Canvas3DBackgroundRenderMode.STATIC_2D_CACHE -> cacheHolder.canvas3DBgStaticBitmap
+                                Canvas3DBackgroundRenderMode.PRE_RENDER_ON_PLAY ->
+                                    cacheHolder.canvas3DBgPlayFrames[currentTimelineTick]
+                                        ?: cacheHolder.canvas3DBgStaticBitmap
+                                        ?: cacheHolder.canvas3DBgPlayFrames.values.lastOrNull()
+                                Canvas3DBackgroundRenderMode.REALTIME_3D ->
+                                    cacheHolder.canvas3DBgRealtimeBitmap ?: cacheHolder.canvas3DBgStaticBitmap
+                            }
+                            if (bg3DBmp != null && !bg3DBmp.isRecycled && bg3DBmp.width > 0 && bg3DBmp.height > 0) {
+                                overlayScratch.srcRect.set(0, 0, bg3DBmp.width, bg3DBmp.height)
+                                nativeCanvas.drawBitmap(bg3DBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                                overlayScratch.srcRect.set(0, 0, cacheW, cacheH)
+                            } else {
+                                KodanimaGraphicsEngine.drawSkyBackdropToCanvas(
+                                    nativeCanvas, size.width, size.height, project.canvasBackground
+                                )
+                            }
+                        } else if (isBgTransparent) {
+                            if (!isCameraModeActive && !camSettings.isEnabled) {
+                                drawTransparencyCheckerboard(nativeCanvas, size.width, size.height, density.density, overlayScratch)
+                            }
                         } else {
                             KodanimaGraphicsEngine.drawProjectBackgroundToCanvas(
                                 canvas = nativeCanvas,
@@ -2319,7 +3043,7 @@ fun CanvasView(
                         cacheHolder.aboveAdvancedIsActive
 
                     var layerStackSaveCount = -1
-                    if (needsLayerStackBlend && (effectiveFloatingRefBelow || isBgTransparent)) {
+                    if (needsLayerStackBlend && (effectiveFloatingRefBelow || isBgTransparent || show3DBg)) {
                         layerStackSaveCount = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
                     }
 
@@ -2774,8 +3498,8 @@ fun CanvasView(
                         )
                     }
 
-                    // Live Camera Capture Frame & Post-Effects Preview in 2D Viewport
-                    if (camSettings.isEnabled || camSettings.postEffects.hasAnyEffect()) {
+                    // Live Camera Capture Frame & Post-Effects Preview rendered unclipped inside overlay if Camera Mode is NOT using outer canvas
+                    if ((camSettings.isEnabled || camSettings.postEffects.hasAnyEffect()) && !isCameraModeActive) {
                         drawCameraAndPostEffectsOverlay(
                             nativeCanvas = nativeCanvas,
                             canvasW = size.width,
@@ -2784,7 +3508,8 @@ fun CanvasView(
                             projHeight = projHeight,
                             screenDensity = density.density,
                             camSettings = camSettings,
-                            evaluatedKf = evaluatedCameraKf
+                            evaluatedKf = evaluatedCameraKf,
+                            scratch = overlayScratch
                         )
                     }
 
@@ -2963,6 +3688,30 @@ fun CanvasView(
                         }
                     }
                 }
+            }
+        }
+
+        // Above-canvas unclipped Camera Capture Frame & Post-Effects overlay when Camera Mode is active (shows full view beyond canvas boundaries!)
+        if (!isCameraSideView3D && isCameraModeActive && (camSettings.isEnabled || camSettings.postEffects.hasAnyEffect())) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val nativeCanvas = drawContext.canvas.nativeCanvas
+                nativeCanvas.save()
+                nativeCanvas.translate(size.width * 0.5f + panX, size.height * 0.5f + panY)
+                nativeCanvas.rotate(rotation)
+                nativeCanvas.scale(if (mirrorHorizontal) -zoom else zoom, zoom)
+                nativeCanvas.translate(-boxW * 0.5f, -boxH * 0.5f)
+                drawCameraAndPostEffectsOverlay(
+                    nativeCanvas = nativeCanvas,
+                    canvasW = boxW,
+                    canvasH = boxH,
+                    projWidth = projWidth,
+                    projHeight = projHeight,
+                    screenDensity = density.density,
+                    camSettings = camSettings,
+                    evaluatedKf = evaluatedCameraKf,
+                    scratch = overlayScratch
+                )
+                nativeCanvas.restore()
             }
         }
 
@@ -3223,6 +3972,39 @@ fun CanvasView(
                         activeColor = Color(0xFF00E676),
                         testTag = "stage_3d_mode_pov"
                     ) { stage3DMode = Stage3DInteractionMode.CAMERA_POV }
+
+                    Stage3DHudPill(
+                        label = "Focar",
+                        icon = Icons.Default.GpsFixed,
+                        active = false,
+                        activeColor = Color(0xFF00E676),
+                        testTag = "stage_3d_focus_btn"
+                    ) {
+                        val kf = evaluatedCameraKf
+                        view3DZoom = 1.32f
+                        val focusScale = stageUnitScaleRef.floatValue * 1.32f
+                        when (stageSelection.type) {
+                            StageTargetType.CAMERA -> {
+                                view3DPanX = (-kf.x * focusScale).coerceIn(-900f, 900f)
+                                view3DPanY = (-kf.y * focusScale).coerceIn(-900f, 900f)
+                            }
+                            StageTargetType.OBJECT_3D -> {
+                                val obj = camSettings.scene3DObjects.firstOrNull { it.id == stageSelection.id }
+                                if (obj != null) {
+                                    val tf = Camera3DEngine.evaluateObjectTransformAtTick(obj.keyframes, effectiveTickFloat, camSettings.autoInterpolate)
+                                    view3DPanX = (-tf.x * focusScale).coerceIn(-900f, 900f)
+                                    view3DPanY = (-tf.y * focusScale).coerceIn(-900f, 900f)
+                                } else {
+                                    view3DPanX = 0f; view3DPanY = 0f
+                                }
+                            }
+                            StageTargetType.LAYER -> {
+                                val tf = Camera3DEngine.evaluateLayerTransformAtTick(camSettings.layerTransformTracks, stageSelection.id, effectiveTickFloat, camSettings.autoInterpolate)
+                                view3DPanX = (-tf.x * focusScale).coerceIn(-900f, 900f)
+                                view3DPanY = (-tf.y * focusScale).coerceIn(-900f, 900f)
+                            }
+                        }
+                    }
 
                     Stage3DHudPill(
                         label = "Centralizar",
@@ -3548,22 +4330,25 @@ private fun projectPoint3D(
     return Projected3DPt(cx + rx * persp, cy + ry * persp, zz)
 }
 
+private fun computeStage3DProjScale(
+    canvasW: Float,
+    canvasH: Float,
+    projWidth: Float,
+    view3DZoom: Float
+): Float {
+    val cardW = min(canvasW, canvasH) * 0.28f * view3DZoom
+    return (2f * cardW) / projWidth.coerceAtLeast(1f)
+}
+
 private fun drawTransparencyCheckerboard(
     nativeCanvas: AndroidCanvas,
     width: Float,
     height: Float,
-    screenDensity: Float
+    screenDensity: Float,
+    scratch: CanvasOverlayScratch
 ) {
     val tile = (14f * screenDensity).coerceAtLeast(12f)
-    val lightPaint = AndroidPaint().apply {
-        color = AndroidColor.rgb(245, 246, 250)
-        style = AndroidPaint.Style.FILL
-    }
-    val darkPaint = AndroidPaint().apply {
-        color = AndroidColor.rgb(212, 217, 228)
-        style = AndroidPaint.Style.FILL
-    }
-    nativeCanvas.drawRect(0f, 0f, width, height, lightPaint)
+    nativeCanvas.drawRect(0f, 0f, width, height, scratch.checkerLightPaint)
     var row = 0
     var y = 0f
     while (y < height) {
@@ -3571,7 +4356,7 @@ private fun drawTransparencyCheckerboard(
         var x = 0f
         while (x < width) {
             if ((row + col) % 2 == 1) {
-                nativeCanvas.drawRect(x, y, min(width, x + tile), min(height, y + tile), darkPaint)
+                nativeCanvas.drawRect(x, y, min(width, x + tile), min(height, y + tile), scratch.checkerDarkPaint)
             }
             x += tile
             col++
@@ -3589,58 +4374,57 @@ private fun drawCameraAndPostEffectsOverlay(
     projHeight: Float,
     screenDensity: Float,
     camSettings: Camera3DSettings,
-    evaluatedKf: Camera3DKeyframe
+    evaluatedKf: Camera3DKeyframe,
+    scratch: CanvasOverlayScratch
 ) {
     val fx = camSettings.postEffects
-    // 1. Live Post-Effects Preview
+    // 1. Live Post-Effects Preview (zero draw-thread allocations)
     if (fx.hasAnyEffect()) {
         if (fx.sepia > 0.01f) {
-            val sPaint = AndroidPaint().apply {
-                color = AndroidColor.argb((fx.sepia.coerceIn(0f, 1f) * 90f).roundToInt(), 148, 102, 48)
-                style = AndroidPaint.Style.FILL
-            }
-            nativeCanvas.drawRect(0f, 0f, canvasW, canvasH, sPaint)
+            scratch.fxSepiaPaint.color = AndroidColor.argb((fx.sepia.coerceIn(0f, 1f) * 90f).roundToInt(), 148, 102, 48)
+            nativeCanvas.drawRect(0f, 0f, canvasW, canvasH, scratch.fxSepiaPaint)
         }
         if (fx.bloom > 0.01f) {
-            val bPaint = AndroidPaint().apply {
-                shader = android.graphics.RadialGradient(
+            val bAlpha = (fx.bloom.coerceIn(0f, 1f) * 78f).roundToInt()
+            if (scratch.fxBloomKeyW != canvasW || scratch.fxBloomKeyH != canvasH || scratch.fxBloomKeyAlpha != bAlpha) {
+                scratch.fxBloomPaint.shader = RadialGradient(
                     canvasW * 0.5f,
                     canvasH * 0.5f,
                     max(canvasW, canvasH) * 0.65f,
-                    intArrayOf(
-                        AndroidColor.argb((fx.bloom.coerceIn(0f, 1f) * 78f).roundToInt(), 255, 244, 224),
-                        0x00000000
-                    ),
+                    intArrayOf(AndroidColor.argb(bAlpha, 255, 244, 224), 0x00000000),
                     floatArrayOf(0f, 1f),
-                    android.graphics.Shader.TileMode.CLAMP
+                    Shader.TileMode.CLAMP
                 )
+                scratch.fxBloomKeyW = canvasW
+                scratch.fxBloomKeyH = canvasH
+                scratch.fxBloomKeyAlpha = bAlpha
             }
-            nativeCanvas.drawRect(0f, 0f, canvasW, canvasH, bPaint)
+            nativeCanvas.drawRect(0f, 0f, canvasW, canvasH, scratch.fxBloomPaint)
         }
         if (fx.chromaticAberration > 0.01f) {
             val shift = fx.chromaticAberration.coerceIn(0f, 1f) * 5f * screenDensity
-            val caPaint = AndroidPaint().apply {
-                style = AndroidPaint.Style.STROKE
-                strokeWidth = 2.5f * screenDensity
-            }
-            caPaint.color = AndroidColor.argb(120, 255, 48, 100)
-            nativeCanvas.drawRect(shift, 0f, canvasW, canvasH, caPaint)
-            caPaint.color = AndroidColor.argb(120, 0, 210, 255)
-            nativeCanvas.drawRect(0f, 0f, (canvasW - shift).coerceAtLeast(1f), canvasH, caPaint)
+            scratch.fxChromaticPaint.strokeWidth = 2.5f * screenDensity
+            scratch.fxChromaticPaint.color = AndroidColor.argb(120, 255, 48, 100)
+            nativeCanvas.drawRect(shift, 0f, canvasW, canvasH, scratch.fxChromaticPaint)
+            scratch.fxChromaticPaint.color = AndroidColor.argb(120, 0, 210, 255)
+            nativeCanvas.drawRect(0f, 0f, (canvasW - shift).coerceAtLeast(1f), canvasH, scratch.fxChromaticPaint)
         }
         if (fx.vignette > 0.01f) {
             val vAlpha = (fx.vignette.coerceIn(0f, 1f) * 200f).roundToInt().coerceIn(0, 230)
-            val vPaint = AndroidPaint().apply {
-                shader = android.graphics.RadialGradient(
+            if (scratch.fxVignetteKeyW != canvasW || scratch.fxVignetteKeyH != canvasH || scratch.fxVignetteKeyAlpha != vAlpha) {
+                scratch.fxVignettePaint.shader = RadialGradient(
                     canvasW * 0.5f,
                     canvasH * 0.5f,
                     max(canvasW, canvasH) * 0.72f,
                     intArrayOf(0x00000000, 0x00000000, (vAlpha shl 24)),
                     floatArrayOf(0f, 0.48f, 1f),
-                    android.graphics.Shader.TileMode.CLAMP
+                    Shader.TileMode.CLAMP
                 )
+                scratch.fxVignetteKeyW = canvasW
+                scratch.fxVignetteKeyH = canvasH
+                scratch.fxVignetteKeyAlpha = vAlpha
             }
-            nativeCanvas.drawRect(0f, 0f, canvasW, canvasH, vPaint)
+            nativeCanvas.drawRect(0f, 0f, canvasW, canvasH, scratch.fxVignettePaint)
         }
     }
 
@@ -3675,67 +4459,39 @@ private fun drawCameraAndPostEffectsOverlay(
         }
 
         val bigSpan = max(canvasW, canvasH) * 4f
-        val outsideMaskPaint = AndroidPaint().apply {
-            color = AndroidColor.argb(115, 8, 12, 22)
-            style = AndroidPaint.Style.FILL
-        }
-        nativeCanvas.drawRect(-bigSpan, -bigSpan, bigSpan, -hh, outsideMaskPaint)
-        nativeCanvas.drawRect(-bigSpan, hh, bigSpan, bigSpan, outsideMaskPaint)
-        nativeCanvas.drawRect(-bigSpan, -hh, -hw, hh, outsideMaskPaint)
-        nativeCanvas.drawRect(hw, -hh, bigSpan, hh, outsideMaskPaint)
+        nativeCanvas.drawRect(-bigSpan, -bigSpan, bigSpan, -hh, scratch.camOutsideMaskPaint)
+        nativeCanvas.drawRect(-bigSpan, hh, bigSpan, bigSpan, scratch.camOutsideMaskPaint)
+        nativeCanvas.drawRect(-bigSpan, -hh, -hw, hh, scratch.camOutsideMaskPaint)
+        nativeCanvas.drawRect(hw, -hh, bigSpan, hh, scratch.camOutsideMaskPaint)
 
-        val outerBorderPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.argb(165, 92, 110, 140)
-            style = AndroidPaint.Style.STROKE
-            strokeWidth = 1.1f * screenDensity
-        }
-        nativeCanvas.drawRect(-hw - outerPad, -hh - outerPad, hw + outerPad, hh + outerPad, outerBorderPaint)
+        scratch.camOuterBorderPaint.strokeWidth = 1.1f * screenDensity
+        nativeCanvas.drawRect(-hw - outerPad, -hh - outerPad, hw + outerPad, hh + outerPad, scratch.camOuterBorderPaint)
 
-        val activeBorderPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.rgb(41, 121, 255)
-            style = AndroidPaint.Style.STROKE
-            strokeWidth = 2.2f * screenDensity
-        }
-        nativeCanvas.drawRect(-hw, -hh, hw, hh, activeBorderPaint)
+        scratch.camActiveBorderPaint.strokeWidth = 2.2f * screenDensity
+        nativeCanvas.drawRect(-hw, -hh, hw, hh, scratch.camActiveBorderPaint)
 
-        val safeBoxPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.argb(150, 0, 210, 255)
-            style = AndroidPaint.Style.STROKE
-            strokeWidth = 1.0f * screenDensity
-        }
-        nativeCanvas.drawRect(-safeW, -safeH, safeW, safeH, safeBoxPaint)
-        nativeCanvas.drawLine(-hw - outerPad, -hh - outerPad, -safeW, -safeH, outerBorderPaint)
-        nativeCanvas.drawLine(hw + outerPad, -hh - outerPad, safeW, -safeH, outerBorderPaint)
-        nativeCanvas.drawLine(-hw - outerPad, hh + outerPad, -safeW, safeH, outerBorderPaint)
-        nativeCanvas.drawLine(hw + outerPad, hh + outerPad, safeW, safeH, outerBorderPaint)
+        scratch.camSafeBoxPaint.strokeWidth = 1.0f * screenDensity
+        nativeCanvas.drawRect(-safeW, -safeH, safeW, safeH, scratch.camSafeBoxPaint)
+        nativeCanvas.drawLine(-hw - outerPad, -hh - outerPad, -safeW, -safeH, scratch.camOuterBorderPaint)
+        nativeCanvas.drawLine(hw + outerPad, -hh - outerPad, safeW, -safeH, scratch.camOuterBorderPaint)
+        nativeCanvas.drawLine(-hw - outerPad, hh + outerPad, -safeW, safeH, scratch.camOuterBorderPaint)
+        nativeCanvas.drawLine(hw + outerPad, hh + outerPad, safeW, safeH, scratch.camOuterBorderPaint)
 
-        val cornerPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.rgb(255, 145, 0)
-            style = AndroidPaint.Style.STROKE
-            strokeWidth = 2.8f * screenDensity
-        }
+        scratch.camCornerPaint.strokeWidth = 2.8f * screenDensity
         val arm = min(frameW, frameH) * 0.085f
-        nativeCanvas.drawLine(-hw, -hh, -hw + arm, -hh, cornerPaint)
-        nativeCanvas.drawLine(-hw, -hh, -hw, -hh + arm, cornerPaint)
-        nativeCanvas.drawLine(hw, -hh, hw - arm, -hh, cornerPaint)
-        nativeCanvas.drawLine(hw, -hh, hw, -hh + arm, cornerPaint)
-        nativeCanvas.drawLine(-hw, hh, -hw + arm, hh, cornerPaint)
-        nativeCanvas.drawLine(-hw, hh, -hw, hh - arm, cornerPaint)
-        nativeCanvas.drawLine(hw, hh, hw - arm, hh, cornerPaint)
-        nativeCanvas.drawLine(hw, hh, hw, hh - arm, cornerPaint)
+        nativeCanvas.drawLine(-hw, -hh, -hw + arm, -hh, scratch.camCornerPaint)
+        nativeCanvas.drawLine(-hw, -hh, -hw, -hh + arm, scratch.camCornerPaint)
+        nativeCanvas.drawLine(hw, -hh, hw - arm, -hh, scratch.camCornerPaint)
+        nativeCanvas.drawLine(hw, -hh, hw, -hh + arm, scratch.camCornerPaint)
+        nativeCanvas.drawLine(-hw, hh, -hw + arm, hh, scratch.camCornerPaint)
+        nativeCanvas.drawLine(-hw, hh, -hw, hh - arm, scratch.camCornerPaint)
+        nativeCanvas.drawLine(hw, hh, hw - arm, hh, scratch.camCornerPaint)
+        nativeCanvas.drawLine(hw, hh, hw, hh - arm, scratch.camCornerPaint)
 
-        val badgeBg = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.argb(205, 16, 20, 34)
-            style = AndroidPaint.Style.FILL
-        }
-        val badgeText = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.WHITE
-            textSize = 9.5f * screenDensity
-            isFakeBoldText = true
-        }
+        scratch.camBadgeTextPaint.textSize = 9.5f * screenDensity
         val modeTag = if (camSettings.cameraMode == CameraMode.MODE_2D) "2D" else "3D"
         val label = "CÂMERA $modeTag ${camSettings.captureWidth}×${camSettings.captureHeight} • ${(evaluatedKf.zoom * 100).roundToInt()}% • FOV ${evaluatedKf.fovDegrees.roundToInt()}°"
-        val tw = badgeText.measureText(label)
+        val tw = scratch.camBadgeTextPaint.measureText(label)
         nativeCanvas.drawRoundRect(
             -hw + 4f * screenDensity,
             -hh - 20f * screenDensity,
@@ -3743,9 +4499,9 @@ private fun drawCameraAndPostEffectsOverlay(
             -hh - 4f * screenDensity,
             5f * screenDensity,
             5f * screenDensity,
-            badgeBg
+            scratch.camBadgeBgPaint
         )
-        nativeCanvas.drawText(label, -hw + 9f * screenDensity, -hh - 8f * screenDensity, badgeText)
+        nativeCanvas.drawText(label, -hw + 9f * screenDensity, -hh - 8f * screenDensity, scratch.camBadgeTextPaint)
         nativeCanvas.restore()
     }
 }
@@ -3801,18 +4557,19 @@ private fun drawCameraPovStageViewport(
     evaluatedKf: Camera3DKeyframe,
     bgSettings: CanvasBackgroundSettings,
     povBitmap: Bitmap?,
-    accentColorInt: Int
+    scratch: CanvasOverlayScratch
 ) {
     // Matte studio viewport framing the live rendered 3D camera output
-    val mattePaint = AndroidPaint().apply {
-        shader = android.graphics.LinearGradient(
+    if (scratch.povMatteKeyH != canvasH) {
+        scratch.povMattePaint.shader = LinearGradient(
             0f, 0f, 0f, canvasH,
             intArrayOf(AndroidColor.rgb(20, 23, 31), AndroidColor.rgb(30, 34, 44)),
             null,
-            android.graphics.Shader.TileMode.CLAMP
+            Shader.TileMode.CLAMP
         )
+        scratch.povMatteKeyH = canvasH
     }
-    nativeCanvas.drawRect(0f, 0f, canvasW, canvasH, mattePaint)
+    nativeCanvas.drawRect(0f, 0f, canvasW, canvasH, scratch.povMattePaint)
 
     val camAsp = (camSettings.captureWidth.toFloat() / camSettings.captureHeight.coerceAtLeast(1).toFloat()).coerceIn(0.35f, 2.8f)
     val padH = 44f * screenDensity
@@ -3829,36 +4586,29 @@ private fun drawCameraPovStageViewport(
     }
     val left = (canvasW - viewW) * 0.5f
     val top = padH + (availH - viewH) * 0.5f
-    val dst = RectF(left, top, left + viewW, top + viewH)
+    scratch.dstRectF.set(left, top, left + viewW, top + viewH)
 
     if (povBitmap != null && !povBitmap.isRecycled) {
         if (bgSettings.style == CanvasBackgroundStyle.TRANSPARENTE) {
             nativeCanvas.save()
-            nativeCanvas.clipRect(dst)
+            nativeCanvas.clipRect(scratch.dstRectF)
             KodanimaGraphicsEngine.drawSkyBackdropToCanvas(
                 nativeCanvas, canvasW, canvasH,
                 if (bgSettings.skyMode == SkyBackdropMode.GRADE_ESPACIAL) bgSettings.copy(skyMode = SkyBackdropMode.ESTUDIO_ESCURO) else bgSettings
             )
             nativeCanvas.restore()
         }
-        val bmpPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG or AndroidPaint.FILTER_BITMAP_FLAG or AndroidPaint.DITHER_FLAG)
-        nativeCanvas.drawBitmap(povBitmap, null, dst, bmpPaint)
+        scratch.srcRect.set(0, 0, povBitmap.width, povBitmap.height)
+        scratch.bitmapPaint.isFilterBitmap = true
+        nativeCanvas.drawBitmap(povBitmap, scratch.srcRect, scratch.dstRectF, scratch.bitmapPaint)
     }
 
-    val framePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.rgb(255, 167, 38)
-        style = AndroidPaint.Style.STROKE
-        strokeWidth = 2.2f * screenDensity
-    }
-    nativeCanvas.drawRect(dst, framePaint)
+    scratch.povFramePaint.strokeWidth = 2.2f * screenDensity
+    nativeCanvas.drawRect(scratch.dstRectF, scratch.povFramePaint)
 
-    val infoPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.WHITE
-        textSize = 10f * screenDensity
-        isFakeBoldText = true
-    }
+    scratch.povInfoPaint.textSize = 10f * screenDensity
     val badge = "VISÃO DA CÂMERA • ${camSettings.captureWidth}×${camSettings.captureHeight} • Zoom ${(evaluatedKf.zoom * 100).roundToInt()}% • FOV ${evaluatedKf.fovDegrees.roundToInt()}° • Arraste para mover"
-    nativeCanvas.drawText(badge, left, top - 6f * screenDensity, infoPaint)
+    nativeCanvas.drawText(badge, left, top - 6f * screenDensity, scratch.povInfoPaint)
 }
 
 private fun drawInteractive3DStageViewport(
@@ -3874,6 +4624,7 @@ private fun drawInteractive3DStageViewport(
     bgBitmap: Bitmap?,
     layers: List<Layer>,
     layerBitmaps: Map<String, Bitmap>,
+    objectEntries: Map<String, CanvasBitmapCache.Stage3DObjectCacheEntry>,
     view3DYaw: Float,
     view3DPitch: Float,
     view3DPanX: Float,
@@ -3881,8 +4632,16 @@ private fun drawInteractive3DStageViewport(
     view3DZoom: Float,
     accentColorInt: Int,
     isMoveCameraMode: Boolean,
-    gizmoOut: Stage3DCamGizmoState
+    stageSelection: StageSelection,
+    gizmoOut: Stage3DCamGizmoState,
+    objectBoundsOut: MutableMap<String, ProjectedObjectBounds>,
+    layerBoundsOut: MutableMap<String, RectF>,
+    scratch: CanvasOverlayScratch,
+    tickFloat: Float
 ) {
+    objectBoundsOut.clear()
+    layerBoundsOut.clear()
+
     // 1. Clean 3D Studio Backdrop (NO 2D square screen-space grid in the 3D stage!)
     val stageSkySettings = if (bgSettings.skyMode == SkyBackdropMode.GRADE_ESPACIAL) {
         bgSettings.copy(skyMode = SkyBackdropMode.ESTUDIO_ESCURO)
@@ -3904,13 +4663,10 @@ private fun drawInteractive3DStageViewport(
     val vpCx = canvasW * 0.5f + view3DPanX
     val vpCy = canvasH * 0.50f + view3DPanY
 
-    // 2. Studio Floor 3D Perspective XZ Grid (neutral dark studio grid + X/Y axes)
+    // 2. Studio Floor 3D Perspective XZ Grid
     val floorY = min(canvasW, canvasH) * 0.25f * view3DZoom
     val gridHalf = min(canvasW, canvasH) * 0.62f * view3DZoom
-    val gridPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-        style = AndroidPaint.Style.STROKE
-        strokeWidth = 1.0f * screenDensity
-    }
+    val gridPaint = scratch.stageGridPaint
     val gridSteps = 10
     for (i in -gridSteps..gridSteps) {
         val t = i.toFloat() / gridSteps.toFloat()
@@ -3918,14 +4674,12 @@ private fun drawInteractive3DStageViewport(
         val edgeFade = (1f - abs(t) * 0.65f).coerceIn(0.25f, 1f)
         val minorAlpha = (42f * edgeFade).roundToInt()
 
-        // Lines parallel to X axis
         gridPaint.color = if (i == 0) AndroidColor.argb(190, 229, 77, 72) else AndroidColor.argb(minorAlpha, 210, 218, 232)
         gridPaint.strokeWidth = if (i == 0) 1.6f * screenDensity else 0.9f * screenDensity
         val a1 = projectPoint3D(-gridHalf, floorY, pos, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
         val b1 = projectPoint3D(gridHalf, floorY, pos, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
         nativeCanvas.drawLine(a1.x, a1.y, b1.x, b1.y, gridPaint)
 
-        // Lines parallel to depth axis
         gridPaint.color = if (i == 0) AndroidColor.argb(190, 86, 189, 98) else AndroidColor.argb(minorAlpha, 210, 218, 232)
         gridPaint.strokeWidth = if (i == 0) 1.6f * screenDensity else 0.9f * screenDensity
         val a2 = projectPoint3D(pos, floorY, -gridHalf, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
@@ -3933,16 +4687,13 @@ private fun drawInteractive3DStageViewport(
         nativeCanvas.drawLine(a2.x, a2.y, b2.x, b2.y, gridPaint)
     }
     val originPt = projectPoint3D(0f, floorY, 0f, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-    val originPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.argb(190, 255, 167, 38)
-        style = AndroidPaint.Style.STROKE
-        strokeWidth = 1.4f * screenDensity
-    }
-    nativeCanvas.drawCircle(originPt.x, originPt.y, 4.5f * screenDensity, originPaint)
+    scratch.stageOriginPaint.strokeWidth = 1.4f * screenDensity
+    nativeCanvas.drawCircle(originPt.x, originPt.y, 4.5f * screenDensity, scratch.stageOriginPaint)
 
-    // 3. Collect Background Plane (backmost +Z) + Transparent Layer Planes (topmost closest to camera -Z)
+    // 3. Collect Background Plane (+Z) + Transparent Layer Planes (unified projection scale)
     val cardW = min(canvasW, canvasH) * 0.28f * view3DZoom
     val cardH = cardW * (projHeight / projWidth.coerceAtLeast(1f)).coerceIn(0.42f, 1.55f)
+    val stageProjScale = (2f * cardW) / projWidth.coerceAtLeast(1f)
     val layerCount = layers.size.coerceAtLeast(1)
     val depthStep = ((camSettings.layerDepthSpacing / 120f).coerceIn(0.10f, 1f) * (min(canvasW, canvasH) * 0.085f) + 14f * screenDensity) * view3DZoom
     val baseCamGap = min(canvasW, canvasH) * 0.34f * view3DZoom / evaluatedKf.zoom.coerceIn(0.30f, 3.5f)
@@ -3950,7 +4701,6 @@ private fun drawInteractive3DStageViewport(
 
     val planes = ArrayList<Stage3DPlaneItem>(layerCount + 1)
 
-    // Canvas Background Paper Plane sits STRICTLY BEHIND all drawing layers (+Z)
     if (bgSettings.style != CanvasBackgroundStyle.TRANSPARENTE && bgBitmap != null && !bgBitmap.isRecycled) {
         val bgZ = zLayout.backgroundPlaneZ
         val pTL = projectPoint3D(-cardW, -cardH, bgZ, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
@@ -3961,31 +4711,54 @@ private fun drawInteractive3DStageViewport(
         planes.add(Stage3DPlaneItem(centerZ, "Fundo (${bgSettings.style.labelPt})", bgBitmap, 1f, true, pTL, pTR, pBR, pBL))
     }
 
+    var selectedTargetCenter3D: Triple<Float, Float, Float>? = null
+
     layers.forEachIndexed { idx, layer ->
         if (!layer.isVisible || layer.opacity <= 0f) return@forEachIndexed
-        val wz = zLayout.layerZs[idx]
-        val pTL = projectPoint3D(-cardW, -cardH, wz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        val pTR = projectPoint3D(cardW, -cardH, wz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        val pBR = projectPoint3D(cardW, cardH, wz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        val pBL = projectPoint3D(-cardW, cardH, wz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+        val lTf = Camera3DEngine.evaluateLayerTransformAtTick(
+            camSettings.layerTransformTracks,
+            layer.id,
+            tickFloat,
+            camSettings.autoInterpolate
+        )
+        val lOffX = lTf.x * stageProjScale
+        val lOffY = lTf.y * stageProjScale
+        val wz = zLayout.layerZs[idx] + lTf.z * stageProjScale
+        val lw = cardW * lTf.scaleX
+        val lh = cardH * lTf.scaleY
+        val pTL = projectPoint3D(lOffX - lw, lOffY - lh, wz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+        val pTR = projectPoint3D(lOffX + lw, lOffY - lh, wz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+        val pBR = projectPoint3D(lOffX + lw, lOffY + lh, wz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+        val pBL = projectPoint3D(lOffX - lw, lOffY + lh, wz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
         val centerZ = (pTL.zDepth + pTR.zDepth + pBR.zDepth + pBL.zDepth) * 0.25f
-        val showLabel = idx == layers.lastIndex || layers.size <= 3
+        val isSel = stageSelection.type == StageTargetType.LAYER && stageSelection.id == layer.id
+        if (isSel) selectedTargetCenter3D = Triple(lOffX, lOffY, wz)
+        layerBoundsOut[layer.id] = RectF(
+            min(min(pTL.x, pTR.x), min(pBR.x, pBL.x)),
+            min(min(pTL.y, pTR.y), min(pBR.y, pBL.y)),
+            max(max(pTL.x, pTR.x), max(pBR.x, pBL.x)),
+            max(max(pTL.y, pTR.y), max(pBR.y, pBL.y))
+        )
+        val showLabel = isSel || idx == layers.lastIndex || layers.size <= 3
         planes.add(
             Stage3DPlaneItem(
                 zOrder = centerZ,
-                label = if (showLabel) layer.name else null,
+                label = if (showLabel) (if (isSel) "★ ${layer.name}" else layer.name) else null,
                 bitmap = layerBitmaps[layer.id],
-                opacity = layer.opacity,
+                opacity = (layer.opacity * lTf.opacity).coerceIn(0f, 1f),
                 isBackground = false,
                 pTL = pTL, pTR = pTR, pBR = pBR, pBL = pBL
             )
         )
     }
 
-    // 4. Compute 3D Camera Frustum Cone (in front of all layers at -Z, aiming into +Z layers!)
+    // 4. Camera Frustum Cone (aim matches Camera yaw/pitch/roll/zoom/x/y identically)
     val camDistZ = zLayout.cameraApexZ
-    val camShiftX = (evaluatedKf.x * 0.16f + evaluatedKf.yawY * 2.2f) * view3DZoom
-    val camShiftY = (evaluatedKf.y * 0.16f - evaluatedKf.pitchX * 1.9f) * view3DZoom
+    val targetX = evaluatedKf.x * stageProjScale
+    val targetY = evaluatedKf.y * stageProjScale
+    val camLookDist = max(cardW, cardH) * 0.65f
+    val camShiftX = targetX + sin(Math.toRadians(evaluatedKf.yawY.toDouble())).toFloat() * camLookDist
+    val camShiftY = targetY - sin(Math.toRadians(evaluatedKf.pitchX.toDouble())).toFloat() * camLookDist
     val pyramidLen = min(canvasW, canvasH) * 0.13f * view3DZoom
     val sensScale = (tan(Math.toRadians(evaluatedKf.fovDegrees.coerceIn(18f, 120f) * 0.5)) / tan(Math.toRadians(25.0))).toFloat().coerceIn(0.35f, 2.2f)
     val camAspect = (camSettings.captureWidth.toFloat() / camSettings.captureHeight.coerceAtLeast(1).toFloat()).coerceIn(0.45f, 2.2f)
@@ -3993,8 +4766,6 @@ private fun drawInteractive3DStageViewport(
     val sensH = (sensW / camAspect).coerceIn(cardH * 0.22f, cardH * 0.85f)
     val nearZ = camDistZ + pyramidLen
 
-    val targetX = evaluatedKf.x * 0.16f * view3DZoom
-    val targetY = evaluatedKf.y * 0.16f * view3DZoom
     val rollRad = Math.toRadians(evaluatedKf.rotationZ.toDouble())
     val cosR = cos(rollRad).toFloat()
     val sinR = sin(rollRad).toFloat()
@@ -4012,7 +4783,6 @@ private fun drawInteractive3DStageViewport(
     val upTriTip = rotCamCorner(0f, -sensH * 1.48f, nearZ, camShiftX * 0.72f + targetX * 0.28f, camShiftY * 0.72f + targetY * 0.28f)
     val camCenterZ = (apex.zDepth + (cTL.zDepth + cBR.zDepth) * 0.5f) * 0.5f
 
-    // Projected capture target corners on front artwork plane so animator sees camera sight lines
     val frontZ = zLayout.layerZs.last()
     val tgtScale = (1f / evaluatedKf.zoom.coerceIn(0.35f, 3.5f)) * sensScale.coerceIn(0.45f, 1.85f)
     val tTL = rotCamCorner(-cardW * tgtScale, -cardH * tgtScale, frontZ, targetX, targetY)
@@ -4020,31 +4790,42 @@ private fun drawInteractive3DStageViewport(
     val tBR = rotCamCorner(cardW * tgtScale, cardH * tgtScale, frontZ, targetX, targetY)
     val tBL = rotCamCorner(-cardW * tgtScale, cardH * tgtScale, frontZ, targetX, targetY)
 
-    val polyMatrix = AndroidMatrix()
-    val layerBmpPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG or AndroidPaint.FILTER_BITMAP_FLAG or AndroidPaint.DITHER_FLAG)
-    val cardStrokePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-        style = AndroidPaint.Style.STROKE
-        strokeWidth = 1.4f * screenDensity
+    // Precompute selected 3D object center if applicable
+    if (stageSelection.type == StageTargetType.OBJECT_3D) {
+        camSettings.scene3DObjects.firstOrNull { it.id == stageSelection.id }?.let { selObj ->
+            val tf = Camera3DEngine.evaluateObjectTransformAtTick(selObj.keyframes, tickFloat, camSettings.autoInterpolate)
+            selectedTargetCenter3D = Triple(
+                tf.x * stageProjScale,
+                tf.y * stageProjScale,
+                tf.z * stageProjScale
+            )
+        }
     }
-    val labelPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.WHITE
-        textSize = 9.5f * screenDensity
-        isFakeBoldText = true
-    }
-    val labelBgPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.argb(175, 14, 17, 24)
-        style = AndroidPaint.Style.FILL
-    }
-    val cardPath = AndroidPath()
+
+    val polyMatrix = scratch.stagePolyMatrix
+    val layerBmpPaint = scratch.stageLayerBmpPaint
+    val cardStrokePaint = scratch.stageCardStrokePaint
+    val labelPaint = scratch.stageLabelPaint
+    labelPaint.textSize = 9.5f * screenDensity
+    val labelBgPaint = scratch.stageLabelBgPaint
+    val cardPath = scratch.stageCardPath
+    val srcPts = scratch.stageSrcPts
+    val dstPts = scratch.stageDstPts
 
     fun drawPlane(plane: Stage3DPlaneItem) {
         val bmp = plane.bitmap
         if (bmp != null && !bmp.isRecycled && bmp.width > 0 && bmp.height > 0) {
             val bw = bmp.width.toFloat()
             val bh = bmp.height.toFloat()
-            val src = floatArrayOf(0f, 0f, bw, 0f, bw, bh, 0f, bh)
-            val dst = floatArrayOf(plane.pTL.x, plane.pTL.y, plane.pTR.x, plane.pTR.y, plane.pBR.x, plane.pBR.y, plane.pBL.x, plane.pBL.y)
-            if (polyMatrix.setPolyToPoly(src, 0, dst, 0, 4)) {
+            srcPts[0] = 0f; srcPts[1] = 0f
+            srcPts[2] = bw; srcPts[3] = 0f
+            srcPts[4] = bw; srcPts[5] = bh
+            srcPts[6] = 0f; srcPts[7] = bh
+            dstPts[0] = plane.pTL.x; dstPts[1] = plane.pTL.y
+            dstPts[2] = plane.pTR.x; dstPts[3] = plane.pTR.y
+            dstPts[4] = plane.pBR.x; dstPts[5] = plane.pBR.y
+            dstPts[6] = plane.pBL.x; dstPts[7] = plane.pBL.y
+            if (polyMatrix.setPolyToPoly(srcPts, 0, dstPts, 0, 4)) {
                 layerBmpPaint.alpha = (plane.opacity.coerceIn(0f, 1f) * 255f).roundToInt()
                 nativeCanvas.save()
                 nativeCanvas.concat(polyMatrix)
@@ -4058,11 +4839,12 @@ private fun drawInteractive3DStageViewport(
         cardPath.lineTo(plane.pBR.x, plane.pBR.y)
         cardPath.lineTo(plane.pBL.x, plane.pBL.y)
         cardPath.close()
-        cardStrokePaint.color = if (plane.isBackground) {
-            AndroidColor.argb(185, 165, 185, 220)
-        } else {
-            (accentColorInt and 0x00FFFFFF) or (200 shl 24)
+        cardStrokePaint.color = when {
+            plane.label?.startsWith("★ ") == true -> AndroidColor.rgb(0, 230, 118)
+            plane.isBackground -> AndroidColor.argb(185, 165, 185, 220)
+            else -> (accentColorInt and 0x00FFFFFF) or (200 shl 24)
         }
+        cardStrokePaint.strokeWidth = if (plane.label?.startsWith("★ ") == true) 2.4f * screenDensity else 1.4f * screenDensity
         nativeCanvas.drawPath(cardPath, cardStrokePaint)
         plane.label?.let { lbl ->
             val lx = plane.pTL.x + 4f * screenDensity
@@ -4081,13 +4863,14 @@ private fun drawInteractive3DStageViewport(
         }
     }
 
-    fun drawCameraAndGizmo() {
-        // Subtle dashed frustum sight rays to target frame
-        val rayPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.argb(if (isMoveCameraMode) 150 else 85, 255, 179, 64)
-            style = AndroidPaint.Style.STROKE
-            strokeWidth = 1.1f * screenDensity
-            pathEffect = DashPathEffect(floatArrayOf(5f * screenDensity, 5f * screenDensity), 0f)
+    fun drawCameraFrustumOnly() {
+        val isCamSelected = stageSelection.type == StageTargetType.CAMERA
+        val rayPaint = scratch.stageRayPaint
+        rayPaint.color = AndroidColor.argb(if (isMoveCameraMode || isCamSelected) 150 else 85, 255, 179, 64)
+        rayPaint.strokeWidth = 1.1f * screenDensity
+        if (scratch.stageRayDashDensity != screenDensity) {
+            rayPaint.pathEffect = DashPathEffect(floatArrayOf(5f * screenDensity, 5f * screenDensity), 0f)
+            scratch.stageRayDashDensity = screenDensity
         }
         nativeCanvas.drawLine(cTL.x, cTL.y, tTL.x, tTL.y, rayPaint)
         nativeCanvas.drawLine(cTR.x, cTR.y, tTR.x, tTR.y, rayPaint)
@@ -4098,16 +4881,10 @@ private fun drawInteractive3DStageViewport(
         nativeCanvas.drawLine(tBR.x, tBR.y, tBL.x, tBL.y, rayPaint)
         nativeCanvas.drawLine(tBL.x, tBL.y, tTL.x, tTL.y, rayPaint)
 
-        // Camera pyramid cone
-        val frustumStroke = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = if (isMoveCameraMode) AndroidColor.rgb(255, 193, 7) else AndroidColor.rgb(255, 167, 38)
-            style = AndroidPaint.Style.STROKE
-            strokeWidth = if (isMoveCameraMode) 2.5f * screenDensity else 2.0f * screenDensity
-        }
-        val frustumFill = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.argb(230, 255, 145, 0)
-            style = AndroidPaint.Style.FILL
-        }
+        val frustumStroke = scratch.stageFrustumStrokePaint
+        frustumStroke.color = if (isCamSelected) AndroidColor.rgb(255, 193, 7) else AndroidColor.argb(170, 255, 167, 38)
+        frustumStroke.strokeWidth = if (isCamSelected) 2.5f * screenDensity else 1.7f * screenDensity
+        val frustumFill = scratch.stageFrustumFillPaint
         nativeCanvas.drawLine(apex.x, apex.y, cTL.x, cTL.y, frustumStroke)
         nativeCanvas.drawLine(apex.x, apex.y, cTR.x, cTR.y, frustumStroke)
         nativeCanvas.drawLine(apex.x, apex.y, cBR.x, cBR.y, frustumStroke)
@@ -4128,84 +4905,93 @@ private fun drawInteractive3DStageViewport(
         cardPath.close()
         nativeCanvas.drawPath(cardPath, frustumFill)
 
-        // Interactive 3D XYZ Transform Gizmo attached to Camera Apex
+        nativeCanvas.drawCircle(apex.x, apex.y, 5.5f * screenDensity, frustumFill)
+    }
+
+    fun drawActiveGizmoAt(gx: Float, gy: Float, gz: Float) {
+        val center = projectPoint3D(gx, gy, gz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
         val handleLen = 46f * screenDensity
-        val xEnd = projectPoint3D(camShiftX + handleLen, camShiftY, camDistZ, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        val yEnd = projectPoint3D(camShiftX, camShiftY + handleLen, camDistZ, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        val zEnd = projectPoint3D(camShiftX, camShiftY, camDistZ + handleLen, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+        val xEnd = projectPoint3D(gx + handleLen, gy, gz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+        val yEnd = projectPoint3D(gx, gy + handleLen, gz, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+        val zEnd = projectPoint3D(gx, gy, gz + handleLen, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
 
-        val gizmoPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            strokeWidth = 2.3f * screenDensity
-            style = AndroidPaint.Style.STROKE
-        }
-        val gizmoHandleFill = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.FILL }
-        val gizmoTextPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = AndroidColor.WHITE
-            textSize = 8f * screenDensity
-            isFakeBoldText = true
-            textAlign = AndroidPaint.Align.CENTER
-        }
+        val gizmoPaint = scratch.stageGizmoPaint
+        gizmoPaint.strokeWidth = 2.3f * screenDensity
+        val gizmoHandleFill = scratch.stageGizmoHandleFillPaint
+        val gizmoTextPaint = scratch.stageGizmoTextPaint
+        gizmoTextPaint.textSize = 8f * screenDensity
 
-        // X Axis (Red)
         gizmoPaint.color = AndroidColor.rgb(239, 83, 80)
         gizmoHandleFill.color = gizmoPaint.color
-        nativeCanvas.drawLine(apex.x, apex.y, xEnd.x, xEnd.y, gizmoPaint)
+        nativeCanvas.drawLine(center.x, center.y, xEnd.x, xEnd.y, gizmoPaint)
         nativeCanvas.drawCircle(xEnd.x, xEnd.y, 7f * screenDensity, gizmoHandleFill)
         nativeCanvas.drawText("X", xEnd.x, xEnd.y + 3f * screenDensity, gizmoTextPaint)
 
-        // Y Axis (Green)
         gizmoPaint.color = AndroidColor.rgb(102, 187, 106)
         gizmoHandleFill.color = gizmoPaint.color
-        nativeCanvas.drawLine(apex.x, apex.y, yEnd.x, yEnd.y, gizmoPaint)
+        nativeCanvas.drawLine(center.x, center.y, yEnd.x, yEnd.y, gizmoPaint)
         nativeCanvas.drawCircle(yEnd.x, yEnd.y, 7f * screenDensity, gizmoHandleFill)
         nativeCanvas.drawText("Y", yEnd.x, yEnd.y + 3f * screenDensity, gizmoTextPaint)
 
-        // Z Depth Axis (Blue)
         gizmoPaint.color = AndroidColor.rgb(66, 165, 245)
         gizmoHandleFill.color = gizmoPaint.color
-        nativeCanvas.drawLine(apex.x, apex.y, zEnd.x, zEnd.y, gizmoPaint)
+        nativeCanvas.drawLine(center.x, center.y, zEnd.x, zEnd.y, gizmoPaint)
         nativeCanvas.drawCircle(zEnd.x, zEnd.y, 7f * screenDensity, gizmoHandleFill)
         nativeCanvas.drawText("Z", zEnd.x, zEnd.y + 3f * screenDensity, gizmoTextPaint)
 
-        // Camera Apex center handle
-        nativeCanvas.drawCircle(apex.x, apex.y, 6.5f * screenDensity, frustumFill)
+        gizmoHandleFill.color = AndroidColor.rgb(255, 193, 7)
+        nativeCanvas.drawCircle(center.x, center.y, 6.5f * screenDensity, gizmoHandleFill)
         gizmoPaint.color = AndroidColor.WHITE
         gizmoPaint.strokeWidth = 1.4f * screenDensity
-        nativeCanvas.drawCircle(apex.x, apex.y, 6.5f * screenDensity, gizmoPaint)
+        nativeCanvas.drawCircle(center.x, center.y, 6.5f * screenDensity, gizmoPaint)
 
-        // Store normalized screen-space vectors for direct touch-dragging of each axis
-        fun normDir(tx: Float, ty: Float): Pair<Float, Float> {
-            val dx = tx - apex.x
-            val dy = ty - apex.y
-            val len = hypot(dx, dy).coerceAtLeast(1f)
-            return (dx / len) to (dy / len)
-        }
-        val (xdx, xdy) = normDir(xEnd.x, xEnd.y)
-        val (ydx, ydy) = normDir(yEnd.x, yEnd.y)
-        val (zdx, zdy) = normDir(zEnd.x, zEnd.y)
+        val xdx = xEnd.x - center.x; val xdy = xEnd.y - center.y
+        val xLen = hypot(xdx, xdy).coerceAtLeast(1f)
+        val ydx = yEnd.x - center.x; val ydy = yEnd.y - center.y
+        val yLen = hypot(ydx, ydy).coerceAtLeast(1f)
+        val zdx = zEnd.x - center.x; val zdy = zEnd.y - center.y
+        val zLen = hypot(zdx, zdy).coerceAtLeast(1f)
+
         gizmoOut.valid = true
-        gizmoOut.apexX = apex.x; gizmoOut.apexY = apex.y
+        gizmoOut.apexX = center.x; gizmoOut.apexY = center.y
         gizmoOut.xTipX = xEnd.x; gizmoOut.xTipY = xEnd.y
         gizmoOut.yTipX = yEnd.x; gizmoOut.yTipY = yEnd.y
         gizmoOut.zTipX = zEnd.x; gizmoOut.zTipY = zEnd.y
-        gizmoOut.xDirScreenX = xdx; gizmoOut.xDirScreenY = xdy
-        gizmoOut.yDirScreenX = ydx; gizmoOut.yDirScreenY = ydy
-        gizmoOut.zDirScreenX = zdx; gizmoOut.zDirScreenY = zdy
+        gizmoOut.xDirScreenX = xdx / xLen; gizmoOut.xDirScreenY = xdy / xLen
+        gizmoOut.yDirScreenX = ydx / yLen; gizmoOut.yDirScreenY = ydy / yLen
+        gizmoOut.zDirScreenX = zdx / zLen; gizmoOut.zDirScreenY = zdy / zLen
     }
 
-    // Proper 3D painter's order interleaving Planes and Camera Frustum from any 360° orbit angle
-    val sortedPlanes = planes.sortedByDescending { it.zOrder }
-    var camDrawn = false
-    for (plane in sortedPlanes) {
-        if (!camDrawn && camCenterZ > plane.zOrder) {
-            drawCameraAndGizmo()
-            camDrawn = true
-        }
-        drawPlane(plane)
+    // Painter's order across 2D planes, background-rasterized 3D objects, and Camera Frustum
+    val visible3DObjs = camSettings.scene3DObjects.filter { it.isVisible }
+    val drawItems = ArrayList<Pair<Float, () -> Unit>>(planes.size + visible3DObjs.size + 1)
+    planes.forEach { p -> drawItems.add(p.zOrder to { drawPlane(p) }) }
+
+    scratch.dstRectF.set(0f, 0f, canvasW, canvasH)
+    for (obj in visible3DObjs) {
+        val entry = objectEntries[obj.id] ?: continue
+        val bmp = entry.bitmap
+        val b = entry.bounds
+        if (bmp.isRecycled || b == null) continue
+        objectBoundsOut[obj.id] = b
+        drawItems.add(b.avgDepth to {
+            scratch.srcRect.set(0, 0, bmp.width, bmp.height)
+            layerBmpPaint.alpha = 255
+            nativeCanvas.drawBitmap(bmp, scratch.srcRect, scratch.dstRectF, layerBmpPaint)
+            if (stageSelection.type == StageTargetType.OBJECT_3D && stageSelection.id == obj.id) {
+                scratch.stageSelObjStrokePaint.strokeWidth = 2.0f * screenDensity
+                nativeCanvas.drawRect(b.minX, b.minY, b.maxX, b.maxY, scratch.stageSelObjStrokePaint)
+                nativeCanvas.drawText("★ ${obj.name}", b.minX, b.minY - 5f * screenDensity, labelPaint)
+            }
+        })
     }
-    if (!camDrawn) {
-        drawCameraAndGizmo()
-    }
+
+    drawItems.add(camCenterZ to { drawCameraFrustumOnly() })
+    drawItems.sortedByDescending { it.first }.forEach { it.second.invoke() }
+
+    // Draw interactive 3D gizmo always visible on top of the selected stage element
+    val gizmoPos = selectedTargetCenter3D ?: Triple(camShiftX, camShiftY, camDistZ)
+    drawActiveGizmoAt(gizmoPos.first, gizmoPos.second, gizmoPos.third)
 
     // 5. Top-right XYZ Axis Orientation Gizmo
     val gizmoCx = canvasW - 36f * screenDensity
@@ -4219,24 +5005,23 @@ private fun drawInteractive3DStageViewport(
         Triple(yTip, AndroidColor.rgb(102, 187, 106), "Z"),
         Triple(zTip, AndroidColor.rgb(66, 165, 245), "Y")
     ).sortedByDescending { it.first.zDepth }
-    val axisLinePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { strokeWidth = 2.0f * screenDensity }
-    val axisDotPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { style = AndroidPaint.Style.FILL }
-    val axisTextPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.WHITE
-        textSize = 8f * screenDensity
-        isFakeBoldText = true
-        textAlign = AndroidPaint.Align.CENTER
-    }
+    scratch.stageAxisLinePaint.strokeWidth = 2.0f * screenDensity
+    scratch.stageAxisTextPaint.textSize = 8f * screenDensity
     axisList.forEach { (tip, col, lbl) ->
-        axisLinePaint.color = col
-        axisDotPaint.color = col
-        nativeCanvas.drawLine(gizmoCx, gizmoCy, tip.x, tip.y, axisLinePaint)
-        nativeCanvas.drawCircle(tip.x, tip.y, 6.5f * screenDensity, axisDotPaint)
-        nativeCanvas.drawText(lbl, tip.x, tip.y + 3f * screenDensity, axisTextPaint)
+        scratch.stageAxisLinePaint.color = col
+        scratch.stageAxisDotPaint.color = col
+        nativeCanvas.drawLine(gizmoCx, gizmoCy, tip.x, tip.y, scratch.stageAxisLinePaint)
+        nativeCanvas.drawCircle(tip.x, tip.y, 6.5f * screenDensity, scratch.stageAxisDotPaint)
+        nativeCanvas.drawText(lbl, tip.x, tip.y + 3f * screenDensity, scratch.stageAxisTextPaint)
     }
 
-    val modeHint = if (isMoveCameraMode) "Mover Câmera" else "Órbita (${view3DYaw.roundToInt()}°, ${view3DPitch.roundToInt()}°)"
-    val hudHint = "ESTÚDIO 3D • $modeHint • FOV ${evaluatedKf.fovDegrees.roundToInt()}° • Z ${(evaluatedKf.zoom * 100).roundToInt()}%"
+    val selName = when (stageSelection.type) {
+        StageTargetType.CAMERA -> "Câmera"
+        StageTargetType.LAYER -> layers.firstOrNull { it.id == stageSelection.id }?.name ?: "Camada"
+        StageTargetType.OBJECT_3D -> camSettings.scene3DObjects.firstOrNull { it.id == stageSelection.id }?.name ?: "Objeto 3D"
+    }
+    val modeHint = if (isMoveCameraMode) "Mover $selName" else "Órbita (${view3DYaw.roundToInt()}°, ${view3DPitch.roundToInt()}°)"
+    val hudHint = "ESTÚDIO 3D • Sel: $selName • $modeHint • FOV ${evaluatedKf.fovDegrees.roundToInt()}° • Z ${(evaluatedKf.zoom * 100).roundToInt()}%"
     nativeCanvas.drawText(hudHint, 12f * screenDensity, canvasH - 12f * screenDensity, labelPaint)
 }
 

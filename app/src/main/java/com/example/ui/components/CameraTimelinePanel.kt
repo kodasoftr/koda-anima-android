@@ -6,6 +6,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -13,11 +16,14 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -29,10 +35,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderSpecial
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Link
@@ -42,6 +50,9 @@ import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.ShowChart
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.ViewInAr
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Wallpaper
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -51,6 +62,7 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -61,16 +73,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.engine.BuiltIn3DPrimitive
 import com.example.engine.Camera3DEngine
+import com.example.engine.TimelineTrackEngine
+import com.example.model.AnimationProject
 import com.example.model.Camera3DKeyframe
 import com.example.model.Camera3DSettings
 import com.example.model.CameraBuiltInEffect
@@ -81,22 +100,34 @@ import com.example.model.CameraPresetTemplate
 import com.example.model.CanvasBackgroundSettings
 import com.example.model.CanvasBackgroundStyle
 import com.example.model.CanvasTexturePattern
+import com.example.model.Frame
+import com.example.model.GradientColorStop
 import com.example.model.KodanimaTheme
+import com.example.model.Layer
+import com.example.model.ObjectTransformKeyframe
 import com.example.model.SkyBackdropMode
+import com.example.model.StageSelection
+import com.example.model.StageTargetType
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.NeonGreen
 import com.example.ui.theme.NeonPink
 import com.example.ui.theme.OrangeAccent
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /**
- * Painel inferior do Estúdio de Câmera 2D e 3D Animada:
- * - Modo Câmera 2D Plano e Modo Câmera 3D Espacial
- * - Dope Sheet com canais (Resumo, Loc X/Y, Zoom, Rot Z, FOV, Incl/Órbita 3D), diamantes ◆ e conexão entre chaves
- * - Editor de Curvas Gráficas (Bezier interativa P1 / P2 arrastáveis)
- * - Efeitos Automáticos aplicáveis entre 2 pontos ou na posição da pinça (N quadros)
- * - Pós-Efeitos de Cena, Pasta Animada e Fundo/Céu 3D & 2D
+ * Painel inferior do Estúdio de Câmera 2D e 3D Animada (5 abas consolidadas):
+ * 0 - Timeline (Dope Sheet multi-faixas para Câmera, Camadas 2D e Objetos 3D, com toque longo para arrastar chaves)
+ * 1 - Transform (Controles do alvo selecionado: Câmera/Lente FOV ou Posição/Rotação/Escala 3D da Camada/Objeto)
+ * 2 - Cenas 3D (Importação .glb/.gltf/.obj+.mtl/.zip + Primitivas 3D + Seleção e Foco)
+ * 3 - Efeitos (Auto Efeitos & Pasta Animada, Curva Gráfica Bézier e Pós-FX)
+ * 4 - Fundo & Céu (Papel, Textura, Ponto Claro / Escuro + Pontos extras com Roda de Cores HSV inline)
  */
 @Composable
 fun CameraTimelinePanel(
@@ -142,6 +173,35 @@ fun CameraTimelinePanel(
     onRotateCameraBy: (Float) -> Unit = {},
     onTiltOrbitCameraBy: (Float, Float) -> Unit = { _, _ -> },
     onAddFrame: (() -> Unit)? = null,
+    layers: List<Layer> = emptyList(),
+    stageSelection: StageSelection = StageSelection(),
+    onSelectStageTarget: (StageSelection) -> Unit = {},
+    onFocusStageTarget: () -> Unit = {},
+    onMoveKeyframe: (fromFrame: Int, toFrame: Int) -> Unit = { _, _ -> },
+    onUpdateSelectedObjectTransform: ((ObjectTransformKeyframe) -> ObjectTransformKeyframe) -> Unit = {},
+    onAddOrUpdateSelectedKeyframe: (CameraEasingCurve?) -> Unit = {},
+    onDeleteSelectedKeyframeAt: (Int) -> Unit = {},
+    onResetSelectedTarget: () -> Unit = {},
+    onImport3DSceneClick: () -> Unit = {},
+    onAddBuiltIn3DPrimitive: (BuiltIn3DPrimitive) -> Unit = {},
+    onToggle3DObjectVisibility: (String) -> Unit = {},
+    onDelete3DObject: (String) -> Unit = {},
+    onSet3DObjectTint: (String, Long) -> Unit = { _, _ -> },
+    projectFrames: List<Frame> = emptyList(),
+    fps: Int = 24,
+    activeLayerIndex: Int = 0,
+    currentTimelineTick: Int = currentFrameIndex,
+    activeScrubTimeMs: Long? = null,
+    playbackTimeMs: Long? = null,
+    onSelectTick: (Int) -> Unit = onSelectFrame,
+    onScrubToMs: (Long) -> Unit = {},
+    onEndScrub: () -> Unit = {},
+    onSetLayerCelHold: (Int, Int, Int) -> Unit = { _, _, _ -> },
+    onMoveLayerCel: (Int, Int, Int) -> Unit = { _, _, _ -> },
+    onAddCelAtTick: (Int, Int) -> Unit = { _, _ -> },
+    onSetKeyframeHold: (Int, Int) -> Unit = { _, _ -> },
+    onApplyTweenBetween: (Int, Int, CameraEasingCurve) -> Unit = { _, _, _ -> },
+    onAddKeyframeAtTick: (Int) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val panelColor = Color(theme.panel)
@@ -149,33 +209,131 @@ fun CameraTimelinePanel(
     val accentColor = Color(theme.accent)
     val secondaryColor = Color(theme.secondaryAccent)
     val textColor = Color(theme.text)
+    val density = LocalDensity.current
 
-    // 0 = Timeline (Dope Sheet), 1 = Câmera (Transform/Lentes/Res.), 2 = Curvas, 3 = Efeitos & Pasta, 4 = Pós-FX, 5 = Fundo / Céu
+    // 5 Consolidated Studio Tabs:
+    // 0 = Timeline, 1 = Transform, 2 = Cenas 3D, 3 = Efeitos (Auto/Curvas/Pós-FX), 4 = Fundo & Céu
     var activeTab by remember { mutableIntStateOf(0) }
+    // Sub-section inside Tab 3 (Efeitos): 0 = Auto & Pasta, 1 = Curva Gráfica, 2 = Pós-FX
+    var activeEffectsSubTab by remember { mutableIntStateOf(0) }
+
     var customResW by remember(cameraSettings.captureWidth) { mutableStateOf(cameraSettings.captureWidth.toString()) }
     var customResH by remember(cameraSettings.captureHeight) { mutableStateOf(cameraSettings.captureHeight.toString()) }
     var templateNameInput by remember { mutableStateOf("") }
 
-    // Pair selection for Dope Sheet & ranged effects
+    // 2-Point Span Selection & Tweening state (Animate-inspired)
     var isPairSelectMode by remember { mutableStateOf(false) }
     var selectedPairA by remember { mutableStateOf<Int?>(null) }
     var selectedPairB by remember { mutableStateOf<Int?>(null) }
+    var showInlineBezierCurve by remember { mutableStateOf(false) }
     var effectApplyToPair by remember { mutableStateOf(false) }
     var pinchEffectDuration by remember { mutableIntStateOf(8) }
     var effectIntensity by remember { mutableFloatStateOf(1.0f) }
 
-    val is3DMode = cameraSettings.cameraMode == CameraMode.MODE_3D
-    val evaluatedKf = remember(cameraSettings, currentFrameIndex) {
-        Camera3DEngine.evaluateCameraAtFrame(cameraSettings, currentFrameIndex)
+    // Long-press keyframe drag state on Keyframe Track
+    var dragSourceFrame by remember { mutableStateOf<Int?>(null) }
+    var dragTargetFrame by remember { mutableStateOf<Int?>(null) }
+
+    // Fundo & Céu Color Wheel Target:
+    // 0 = Ponto Claro (skyLightColor/skyTopColor), 1 = Ponto Escuro (skyDarkColor/skyBottomColor),
+    // 2 = Parada intermediária selecionada, 3 = Papel Cor 1, 4 = Papel Cor 2
+    var skyWheelTarget by remember { mutableIntStateOf(0) }
+    var selectedSkyStopId by remember { mutableStateOf<String?>(null) }
+
+    // Independent camera runway expansion, zoom & stretch/move states
+    var extraRunwayTicks by remember { mutableIntStateOf(0) }
+    var timelineTickWidthDp by remember { mutableFloatStateOf(32f) }
+    var draggingCamCel by remember { mutableStateOf<Int?>(null) }
+    var liveCamCelHold by remember { mutableStateOf<Int?>(null) }
+    var movingCamCel by remember { mutableStateOf<Int?>(null) }
+    var liveMoveCamCelTick by remember { mutableStateOf<Int?>(null) }
+    var draggingKfTick by remember { mutableStateOf<Int?>(null) }
+    var liveDraggingKfHold by remember { mutableStateOf<Int?>(null) }
+
+    val safeFps = max(1, fps)
+    val effectiveTickFloat = remember(activeScrubTimeMs, playbackTimeMs, currentTimelineTick, safeFps) {
+        (activeScrubTimeMs ?: playbackTimeMs)?.let { TimelineTrackEngine.timeMsToTickFloat(it, safeFps) }
+            ?: currentTimelineTick.toFloat()
     }
-    val hasKeyAtCurrent = cameraSettings.keyframes.any { it.frameIndex == currentFrameIndex }
-    val activeOrNearestKf = remember(cameraSettings.keyframes, currentFrameIndex) {
-        cameraSettings.keyframes.firstOrNull { it.frameIndex == currentFrameIndex }
-            ?: cameraSettings.keyframes.minByOrNull { kotlin.math.abs(it.frameIndex - currentFrameIndex) }
+    val projForTrack = remember(projectFrames, totalFrames, safeFps, cameraSettings) {
+        AnimationProject(
+            fps = safeFps,
+            frames = projectFrames.ifEmpty { List(totalFrames.coerceAtLeast(1)) { Frame() } },
+            camera3D = cameraSettings
+        )
+    }
+    val totalRulerTicks = remember(projForTrack, totalFrames, safeFps, extraRunwayTicks) {
+        maxOf(
+            TimelineTrackEngine.computeTotalTicks(projForTrack, includeCameraRunway = true) + 8,
+            totalFrames + 8,
+            safeFps * 2,
+            24
+        ) + extraRunwayTicks
+    }
+
+    val is3DMode = cameraSettings.cameraMode == CameraMode.MODE_3D
+    val evaluatedKf = remember(cameraSettings, effectiveTickFloat) {
+        Camera3DEngine.evaluateCameraAtTick(cameraSettings, effectiveTickFloat)
+    }
+
+    val selectedLayerObj = remember(layers, stageSelection) {
+        if (stageSelection.type == StageTargetType.LAYER) layers.firstOrNull { it.id == stageSelection.id } else null
+    }
+    val selected3DObj = remember(cameraSettings.scene3DObjects, stageSelection) {
+        if (stageSelection.type == StageTargetType.OBJECT_3D) {
+            cameraSettings.scene3DObjects.firstOrNull { it.id == stageSelection.id }
+        } else null
+    }
+    val activeObjectKeyframes: List<ObjectTransformKeyframe> = remember(cameraSettings, stageSelection) {
+        when (stageSelection.type) {
+            StageTargetType.OBJECT_3D ->
+                cameraSettings.scene3DObjects.firstOrNull { it.id == stageSelection.id }?.keyframes ?: emptyList()
+            StageTargetType.LAYER ->
+                cameraSettings.layerTransformTracks.firstOrNull { it.layerId == stageSelection.id }?.keyframes ?: emptyList()
+            StageTargetType.CAMERA -> emptyList()
+        }
+    }
+    val evaluatedObjKf = remember(activeObjectKeyframes, effectiveTickFloat, cameraSettings.autoInterpolate) {
+        Camera3DEngine.evaluateObjectTransformAtTick(
+            keyframes = activeObjectKeyframes,
+            tickFloat = effectiveTickFloat,
+            autoInterpolate = cameraSettings.autoInterpolate
+        )
+    }
+
+    val isCameraTarget = stageSelection.type == StageTargetType.CAMERA ||
+        (stageSelection.type == StageTargetType.OBJECT_3D && selected3DObj == null) ||
+        (stageSelection.type == StageTargetType.LAYER && selectedLayerObj == null && cameraSettings.layerTransformTracks.none { it.layerId == stageSelection.id })
+
+    val hasKeyAtCurrent = if (isCameraTarget) {
+        cameraSettings.keyframes.any { it.frameIndex == currentTimelineTick }
+    } else {
+        activeObjectKeyframes.any { it.frameIndex == currentTimelineTick }
+    }
+    val currentKfHold = if (isCameraTarget) {
+        cameraSettings.keyframes.firstOrNull { it.frameIndex == currentTimelineTick }?.holdTicks?.coerceAtLeast(1) ?: 1
+    } else {
+        activeObjectKeyframes.firstOrNull { it.frameIndex == currentTimelineTick }?.holdTicks?.coerceAtLeast(1) ?: 1
+    }
+
+    val activeOrNearestKf = remember(cameraSettings.keyframes, currentTimelineTick, evaluatedKf) {
+        cameraSettings.keyframes.firstOrNull { it.frameIndex == currentTimelineTick }
+            ?: cameraSettings.keyframes.minByOrNull { abs(it.frameIndex - currentTimelineTick) }
             ?: evaluatedKf
     }
-    val sortedKeyFrames = remember(cameraSettings.keyframes) {
-        cameraSettings.keyframes.map { it.frameIndex }.sorted()
+    val sortedKeyFrames = remember(isCameraTarget, cameraSettings.keyframes, activeObjectKeyframes) {
+        if (isCameraTarget) {
+            cameraSettings.keyframes.map { it.frameIndex }.sorted()
+        } else {
+            activeObjectKeyframes.map { it.frameIndex }.sorted()
+        }
+    }
+    val activeKeyframeHolds = remember(isCameraTarget, cameraSettings.keyframes, activeObjectKeyframes) {
+        if (isCameraTarget) {
+            cameraSettings.keyframes.sortedBy { it.frameIndex }.map { it.frameIndex to it.holdTicks.coerceAtLeast(1) }
+        } else {
+            activeObjectKeyframes.sortedBy { it.frameIndex }.map { it.frameIndex to it.holdTicks.coerceAtLeast(1) }
+        }
     }
     val pairMin = remember(selectedPairA, selectedPairB) {
         val a = selectedPairA
@@ -186,6 +344,12 @@ fun CameraTimelinePanel(
         val a = selectedPairA
         val b = selectedPairB
         if (a != null && b != null) maxOf(a, b) else null
+    }
+
+    val targetDisplayName = when {
+        isCameraTarget -> "Câmera"
+        stageSelection.type == StageTargetType.LAYER -> "Camada: ${selectedLayerObj?.name ?: "Camada"}"
+        else -> "3D: ${selected3DObj?.name ?: "Objeto"}"
     }
 
     Surface(
@@ -266,7 +430,7 @@ fun CameraTimelinePanel(
 
                         if (is3DMode) {
                             CamPill(
-                                label = "Estúdio 3D",
+                                label = "Palco 3D",
                                 active = isSideView3D,
                                 activeColor = secondaryColor,
                                 textColor = textColor,
@@ -291,7 +455,7 @@ fun CameraTimelinePanel(
                         ) { onToggleCaptureFrameOverlay() }
                     }
 
-                    // Pinned Close Button (never clipped off on mobile)
+                    // Pinned Close Button
                     Surface(
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
@@ -307,12 +471,12 @@ fun CameraTimelinePanel(
                             horizontalArrangement = Arrangement.spacedBy(3.dp)
                         ) {
                             Icon(Icons.Default.Close, contentDescription = "Voltar à timeline normal", tint = textColor, modifier = Modifier.size(13.dp))
-                            Text("Timeline", fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = textColor)
+                            Text("Sair Câm.", fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = textColor)
                         }
                     }
                 }
 
-                // Row 2: Dedicated Studio Tab Strip
+                // Row 2: 5 Streamlined Studio Tabs
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -321,149 +485,206 @@ fun CameraTimelinePanel(
                     horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     CamTabPill("Timeline", activeTab == 0, accentColor, textColor, "cam_tab_dope") { activeTab = 0 }
-                    CamTabPill("Câmera & Lente", activeTab == 1, OrangeAccent, textColor, "cam_tab_camera") { activeTab = 1 }
-                    CamTabPill("Curvas", activeTab == 2, CyanAccent, textColor, "cam_tab_curves") { activeTab = 2 }
-                    CamTabPill("Efeitos & Pasta", activeTab == 3, secondaryColor, textColor, "cam_tab_effects") { activeTab = 3 }
-                    CamTabPill("Pós-FX", activeTab == 4, NeonPink, textColor, "cam_tab_post") { activeTab = 4 }
-                    CamTabPill("Fundo / Céu", activeTab == 5, NeonGreen, textColor, "cam_tab_bg") { activeTab = 5 }
+                    CamTabPill("Transform", activeTab == 1, OrangeAccent, textColor, "cam_tab_transform") { activeTab = 1 }
+                    CamTabPill("Cenas 3D (${cameraSettings.scene3DObjects.size})", activeTab == 2, CyanAccent, textColor, "cam_tab_scenes") { activeTab = 2 }
+                    CamTabPill("Efeitos", activeTab == 3, secondaryColor, textColor, "cam_tab_effects") { activeTab = 3 }
+                    CamTabPill("Fundo & Céu", activeTab == 4, NeonGreen, textColor, "cam_tab_bg") { activeTab = 4 }
                 }
 
                 @Composable
-                fun CameraTransformControlsContent(compactForSplit: Boolean) {
-                    Column(
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        // Quick Nudge Buttons
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("Mover:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
-                            CamPill("←", false, CyanAccent, textColor) { onNudgeCameraPan(-24f, 0f) }
-                            CamPill("↑", false, CyanAccent, textColor) { onNudgeCameraPan(0f, -24f) }
-                            CamPill("↓", false, CyanAccent, textColor) { onNudgeCameraPan(0f, 24f) }
-                            CamPill("→", false, CyanAccent, textColor) { onNudgeCameraPan(24f, 0f) }
-                            CamPill("Zoom -", false, accentColor, textColor) { onZoomCameraBy(0.9f) }
-                            CamPill("Zoom +", false, accentColor, textColor) { onZoomCameraBy(1.1f) }
-                            CamPill("↺ 15°", false, secondaryColor, textColor) { onRotateCameraBy(-15f) }
-                            CamPill("↻ 15°", false, secondaryColor, textColor) { onRotateCameraBy(15f) }
-                            if (is3DMode) {
-                                CamPill("Yaw-", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(-5f, 0f) }
-                                CamPill("Yaw+", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(5f, 0f) }
-                                CamPill("Pitch-", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(0f, -5f) }
-                                CamPill("Pitch+", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(0f, 5f) }
-                            }
-                            CamPill("Zerar Q${currentFrameIndex + 1}", false, CyanAccent, textColor, Icons.Default.RestartAlt) {
-                                onResetCurrentKeyframe()
-                            }
-                            if (!compactForSplit) {
-                                CamPill("Zerar Tudo", false, NeonPink, NeonPink, Icons.Default.RestartAlt) {
-                                    onResetKeyframes()
-                                }
-                            }
-                        }
-
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CamSlider("Zoom", "${((evaluatedKf.zoom * 100).roundToInt())}%", evaluatedKf.zoom, 0.3f..4.0f, accentColor, textColor, Modifier.weight(1f)) { z ->
-                                onUpdateCurrentCamera { it.copy(zoom = z) }
-                            }
-                            CamSlider("Giro Z", "${evaluatedKf.rotationZ.roundToInt()}°", evaluatedKf.rotationZ, -180f..180f, accentColor, textColor, Modifier.weight(1f)) { rz ->
-                                onUpdateCurrentCamera { it.copy(rotationZ = rz) }
-                            }
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CamSlider("Pan X", "${evaluatedKf.x.roundToInt()}", evaluatedKf.x, -800f..800f, secondaryColor, textColor, Modifier.weight(1f)) { px ->
-                                onUpdateCurrentCamera { it.copy(x = px) }
-                            }
-                            CamSlider("Pan Y", "${evaluatedKf.y.roundToInt()}", evaluatedKf.y, -800f..800f, secondaryColor, textColor, Modifier.weight(1f)) { py ->
-                                onUpdateCurrentCamera { it.copy(y = py) }
-                            }
-                        }
-
-                        CamSlider(
-                            label = "Lente FOV",
-                            valueText = "${evaluatedKf.fovDegrees.roundToInt()}°",
-                            value = evaluatedKf.fovDegrees,
-                            range = 18f..120f,
-                            accentColor = CyanAccent,
-                            textColor = textColor,
-                            modifier = Modifier.fillMaxWidth()
-                        ) { fov ->
-                            onSetCameraFov(fov)
-                        }
-
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("Lentes:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
-                            listOf(
-                                "24mm (84°)" to 84f,
-                                "35mm (63°)" to 63f,
-                                "50mm (46°)" to 46f,
-                                "85mm (28°)" to 28f
-                            ).forEach { (lensLabel, fovVal) ->
-                                val isSel = kotlin.math.abs(evaluatedKf.fovDegrees - fovVal) < 2f
-                                CamPill(lensLabel, isSel, CyanAccent, textColor) {
-                                    onSetCameraFov(fovVal)
-                                }
-                            }
-                        }
-
-                        if (is3DMode) {
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CamSlider("Incl. X", "${evaluatedKf.pitchX.roundToInt()}°", evaluatedKf.pitchX, -40f..40f, OrangeAccent, textColor, Modifier.weight(1f)) { px ->
-                                    onUpdateCurrentCamera { it.copy(pitchX = px) }
-                                }
-                                CamSlider("Órbita Y", "${evaluatedKf.yawY.roundToInt()}°", evaluatedKf.yawY, -40f..40f, OrangeAccent, textColor, Modifier.weight(1f)) { yy ->
-                                    onUpdateCurrentCamera { it.copy(yawY = yy) }
-                                }
-                            }
-                            CamSlider("Prof. Z", "${cameraSettings.layerDepthSpacing.roundToInt()}", cameraSettings.layerDepthSpacing, 0f..120f, NeonGreen, textColor, Modifier.fillMaxWidth()) { d ->
-                                onSetLayerDepthSpacing(d)
-                            }
-                        }
-
-                        if (!compactForSplit) {
+                fun TargetTransformControlsContent(compactForSplit: Boolean) {
+                    if (isCameraTarget) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .horizontalScroll(rememberScrollState()),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text("Res. Câmera:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
-                                listOf(1280 to 720, 1920 to 1080, 1080 to 1080, 1080 to 1920).forEach { (w, h) ->
-                                    val isSel = cameraSettings.captureWidth == w && cameraSettings.captureHeight == h
-                                    CamPill("${w}×${h}", isSel, accentColor, textColor) {
+                                Text("Câmera:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
+                                if (is3DMode) {
+                                    CamPill("Focar", false, CyanAccent, textColor, Icons.Default.CenterFocusStrong, testTag = "transform_focus_btn") {
+                                        onFocusStageTarget()
+                                    }
+                                }
+                                CamPill("←", false, CyanAccent, textColor) { onNudgeCameraPan(-24f, 0f) }
+                                CamPill("↑", false, CyanAccent, textColor) { onNudgeCameraPan(0f, -24f) }
+                                CamPill("↓", false, CyanAccent, textColor) { onNudgeCameraPan(0f, 24f) }
+                                CamPill("→", false, CyanAccent, textColor) { onNudgeCameraPan(24f, 0f) }
+                                CamPill("Zoom -", false, accentColor, textColor) { onZoomCameraBy(0.9f) }
+                                CamPill("Zoom +", false, accentColor, textColor) { onZoomCameraBy(1.1f) }
+                                CamPill("↺ 15°", false, secondaryColor, textColor) { onRotateCameraBy(-15f) }
+                                CamPill("↻ 15°", false, secondaryColor, textColor) { onRotateCameraBy(15f) }
+                                if (is3DMode) {
+                                    CamPill("Yaw-", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(-5f, 0f) }
+                                    CamPill("Yaw+", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(5f, 0f) }
+                                    CamPill("Pitch-", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(0f, -5f) }
+                                    CamPill("Pitch+", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(0f, 5f) }
+                                }
+                                CamPill("Zerar T${currentTimelineTick + 1}", false, CyanAccent, textColor, Icons.Default.RestartAlt) {
+                                    onResetCurrentKeyframe()
+                                }
+                                if (!compactForSplit) {
+                                    CamPill("Zerar Tudo", false, NeonPink, NeonPink, Icons.Default.RestartAlt) {
+                                        onResetKeyframes()
+                                    }
+                                }
+                            }
+
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CamSlider("Zoom", "${((evaluatedKf.zoom * 100).roundToInt())}%", evaluatedKf.zoom, 0.2f..4.5f, accentColor, textColor, Modifier.weight(1f)) { z ->
+                                    onUpdateCurrentCamera { it.copy(zoom = z) }
+                                }
+                                CamSlider("Giro Z", "${evaluatedKf.rotationZ.roundToInt()}°", evaluatedKf.rotationZ, -180f..180f, accentColor, textColor, Modifier.weight(1f)) { rz ->
+                                    onUpdateCurrentCamera { it.copy(rotationZ = rz) }
+                                }
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CamSlider("Pan X", "${evaluatedKf.x.roundToInt()}", evaluatedKf.x, -1200f..1200f, secondaryColor, textColor, Modifier.weight(1f)) { px ->
+                                    onUpdateCurrentCamera { it.copy(x = px) }
+                                }
+                                CamSlider("Pan Y", "${evaluatedKf.y.roundToInt()}", evaluatedKf.y, -1200f..1200f, secondaryColor, textColor, Modifier.weight(1f)) { py ->
+                                    onUpdateCurrentCamera { it.copy(y = py) }
+                                }
+                            }
+
+                            CamSlider(
+                                label = "Lente FOV",
+                                valueText = "${evaluatedKf.fovDegrees.roundToInt()}°",
+                                value = evaluatedKf.fovDegrees,
+                                range = 18f..120f,
+                                accentColor = CyanAccent,
+                                textColor = textColor,
+                                modifier = Modifier.fillMaxWidth()
+                            ) { fov ->
+                                onSetCameraFov(fov)
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Lentes:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
+                                listOf(
+                                    "24mm (84°)" to 84f,
+                                    "35mm (63°)" to 63f,
+                                    "50mm (46°)" to 46f,
+                                    "85mm (28°)" to 28f
+                                ).forEach { (lensLabel, fovVal) ->
+                                    val isSel = kotlin.math.abs(evaluatedKf.fovDegrees - fovVal) < 2f
+                                    CamPill(lensLabel, isSel, CyanAccent, textColor) {
+                                        onSetCameraFov(fovVal)
+                                    }
+                                }
+                            }
+
+                            if (is3DMode) {
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    CamSlider("Incl. X", "${evaluatedKf.pitchX.roundToInt()}°", evaluatedKf.pitchX, -45f..45f, OrangeAccent, textColor, Modifier.weight(1f)) { px ->
+                                        onUpdateCurrentCamera { it.copy(pitchX = px) }
+                                    }
+                                    CamSlider("Órbita Y", "${evaluatedKf.yawY.roundToInt()}°", evaluatedKf.yawY, -60f..60f, OrangeAccent, textColor, Modifier.weight(1f)) { yy ->
+                                        onUpdateCurrentCamera { it.copy(yawY = yy) }
+                                    }
+                                }
+                                CamSlider("Prof. Z", "${cameraSettings.layerDepthSpacing.roundToInt()}", cameraSettings.layerDepthSpacing, 0f..140f, NeonGreen, textColor, Modifier.fillMaxWidth()) { d ->
+                                    onSetLayerDepthSpacing(d)
+                                }
+                            }
+
+                            if (!compactForSplit) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    Text("Res. Câmera:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
+                                    listOf(1280 to 720, 1920 to 1080, 1080 to 1080, 1080 to 1920).forEach { (w, h) ->
+                                        val isSel = cameraSettings.captureWidth == w && cameraSettings.captureHeight == h
+                                        CamPill("${w}×${h}", isSel, accentColor, textColor) {
+                                            onSetCameraResolution(w, h)
+                                        }
+                                    }
+                                    OutlinedTextField(
+                                        value = customResW,
+                                        onValueChange = { customResW = it.filter { ch -> ch.isDigit() }.take(4) },
+                                        singleLine = true,
+                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                        modifier = Modifier.width(62.dp).height(42.dp)
+                                    )
+                                    Text("×", color = textColor, fontSize = 11.sp)
+                                    OutlinedTextField(
+                                        value = customResH,
+                                        onValueChange = { customResH = it.filter { ch -> ch.isDigit() }.take(4) },
+                                        singleLine = true,
+                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                        modifier = Modifier.width(62.dp).height(42.dp)
+                                    )
+                                    CamPill("Aplicar", false, NeonGreen, textColor) {
+                                        val w = customResW.toIntOrNull() ?: cameraSettings.captureWidth
+                                        val h = customResH.toIntOrNull() ?: cameraSettings.captureHeight
                                         onSetCameraResolution(w, h)
                                     }
                                 }
-                                OutlinedTextField(
-                                    value = customResW,
-                                    onValueChange = { customResW = it.filter { ch -> ch.isDigit() }.take(4) },
-                                    singleLine = true,
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                    modifier = Modifier.width(62.dp).height(42.dp)
-                                )
-                                Text("×", color = textColor, fontSize = 11.sp)
-                                OutlinedTextField(
-                                    value = customResH,
-                                    onValueChange = { customResH = it.filter { ch -> ch.isDigit() }.take(4) },
-                                    singleLine = true,
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                    modifier = Modifier.width(62.dp).height(42.dp)
-                                )
-                                CamPill("Aplicar", false, NeonGreen, textColor) {
-                                    val w = customResW.toIntOrNull() ?: cameraSettings.captureWidth
-                                    val h = customResH.toIntOrNull() ?: cameraSettings.captureHeight
-                                    onSetCameraResolution(w, h)
+                            }
+                        }
+                    } else {
+                        // Layer / 3D Object Transform Inspector
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(targetDisplayName, fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = OrangeAccent)
+                                CamPill("Focar", false, CyanAccent, textColor, Icons.Default.CenterFocusStrong, testTag = "transform_focus_btn") {
+                                    onFocusStageTarget()
+                                }
+                                CamPill(if (hasKeyAtCurrent) "Atualizar ◆" else "+ ◆ T${currentTimelineTick + 1}", hasKeyAtCurrent, OrangeAccent, textColor, Icons.Default.Add) {
+                                    onAddOrUpdateSelectedKeyframe(null)
+                                }
+                                CamPill("Zerar T${currentTimelineTick + 1}", false, NeonPink, NeonPink, Icons.Default.RestartAlt) {
+                                    onResetSelectedTarget()
+                                }
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CamSlider("Pos X", "${evaluatedObjKf.x.roundToInt()}", evaluatedObjKf.x, -1200f..1200f, CyanAccent, textColor, Modifier.weight(1f)) { nx ->
+                                    onUpdateSelectedObjectTransform { it.copy(x = nx) }
+                                }
+                                CamSlider("Pos Y", "${evaluatedObjKf.y.roundToInt()}", evaluatedObjKf.y, -1200f..1200f, CyanAccent, textColor, Modifier.weight(1f)) { ny ->
+                                    onUpdateSelectedObjectTransform { it.copy(y = ny) }
+                                }
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CamSlider("Pos Z", "${evaluatedObjKf.z.roundToInt()}", evaluatedObjKf.z, -800f..800f, NeonGreen, textColor, Modifier.weight(1f)) { nz ->
+                                    onUpdateSelectedObjectTransform { it.copy(z = nz) }
+                                }
+                                CamSlider("Escala", "${(evaluatedObjKf.scaleX * 100).roundToInt()}%", evaluatedObjKf.scaleX, 0.1f..5.0f, OrangeAccent, textColor, Modifier.weight(1f)) { sc ->
+                                    onUpdateSelectedObjectTransform { it.copy(scaleX = sc, scaleY = sc, scaleZ = sc) }
+                                }
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CamSlider("Rot X", "${evaluatedObjKf.rotX.roundToInt()}°", evaluatedObjKf.rotX, -180f..180f, secondaryColor, textColor, Modifier.weight(1f)) { rx ->
+                                    onUpdateSelectedObjectTransform { it.copy(rotX = rx) }
+                                }
+                                CamSlider("Rot Y", "${evaluatedObjKf.rotY.roundToInt()}°", evaluatedObjKf.rotY, -180f..180f, secondaryColor, textColor, Modifier.weight(1f)) { ry ->
+                                    onUpdateSelectedObjectTransform { it.copy(rotY = ry) }
+                                }
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CamSlider("Rot Z", "${evaluatedObjKf.rotZ.roundToInt()}°", evaluatedObjKf.rotZ, -180f..180f, accentColor, textColor, Modifier.weight(1f)) { rz ->
+                                    onUpdateSelectedObjectTransform { it.copy(rotZ = rz) }
+                                }
+                                CamSlider("Opac.", "${(evaluatedObjKf.opacity * 100).roundToInt()}%", evaluatedObjKf.opacity, 0f..1f, NeonPink, textColor, Modifier.weight(1f)) { op ->
+                                    onUpdateSelectedObjectTransform { it.copy(opacity = op) }
                                 }
                             }
                         }
@@ -471,35 +692,110 @@ fun CameraTimelinePanel(
                 }
 
                 when (activeTab) {
+                    // =========================================================================
+                    // TAB 0: TIMELINE ESTILO CLÁSSICO (2 Pontos + Interpolação Direta no Trecho)
+                    // =========================================================================
                     0 -> {
-                        val channels = remember(is3DMode) {
-                            buildList {
-                                add("Resumo")
-                                add("Loc X/Y")
-                                add("Zoom")
-                                add("Rot Z")
-                                add("FOV")
-                                if (is3DMode) {
-                                    add("Incl/Órb")
+                        val activeKeyframeMeta = remember(isCameraTarget, cameraSettings.keyframes, activeObjectKeyframes) {
+                            if (isCameraTarget) {
+                                cameraSettings.keyframes.sortedBy { it.frameIndex }
+                                    .map { Triple(it.frameIndex, it.holdTicks.coerceAtLeast(1), it.easing) }
+                            } else {
+                                activeObjectKeyframes.sortedBy { it.frameIndex }
+                                    .map { Triple(it.frameIndex, it.holdTicks.coerceAtLeast(1), it.easing) }
+                            }
+                        }
+
+                        // Resolve active 2-point span: explicit user pair OR current bracketed keyframe pair around Pinça
+                        val bracketPrevTick = activeKeyframeMeta.lastOrNull { it.first <= currentTimelineTick }?.first
+                        val bracketNextTick = activeKeyframeMeta.firstOrNull { it.first > currentTimelineTick }?.first
+                        val activeSpanStart: Int? = pairMin ?: if (bracketPrevTick != null && bracketNextTick != null) bracketPrevTick else null
+                        val activeSpanEnd: Int? = pairMax ?: if (bracketPrevTick != null && bracketNextTick != null) bracketNextTick else null
+                        val activeSpanEasing: CameraEasingCurve? = activeSpanStart?.let { sTick ->
+                            activeKeyframeMeta.firstOrNull { it.first == sTick }?.third
+                        }
+
+                        // Target Track Selector Strip (Câmera / Camadas / Objetos 3D)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Alvo:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
+                            CamPill(
+                                label = "Câmera (${cameraSettings.keyframes.size})",
+                                active = isCameraTarget,
+                                activeColor = accentColor,
+                                textColor = textColor,
+                                testTag = "target_track_camera"
+                            ) {
+                                onSelectStageTarget(StageSelection(StageTargetType.CAMERA, "camera"))
+                            }
+                            layers.forEach { layer ->
+                                val isSel = stageSelection.type == StageTargetType.LAYER && stageSelection.id == layer.id
+                                val kfCount = cameraSettings.layerTransformTracks.firstOrNull { it.layerId == layer.id }?.keyframes?.size ?: 0
+                                CamPill(
+                                    label = if (kfCount > 0) "${layer.name} (◆$kfCount)" else layer.name,
+                                    active = isSel,
+                                    activeColor = CyanAccent,
+                                    textColor = textColor,
+                                    testTag = "target_track_layer_${layer.id}"
+                                ) {
+                                    onSelectStageTarget(StageSelection(StageTargetType.LAYER, layer.id))
+                                }
+                            }
+                            cameraSettings.scene3DObjects.forEach { obj ->
+                                val isSel = stageSelection.type == StageTargetType.OBJECT_3D && stageSelection.id == obj.id
+                                CamPill(
+                                    label = "3D: ${obj.name} (◆${obj.keyframes.size})",
+                                    active = isSel,
+                                    activeColor = OrangeAccent,
+                                    textColor = textColor,
+                                    testTag = "target_track_obj_${obj.id}"
+                                ) {
+                                    onSelectStageTarget(StageSelection(StageTargetType.OBJECT_3D, obj.id))
                                 }
                             }
                         }
 
                         // Transport & Keyframe Status Row
+                        val curSecText = String.format(
+                            Locale.US,
+                            "%.2fs",
+                            TimelineTrackEngine.tickToTimeMs(currentTimelineTick, safeFps) / 1000.0
+                        )
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = if (pairMin != null && pairMax != null) {
-                                    "Par: Q${pairMin + 1}–Q${pairMax + 1}"
-                                } else {
-                                    "Q${currentFrameIndex + 1}/$totalFrames • ◆${sortedKeyFrames.size}"
+                                text = when {
+                                    dragSourceFrame != null && dragTargetFrame != null ->
+                                        "Movendo ◆ T${dragSourceFrame!! + 1} → T${dragTargetFrame!! + 1}"
+                                    movingCamCel != null && liveMoveCamCelTick != null ->
+                                        "Movendo Cel Q${movingCamCel!! + 1} → T${liveMoveCamCelTick!! + 1}"
+                                    draggingCamCel != null && liveCamCelHold != null ->
+                                        "Esticando Cel Q${draggingCamCel!! + 1}: ${liveCamCelHold}q"
+                                    draggingKfTick != null && liveDraggingKfHold != null ->
+                                        "Sustentar ◆ T${draggingKfTick!! + 1}: ${liveDraggingKfHold}q"
+                                    isPairSelectMode && selectedPairA != null && selectedPairB == null ->
+                                        "Ponto 1: T${selectedPairA!! + 1} • Toque no Ponto 2"
+                                    pairMin != null && pairMax != null ->
+                                        "2 Pontos: T${pairMin + 1} ━━► T${pairMax + 1}"
+                                    else ->
+                                        "T${currentTimelineTick + 1} ($curSecText) • ◆${sortedKeyFrames.size}"
                                 },
                                 fontSize = 9.5.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = if (pairMin != null && pairMax != null) OrangeAccent else textColor.copy(alpha = 0.85f)
+                                color = when {
+                                    dragSourceFrame != null || movingCamCel != null -> NeonGreen
+                                    draggingCamCel != null || draggingKfTick != null -> CyanAccent
+                                    isPairSelectMode || (pairMin != null && pairMax != null) -> OrangeAccent
+                                    else -> textColor.copy(alpha = 0.88f)
+                                }
                             )
                             Row(
                                 modifier = Modifier
@@ -512,23 +808,106 @@ fun CameraTimelinePanel(
                                 CamPill("◀ ◆", false, CyanAccent, textColor, testTag = "camera_prev_key_btn") { onPrevKeyframe() }
 
                                 CamPill(
-                                    label = if (hasKeyAtCurrent) "Atualizar ◆" else "+ ◆ Q${currentFrameIndex + 1}",
+                                    label = if (hasKeyAtCurrent) "Atualizar ◆" else "+ ◆ T${currentTimelineTick + 1}",
                                     active = hasKeyAtCurrent,
                                     activeColor = OrangeAccent,
                                     textColor = textColor,
                                     icon = Icons.Default.Add
-                                ) { onAddOrUpdateKeyframe(null) }
+                                ) {
+                                    if (isCameraTarget) onAddOrUpdateKeyframe(null)
+                                    else onAddOrUpdateSelectedKeyframe(null)
+                                }
 
                                 CamPill("◆ ▶", false, CyanAccent, textColor, testTag = "camera_next_key_btn") { onNextKeyframe() }
+
+                                CamPill(
+                                    label = when {
+                                        isPairSelectMode && selectedPairA == null -> "Escolher Ponto 1..."
+                                        isPairSelectMode && selectedPairA != null && selectedPairB == null -> "Escolher Ponto 2..."
+                                        pairMin != null && pairMax != null -> "2 Pontos: T${pairMin + 1}–T${pairMax + 1}"
+                                        else -> "Escolher 2 Pontos"
+                                    },
+                                    active = isPairSelectMode || (pairMin != null && pairMax != null),
+                                    activeColor = OrangeAccent,
+                                    textColor = textColor,
+                                    icon = Icons.Default.Link,
+                                    testTag = "camera_pair_select_toggle"
+                                ) {
+                                    isPairSelectMode = !isPairSelectMode
+                                    if (isPairSelectMode && selectedPairA != null && selectedPairB != null) {
+                                        selectedPairA = null
+                                        selectedPairB = null
+                                    } else if (!isPairSelectMode && selectedPairB == null) {
+                                        selectedPairA = null
+                                    }
+                                }
+
+                                if (selectedPairA != null || selectedPairB != null) {
+                                    CamPill("Limpar", false, NeonPink, NeonPink) {
+                                        selectedPairA = null
+                                        selectedPairB = null
+                                        isPairSelectMode = false
+                                    }
+                                }
 
                                 CamPill(
                                     label = "Conectar ◆━◆",
                                     active = cameraSettings.autoInterpolate && sortedKeyFrames.size >= 2,
                                     activeColor = NeonGreen,
                                     textColor = textColor,
-                                    icon = Icons.Default.Link,
                                     testTag = "camera_connect_keyframes_btn"
                                 ) { onConnectTwoKeyframes() }
+
+                                if (hasKeyAtCurrent) {
+                                    val shownHold = if (draggingKfTick == currentTimelineTick && liveDraggingKfHold != null) {
+                                        liveDraggingKfHold!!
+                                    } else currentKfHold
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(OrangeAccent.copy(alpha = 0.14f))
+                                            .border(0.8.dp, OrangeAccent.copy(alpha = 0.45f), RoundedCornerShape(8.dp))
+                                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            text = "-1q",
+                                            fontSize = 8.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = textColor,
+                                            modifier = Modifier
+                                                .clickable { onSetKeyframeHold(currentTimelineTick, (shownHold - 1).coerceIn(1, 240)) }
+                                                .padding(horizontal = 3.dp, vertical = 1.dp)
+                                        )
+                                        Text(
+                                            text = "Pausa ${shownHold}q",
+                                            fontSize = 8.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = OrangeAccent
+                                        )
+                                        Text(
+                                            text = "+1q",
+                                            fontSize = 8.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = textColor,
+                                            modifier = Modifier
+                                                .clickable { onSetKeyframeHold(currentTimelineTick, (shownHold + 1).coerceIn(1, 240)) }
+                                                .padding(horizontal = 3.dp, vertical = 1.dp)
+                                        )
+                                    }
+
+                                    CamPill(
+                                        label = "Remover ◆",
+                                        active = false,
+                                        activeColor = NeonPink,
+                                        textColor = NeonPink,
+                                        icon = Icons.Default.DeleteOutline
+                                    ) {
+                                        if (isCameraTarget) onDeleteKeyframeAt(currentTimelineTick)
+                                        else onDeleteSelectedKeyframeAt(currentTimelineTick)
+                                    }
+                                }
 
                                 if (onAddFrame != null) {
                                     CamPill(
@@ -541,190 +920,886 @@ fun CameraTimelinePanel(
                                     ) { onAddFrame() }
                                 }
 
-                                if (hasKeyAtCurrent) {
-                                    CamPill(
-                                        label = "Remover ◆",
-                                        active = false,
-                                        activeColor = NeonPink,
-                                        textColor = NeonPink,
-                                        icon = Icons.Default.DeleteOutline
-                                    ) { onDeleteKeyframeAt(currentFrameIndex) }
-                                }
-
                                 CamPill(
-                                    label = if (isPairSelectMode) "Par: ON" else "Sel. 2 Pontos",
-                                    active = isPairSelectMode,
-                                    activeColor = OrangeAccent,
-                                    textColor = textColor,
-                                    testTag = "camera_pair_select_toggle"
-                                ) {
-                                    isPairSelectMode = !isPairSelectMode
-                                    if (!isPairSelectMode && selectedPairB == null) {
-                                        selectedPairA = null
-                                    }
+                                    label = "+ Tempo",
+                                    active = false,
+                                    activeColor = CyanAccent,
+                                    textColor = CyanAccent,
+                                    icon = Icons.Default.Add,
+                                    testTag = "camera_add_runway_btn"
+                                ) { extraRunwayTicks += safeFps }
+
+                                CamPill("-", false, textColor, textColor) {
+                                    timelineTickWidthDp = (timelineTickWidthDp - 4f).coerceIn(22f, 48f)
                                 }
-                                if (selectedPairA != null || selectedPairB != null) {
-                                    CamPill("Limpar Par", false, NeonPink, NeonPink) {
-                                        selectedPairA = null
-                                        selectedPairB = null
-                                    }
+                                CamPill("+", false, textColor, textColor) {
+                                    timelineTickWidthDp = (timelineTickWidthDp + 4f).coerceIn(22f, 48f)
                                 }
                             }
                         }
 
                         @Composable
                         fun DopeSheetBlock(modifier: Modifier = Modifier) {
-                            Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            val tickWidthDp = timelineTickWidthDp
+                            val tickWidth = tickWidthDp.dp
+                            val tickPx = with(density) { tickWidth.toPx() }.coerceAtLeast(1f)
+                            val rulerHeightDp = 22.dp
+                            val celRowHeightDp = 24.dp
+                            val keyTrackHeightDp = 40.dp
+                            val showCameraContextRow = !isCameraTarget && cameraSettings.keyframes.isNotEmpty()
+                            val contextRowHeightDp = 22.dp
+                            val gridTotalHeightDp = rulerHeightDp + celRowHeightDp + keyTrackHeightDp +
+                                (if (showCameraContextRow) contextRowHeightDp else 0.dp)
+                            val gridWidthDp = tickWidth * totalRulerTicks
+                            val dopeScrollState = rememberScrollState()
+
+                            val activeLayerName = layers.getOrNull(activeLayerIndex)?.name ?: "Camada"
+                            val activeCels = remember(projForTrack, activeLayerIndex) {
+                                TimelineTrackEngine.computeLayerCels(projForTrack, activeLayerIndex)
+                            }
+                            val keyframeSet = sortedKeyFrames.toSet()
+
+                            fun pickPairPoint(tIdx: Int) {
+                                when {
+                                    selectedPairA == null || (selectedPairA != null && selectedPairB != null) -> {
+                                        selectedPairA = tIdx
+                                        selectedPairB = null
+                                    }
+                                    selectedPairA != tIdx -> {
+                                        selectedPairB = tIdx
+                                        isPairSelectMode = false
+                                    }
+                                }
+                            }
+
+                            Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                                // Main Unified Timeline Strip
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .background(bgColor.copy(alpha = 0.65f))
-                                        .border(0.8.dp, textColor.copy(alpha = 0.16f), RoundedCornerShape(8.dp))
+                                        .clip(RoundedCornerShape(9.dp))
+                                        .background(bgColor.copy(alpha = 0.70f))
+                                        .border(0.9.dp, textColor.copy(alpha = 0.18f), RoundedCornerShape(9.dp))
                                 ) {
-                                    // Left channel labels column
+                                    // Left Pinned Track Headers
                                     Column(
                                         modifier = Modifier
-                                            .width(74.dp)
-                                            .background(panelColor.copy(alpha = 0.9f))
-                                            .padding(vertical = 3.dp)
+                                            .width(80.dp)
+                                            .height(gridTotalHeightDp)
+                                            .background(panelColor.copy(alpha = 0.94f))
                                     ) {
-                                        Text(
-                                            text = "Quadro",
-                                            fontSize = 8.5.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = accentColor,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                        )
-                                        channels.forEachIndexed { cIdx, chName ->
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(rulerHeightDp)
+                                                .background(bgColor.copy(alpha = 0.78f))
+                                                .padding(horizontal = 6.dp),
+                                            contentAlignment = Alignment.CenterStart
+                                        ) {
+                                            Text(
+                                                text = "Tempo (${safeFps}f)",
+                                                fontSize = 8.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = CyanAccent,
+                                                maxLines = 1
+                                            )
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(celRowHeightDp)
+                                                .background(accentColor.copy(alpha = 0.08f))
+                                                .padding(horizontal = 6.dp),
+                                            contentAlignment = Alignment.CenterStart
+                                        ) {
+                                            Text(
+                                                text = activeLayerName,
+                                                fontSize = 8.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = textColor.copy(alpha = 0.85f),
+                                                maxLines = 1
+                                            )
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(keyTrackHeightDp)
+                                                .background(OrangeAccent.copy(alpha = 0.12f))
+                                                .border(0.4.dp, OrangeAccent.copy(alpha = 0.25f))
+                                                .padding(horizontal = 6.dp),
+                                            contentAlignment = Alignment.CenterStart
+                                        ) {
+                                            Column {
+                                                Text(
+                                                    text = targetDisplayName,
+                                                    fontSize = 8.5.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = OrangeAccent,
+                                                    maxLines = 1
+                                                )
+                                                Text(
+                                                    text = "Chaves & Interp",
+                                                    fontSize = 7.sp,
+                                                    color = textColor.copy(alpha = 0.62f),
+                                                    maxLines = 1
+                                                )
+                                            }
+                                        }
+                                        if (showCameraContextRow) {
                                             Box(
                                                 modifier = Modifier
                                                     .fillMaxWidth()
-                                                    .height(18.dp)
+                                                    .height(contextRowHeightDp)
+                                                    .clickable {
+                                                        onSelectStageTarget(StageSelection(StageTargetType.CAMERA, "camera"))
+                                                    }
                                                     .padding(horizontal = 6.dp),
                                                 contentAlignment = Alignment.CenterStart
                                             ) {
                                                 Text(
-                                                    text = chName,
-                                                    fontSize = 8.5.sp,
-                                                    fontWeight = if (cIdx == 0) FontWeight.Bold else FontWeight.Medium,
-                                                    color = if (cIdx == 0) OrangeAccent else textColor.copy(alpha = 0.84f),
+                                                    text = "Câmera (◆${cameraSettings.keyframes.size})",
+                                                    fontSize = 7.5.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = accentColor,
                                                     maxLines = 1
                                                 )
                                             }
                                         }
                                     }
 
-                                    // Right Dope Sheet frame columns
-                                    Row(
+                                    // Right Scrollable Time Ruler + Cels + Visual Tween Span Track + Cyan Pinça
+                                    Box(
                                         modifier = Modifier
                                             .weight(1f)
-                                            .horizontalScroll(rememberScrollState())
-                                            .padding(vertical = 3.dp, horizontal = 3.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                                            .height(gridTotalHeightDp)
+                                            .horizontalScroll(dopeScrollState)
                                     ) {
-                                        val firstKf = sortedKeyFrames.firstOrNull()
-                                        val lastKf = sortedKeyFrames.lastOrNull()
-                                        for (fIdx in 0 until totalFrames.coerceAtLeast(1)) {
-                                            val isCurrent = fIdx == currentFrameIndex
-                                            val kf = cameraSettings.keyframes.firstOrNull { it.frameIndex == fIdx }
-                                            val isPairEndpoint = fIdx == selectedPairA || fIdx == selectedPairB
-                                            val inPairSpan = pairMin != null && pairMax != null && fIdx in pairMin..pairMax
-                                            val inInterpolatedSpan = firstKf != null && lastKf != null && firstKf != lastKf && fIdx in firstKf..lastKf
-
-                                            Column(
-                                                modifier = Modifier
-                                                    .width(28.dp)
-                                                    .clip(RoundedCornerShape(5.dp))
-                                                    .background(
-                                                        when {
-                                                            isCurrent -> accentColor.copy(alpha = 0.28f)
-                                                            inPairSpan -> OrangeAccent.copy(alpha = 0.20f)
-                                                            kf != null -> OrangeAccent.copy(alpha = 0.12f)
-                                                            else -> Color.Transparent
+                                        Box(
+                                            modifier = Modifier
+                                                .width(gridWidthDp)
+                                                .height(gridTotalHeightDp)
+                                        ) {
+                                            Column(modifier = Modifier.fillMaxSize()) {
+                                                // 1. Time Ruler (Tap = move Pinça, Drag = scrub continuously)
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .height(rulerHeightDp)
+                                                        .background(bgColor.copy(alpha = 0.88f))
+                                                        .testTag("camera_timeline_ruler")
+                                                        .pointerInput(totalRulerTicks, safeFps, tickPx) {
+                                                            val maxScrubMs = TimelineTrackEngine.tickToTimeMs(
+                                                                (totalRulerTicks - 1).coerceAtLeast(1),
+                                                                safeFps
+                                                            )
+                                                            detectHorizontalDragGestures(
+                                                                onDragStart = { startOffset ->
+                                                                    val tickPos = (startOffset.x / tickPx).coerceAtLeast(0f)
+                                                                    val targetMs = ((tickPos / safeFps.toFloat()) * 1000.0)
+                                                                        .toLong()
+                                                                        .coerceIn(0L, maxScrubMs)
+                                                                    onScrubToMs(targetMs)
+                                                                },
+                                                                onDragEnd = { onEndScrub() },
+                                                                onDragCancel = { onEndScrub() }
+                                                            ) { change, _ ->
+                                                                change.consume()
+                                                                val tickPos = (change.position.x / tickPx).coerceAtLeast(0f)
+                                                                val targetMs = ((tickPos / safeFps.toFloat()) * 1000.0)
+                                                                    .toLong()
+                                                                    .coerceIn(0L, maxScrubMs)
+                                                                onScrubToMs(targetMs)
+                                                            }
                                                         }
-                                                    )
-                                                    .border(
-                                                        width = when {
-                                                            isPairEndpoint -> 1.4.dp
-                                                            isCurrent -> 1.3.dp
-                                                            else -> 0.5.dp
-                                                        },
-                                                        color = when {
-                                                            isPairEndpoint -> Color(0xFFFFD600)
-                                                            isCurrent -> accentColor
-                                                            else -> textColor.copy(alpha = 0.12f)
-                                                        },
-                                                        shape = RoundedCornerShape(5.dp)
-                                                    )
-                                                    .clickable {
-                                                        onSelectFrame(fIdx)
-                                                        if (isPairSelectMode) {
-                                                            when {
-                                                                selectedPairA == null || (selectedPairA != null && selectedPairB != null) -> {
-                                                                    selectedPairA = fIdx
-                                                                    selectedPairB = null
+                                                ) {
+                                                    val quarterStep = max(1, safeFps / 4)
+                                                    for (t in 0 until totalRulerTicks) {
+                                                        val isSec = t % safeFps == 0
+                                                        val isQuarter = t % quarterStep == 0
+                                                        val isCurrentTick = t == currentTimelineTick
+                                                        Column(
+                                                            modifier = Modifier
+                                                                .width(tickWidth)
+                                                                .fillMaxHeight()
+                                                                .clickable {
+                                                                    onSelectTick(t)
+                                                                    if (isPairSelectMode) pickPairPoint(t)
+                                                                },
+                                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                                            verticalArrangement = Arrangement.SpaceBetween
+                                                        ) {
+                                                            Text(
+                                                                text = when {
+                                                                    isSec -> "${t / safeFps}s"
+                                                                    (t + 1) % 5 == 0 -> "${t + 1}"
+                                                                    else -> ""
+                                                                },
+                                                                fontSize = if (isSec) 8.sp else 7.sp,
+                                                                fontWeight = if (isSec || isCurrentTick) FontWeight.Bold else FontWeight.Normal,
+                                                                color = when {
+                                                                    isCurrentTick -> CyanAccent
+                                                                    isSec -> textColor.copy(alpha = 0.92f)
+                                                                    else -> textColor.copy(alpha = 0.45f)
+                                                                },
+                                                                maxLines = 1
+                                                            )
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .width(if (isSec) 1.5.dp else 1.dp)
+                                                                    .height(if (isSec) 6.dp else if (isQuarter) 4.dp else 2.dp)
+                                                                    .background(
+                                                                        when {
+                                                                            isCurrentTick -> CyanAccent
+                                                                            isSec -> accentColor.copy(alpha = 0.85f)
+                                                                            else -> textColor.copy(alpha = 0.3f)
+                                                                        }
+                                                                    )
+                                                            )
+                                                        }
+                                                    }
+                                                }
+
+                                                // 2. Active Drawing Layer Independent Cels Strip
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .height(celRowHeightDp)
+                                                        .background(bgColor.copy(alpha = 0.45f))
+                                                        .pointerInput(totalRulerTicks, activeLayerIndex, tickPx) {
+                                                            detectTapGestures { offset ->
+                                                                val tappedTick = (offset.x / tickPx).toInt().coerceIn(0, totalRulerTicks - 1)
+                                                                onAddCelAtTick(activeLayerIndex, tappedTick)
+                                                            }
+                                                        }
+                                                ) {
+                                                    Row(modifier = Modifier.fillMaxSize()) {
+                                                        for (t in 0 until totalRulerTicks) {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .width(tickWidth)
+                                                                    .fillMaxHeight()
+                                                                    .border(0.3.dp, textColor.copy(alpha = 0.06f))
+                                                            )
+                                                        }
+                                                    }
+                                                    activeCels.forEach { cel ->
+                                                        val displayStart = if (movingCamCel == cel.frameIndex && liveMoveCamCelTick != null) {
+                                                            liveMoveCamCelTick!!
+                                                        } else cel.startTick
+                                                        val displayHold = if (draggingCamCel == cel.frameIndex && liveCamCelHold != null) {
+                                                            liveCamCelHold!!
+                                                        } else cel.durationTicks
+                                                        val isCurrentCel = currentTimelineTick in displayStart until (displayStart + displayHold)
+                                                        val hasInk = cel.layer.strokes.isNotEmpty() || cel.layer.imageAttachment != null
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .offset(x = tickWidth * displayStart)
+                                                                .width((tickWidth * displayHold - 2.dp).coerceAtLeast(tickWidth - 2.dp))
+                                                                .fillMaxHeight()
+                                                                .padding(vertical = 2.dp)
+                                                                .clip(RoundedCornerShape(4.dp))
+                                                                .background(
+                                                                    when {
+                                                                        movingCamCel == cel.frameIndex -> NeonGreen.copy(alpha = 0.35f)
+                                                                        isCurrentCel -> accentColor.copy(alpha = 0.36f)
+                                                                        hasInk -> CyanAccent.copy(alpha = 0.20f)
+                                                                        else -> textColor.copy(alpha = 0.10f)
+                                                                    }
+                                                                )
+                                                                .border(
+                                                                    width = if (isCurrentCel) 1.1.dp else 0.7.dp,
+                                                                    color = when {
+                                                                        movingCamCel == cel.frameIndex -> NeonGreen
+                                                                        isCurrentCel -> CyanAccent
+                                                                        else -> textColor.copy(alpha = 0.26f)
+                                                                    },
+                                                                    shape = RoundedCornerShape(4.dp)
+                                                                )
+                                                                .pointerInput(cel.frameIndex, cel.startTick, totalRulerTicks, tickPx) {
+                                                                    var accumX = 0f
+                                                                    detectDragGesturesAfterLongPress(
+                                                                        onDragStart = {
+                                                                            accumX = 0f
+                                                                            movingCamCel = cel.frameIndex
+                                                                            liveMoveCamCelTick = cel.startTick
+                                                                        },
+                                                                        onDrag = { change, dragAmount ->
+                                                                            change.consume()
+                                                                            accumX += dragAmount.x
+                                                                            val deltaTicks = (accumX / tickPx).roundToInt()
+                                                                            liveMoveCamCelTick = (cel.startTick + deltaTicks).coerceIn(0, (totalRulerTicks - 1).coerceAtLeast(0))
+                                                                        },
+                                                                        onDragEnd = {
+                                                                            val dst = liveMoveCamCelTick ?: cel.startTick
+                                                                            movingCamCel = null
+                                                                            liveMoveCamCelTick = null
+                                                                            if (dst != cel.startTick) {
+                                                                                onMoveLayerCel(activeLayerIndex, cel.frameIndex, dst)
+                                                                            }
+                                                                        },
+                                                                        onDragCancel = {
+                                                                            movingCamCel = null
+                                                                            liveMoveCamCelTick = null
+                                                                        }
+                                                                    )
                                                                 }
-                                                                selectedPairA != fIdx -> {
-                                                                    selectedPairB = fIdx
+                                                                .clickable { onSelectTick(cel.startTick) }
+                                                                .testTag("camera_layer_cel_${cel.frameIndex}"),
+                                                            contentAlignment = Alignment.CenterStart
+                                                        ) {
+                                                            Text(
+                                                                text = if (displayHold > 1) "Q${cel.frameIndex + 1} (${displayHold}q)" else "Q${cel.frameIndex + 1}",
+                                                                fontSize = 8.sp,
+                                                                fontWeight = FontWeight.Bold,
+                                                                color = if (isCurrentCel) textColor else textColor.copy(alpha = 0.85f),
+                                                                maxLines = 1,
+                                                                modifier = Modifier.padding(start = 4.dp, end = 10.dp)
+                                                            )
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .align(Alignment.CenterEnd)
+                                                                    .width(10.dp)
+                                                                    .fillMaxHeight()
+                                                                    .background(if (draggingCamCel == cel.frameIndex) CyanAccent.copy(alpha = 0.7f) else textColor.copy(alpha = 0.14f))
+                                                                    .pointerInput(cel.frameIndex, cel.durationTicks, tickPx) {
+                                                                        var accumX = 0f
+                                                                        detectHorizontalDragGestures(
+                                                                            onDragStart = {
+                                                                                accumX = 0f
+                                                                                draggingCamCel = cel.frameIndex
+                                                                                liveCamCelHold = cel.durationTicks
+                                                                            },
+                                                                            onDragEnd = {
+                                                                                val finalHold = liveCamCelHold ?: cel.durationTicks
+                                                                                draggingCamCel = null
+                                                                                liveCamCelHold = null
+                                                                                onSetLayerCelHold(activeLayerIndex, cel.frameIndex, finalHold)
+                                                                            },
+                                                                            onDragCancel = {
+                                                                                draggingCamCel = null
+                                                                                liveCamCelHold = null
+                                                                            }
+                                                                        ) { change, dragAmount ->
+                                                                            change.consume()
+                                                                            accumX += dragAmount
+                                                                            val delta = (accumX / tickPx).roundToInt()
+                                                                            liveCamCelHold = (cel.durationTicks + delta).coerceIn(1, 240)
+                                                                        }
+                                                                    }
+                                                                    .testTag("camera_cel_stretch_${cel.frameIndex}"),
+                                                                contentAlignment = Alignment.Center
+                                                            ) {
+                                                                Box(
+                                                                    modifier = Modifier
+                                                                        .width(2.dp)
+                                                                        .height(10.dp)
+                                                                        .clip(RoundedCornerShape(1.dp))
+                                                                        .background(if (isCurrentCel) CyanAccent else textColor.copy(alpha = 0.55f))
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // 3. Hero Track: Interactive Keyframes + Classic Tween Span Bars (◆ ━━━━► ◆)
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .height(keyTrackHeightDp)
+                                                        .background(bgColor.copy(alpha = 0.55f))
+                                                ) {
+                                                    // Base tick slots (Tap = select tick/pair point, Double-tap = insert ◆ keyframe)
+                                                    Row(modifier = Modifier.fillMaxSize()) {
+                                                        for (tIdx in 0 until totalRulerTicks) {
+                                                            val isCurrent = tIdx == currentTimelineTick
+                                                            val isPairEndpoint = tIdx == selectedPairA || tIdx == selectedPairB
+                                                            val inPairSpan = pairMin != null && pairMax != null && tIdx in pairMin..pairMax
+                                                            val isDragDropTarget = dragTargetFrame == tIdx && dragSourceFrame != null
+
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .width(tickWidth)
+                                                                    .fillMaxHeight()
+                                                                    .background(
+                                                                        when {
+                                                                            isDragDropTarget -> NeonGreen.copy(alpha = 0.34f)
+                                                                            isPairEndpoint -> Color(0xFFFFD600).copy(alpha = 0.24f)
+                                                                            inPairSpan -> OrangeAccent.copy(alpha = 0.14f)
+                                                                            isCurrent -> accentColor.copy(alpha = 0.20f)
+                                                                            else -> Color.Transparent
+                                                                        }
+                                                                    )
+                                                                    .border(
+                                                                        width = when {
+                                                                            isDragDropTarget -> 1.5.dp
+                                                                            isPairEndpoint -> 1.3.dp
+                                                                            isCurrent -> 1.0.dp
+                                                                            else -> 0.4.dp
+                                                                        },
+                                                                        color = when {
+                                                                            isDragDropTarget -> NeonGreen
+                                                                            isPairEndpoint -> Color(0xFFFFD600)
+                                                                            isCurrent -> accentColor
+                                                                            else -> textColor.copy(alpha = 0.10f)
+                                                                        }
+                                                                    )
+                                                                    .pointerInput(tIdx, isPairSelectMode, selectedPairA, selectedPairB) {
+                                                                        detectTapGestures(
+                                                                            onTap = {
+                                                                                onSelectTick(tIdx)
+                                                                                if (isPairSelectMode) pickPairPoint(tIdx)
+                                                                            },
+                                                                            onDoubleTap = {
+                                                                                onAddKeyframeAtTick(tIdx)
+                                                                            }
+                                                                        )
+                                                                    }
+                                                                    .testTag("dope_frame_$tIdx"),
+                                                                contentAlignment = Alignment.BottomCenter
+                                                            ) {
+                                                                if (tIdx !in keyframeSet) {
+                                                                    Box(
+                                                                        modifier = Modifier
+                                                                            .padding(bottom = 3.dp)
+                                                                            .size(3.dp)
+                                                                            .clip(CircleShape)
+                                                                            .background(
+                                                                                if (isPairEndpoint) Color(0xFFFFD600)
+                                                                                else textColor.copy(alpha = 0.18f)
+                                                                            )
+                                                                    )
                                                                 }
                                                             }
                                                         }
                                                     }
-                                                    .testTag("dope_frame_$fIdx"),
-                                                horizontalAlignment = Alignment.CenterHorizontally
-                                            ) {
-                                                Text(
-                                                    text = "${fIdx + 1}",
-                                                    fontSize = 8.5.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = if (isCurrent) accentColor else textColor.copy(alpha = 0.88f)
-                                                )
-                                                channels.forEachIndexed { chIdx, _ ->
-                                                    val isDiamond = kf != null
+
+                                                    // User-picked 2-Point preview span bar (when user picked two arbitrary points A & B!)
+                                                    if (pairMin != null && pairMax != null && pairMax > pairMin) {
+                                                        val startX = tickWidth * (pairMin + 0.5f)
+                                                        val spanW = (tickWidth * (pairMax - pairMin)).coerceAtLeast(tickWidth)
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .align(Alignment.CenterStart)
+                                                                .offset(x = startX)
+                                                                .width(spanW)
+                                                                .height(24.dp)
+                                                                .clip(RoundedCornerShape(6.dp))
+                                                                .background(Color(0xFFFFD600).copy(alpha = 0.16f))
+                                                                .border(1.2.dp, Color(0xFFFFD600).copy(alpha = 0.85f), RoundedCornerShape(6.dp))
+                                                        )
+                                                    }
+
+                                                    // Classic Tween Span Bars (◆ ━━━━━━► ◆) between every consecutive pair of keyframes!
+                                                    for (i in 0 until activeKeyframeMeta.lastIndex) {
+                                                        val (kStart, kHold, kEasing) = activeKeyframeMeta[i]
+                                                        val kEnd = activeKeyframeMeta[i + 1].first
+                                                        if (kEnd <= kStart || kStart >= totalRulerTicks) continue
+                                                        val isThisSpanSelected = activeSpanStart == kStart && activeSpanEnd == kEnd
+                                                        val isTweenActive = cameraSettings.autoInterpolate && kEasing != CameraEasingCurve.DEGRAU
+                                                        val effectiveHold = if (draggingKfTick == kStart && liveDraggingKfHold != null) {
+                                                            liveDraggingKfHold!!
+                                                        } else kHold
+
+                                                        val barColor = when {
+                                                            !isTweenActive -> textColor.copy(alpha = 0.10f)
+                                                            kEasing == CameraEasingCurve.LINEAR -> CyanAccent
+                                                            kEasing == CameraEasingCurve.ELASTICO -> NeonPink
+                                                            kEasing == CameraEasingCurve.ACELERAR -> OrangeAccent
+                                                            kEasing == CameraEasingCurve.DESACELERAR -> NeonGreen
+                                                            else -> accentColor
+                                                        }
+                                                        val spanStartX = tickWidth * (kStart + 0.5f)
+                                                        val spanWidth = (tickWidth * (kEnd - kStart)).coerceAtLeast(12.dp)
+
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .align(Alignment.CenterStart)
+                                                                .offset(x = spanStartX)
+                                                                .width(spanWidth)
+                                                                .height(22.dp)
+                                                                .clip(RoundedCornerShape(5.dp))
+                                                                .background(
+                                                                    if (isTweenActive) barColor.copy(alpha = if (isThisSpanSelected) 0.34f else 0.22f)
+                                                                    else textColor.copy(alpha = 0.08f)
+                                                                )
+                                                                .border(
+                                                                    width = if (isThisSpanSelected) 1.5.dp else 0.8.dp,
+                                                                    color = when {
+                                                                        isThisSpanSelected -> Color(0xFFFFD600)
+                                                                        isTweenActive -> barColor.copy(alpha = 0.72f)
+                                                                        else -> textColor.copy(alpha = 0.28f)
+                                                                    },
+                                                                    shape = RoundedCornerShape(5.dp)
+                                                                )
+                                                                .clickable {
+                                                                    // Tap ANY tween bar to select those exact 2 points!
+                                                                    selectedPairA = kStart
+                                                                    selectedPairB = kEnd
+                                                                    isPairSelectMode = false
+                                                                    val midTick = (kStart + kEnd) / 2
+                                                                    onSelectTick(midTick)
+                                                                }
+                                                                .testTag("tween_span_${kStart}_${kEnd}"),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            // Arrow shaft + chevron inside span bar
+                                                            Canvas(modifier = Modifier.fillMaxSize()) {
+                                                                val cy = size.height * 0.5f
+                                                                val pad = 10f
+                                                                if (size.width > 24f) {
+                                                                    if (isTweenActive) {
+                                                                        drawLine(
+                                                                            color = barColor.copy(alpha = 0.9f),
+                                                                            start = Offset(pad, cy),
+                                                                            end = Offset(size.width - pad, cy),
+                                                                            strokeWidth = 2.4f
+                                                                        )
+                                                                        val ax = size.width - pad
+                                                                        drawLine(barColor, Offset(ax - 7f, cy - 5f), Offset(ax, cy), strokeWidth = 2.4f)
+                                                                        drawLine(barColor, Offset(ax - 7f, cy + 5f), Offset(ax, cy), strokeWidth = 2.4f)
+                                                                    } else {
+                                                                        // Dashed/step line for Degrau
+                                                                        var dx = pad
+                                                                        while (dx < size.width - pad - 4f) {
+                                                                            drawLine(
+                                                                                color = textColor.copy(alpha = 0.45f),
+                                                                                start = Offset(dx, cy),
+                                                                                end = Offset((dx + 6f).coerceAtMost(size.width - pad), cy),
+                                                                                strokeWidth = 1.6f
+                                                                            )
+                                                                            dx += 12f
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            if (kEnd - kStart >= 2) {
+                                                                Text(
+                                                                    text = if (isTweenActive) kEasing.labelPt else "Sem Interp",
+                                                                    fontSize = 7.5.sp,
+                                                                    fontWeight = FontWeight.Bold,
+                                                                    color = if (isTweenActive) textColor else textColor.copy(alpha = 0.65f),
+                                                                    maxLines = 1,
+                                                                    modifier = Modifier
+                                                                        .background(bgColor.copy(alpha = 0.72f), RoundedCornerShape(3.dp))
+                                                                        .padding(horizontal = 4.dp, vertical = 0.5.dp)
+                                                                )
+                                                            }
+                                                            // Hold plateau indicator if keyframe holds > 1q
+                                                            if (effectiveHold > 1) {
+                                                                Box(
+                                                                    modifier = Modifier
+                                                                        .align(Alignment.CenterStart)
+                                                                        .width((tickWidth * (effectiveHold - 1)).coerceAtMost(spanWidth))
+                                                                        .fillMaxHeight()
+                                                                        .background(OrangeAccent.copy(alpha = 0.25f))
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // Draggable Keyframe Nodes (◆) positioned cleanly over the track
+                                                    activeKeyframeMeta.forEach { (kfTick, kfHold, _) ->
+                                                        if (kfTick !in 0 until totalRulerTicks) return@forEach
+                                                        val isNodeCurrent = kfTick == currentTimelineTick
+                                                        val isNodePairEnd = kfTick == selectedPairA || kfTick == selectedPairB
+                                                        val isDragSource = dragSourceFrame == kfTick
+                                                        val nodeStartX = tickWidth * (kfTick + 0.5f) - 11.dp
+
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .align(Alignment.CenterStart)
+                                                                .offset(x = nodeStartX)
+                                                                .size(22.dp)
+                                                                .clip(CircleShape)
+                                                                .background(
+                                                                    when {
+                                                                        isDragSource -> NeonGreen
+                                                                        isNodePairEnd -> Color(0xFFFFD600)
+                                                                        isNodeCurrent -> CyanAccent
+                                                                        else -> OrangeAccent
+                                                                    }.copy(alpha = 0.25f)
+                                                                )
+                                                                .border(
+                                                                    width = if (isNodePairEnd || isNodeCurrent) 1.5.dp else 1.dp,
+                                                                    color = when {
+                                                                        isDragSource -> NeonGreen
+                                                                        isNodePairEnd -> Color(0xFFFFD600)
+                                                                        isNodeCurrent -> CyanAccent
+                                                                        else -> OrangeAccent
+                                                                    },
+                                                                    shape = CircleShape
+                                                                )
+                                                                .pointerInput(kfTick, totalRulerTicks, stageSelection, tickPx) {
+                                                                    var accumX = 0f
+                                                                    detectDragGesturesAfterLongPress(
+                                                                        onDragStart = {
+                                                                            accumX = 0f
+                                                                            dragSourceFrame = kfTick
+                                                                            dragTargetFrame = kfTick
+                                                                        },
+                                                                        onDrag = { change, dragAmount ->
+                                                                            change.consume()
+                                                                            accumX += dragAmount.x
+                                                                            val deltaCols = (accumX / tickPx).roundToInt()
+                                                                            dragTargetFrame = (kfTick + deltaCols).coerceIn(0, (totalRulerTicks - 1).coerceAtLeast(0))
+                                                                        },
+                                                                        onDragEnd = {
+                                                                            val src = dragSourceFrame
+                                                                            val dst = dragTargetFrame
+                                                                            dragSourceFrame = null
+                                                                            dragTargetFrame = null
+                                                                            if (src != null && dst != null && src != dst) {
+                                                                                onMoveKeyframe(src, dst)
+                                                                            }
+                                                                        },
+                                                                        onDragCancel = {
+                                                                            dragSourceFrame = null
+                                                                            dragTargetFrame = null
+                                                                        }
+                                                                    )
+                                                                }
+                                                                .clickable {
+                                                                    onSelectTick(kfTick)
+                                                                    if (isPairSelectMode) pickPairPoint(kfTick)
+                                                                }
+                                                                .testTag("keyframe_node_$kfTick"),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Text(
+                                                                text = if (kfHold > 1) "◆" else "◆",
+                                                                fontSize = 11.sp,
+                                                                fontWeight = FontWeight.Black,
+                                                                color = when {
+                                                                    isDragSource -> NeonGreen
+                                                                    isNodePairEnd -> Color(0xFFFFD600)
+                                                                    isNodeCurrent -> CyanAccent
+                                                                    else -> OrangeAccent
+                                                                }
+                                                            )
+                                                        }
+                                                    }
+                                                }
+
+                                                // 4. Optional Camera Context Row when editing Layer/3D Object
+                                                if (showCameraContextRow) {
                                                     Box(
                                                         modifier = Modifier
                                                             .fillMaxWidth()
-                                                            .height(18.dp)
-                                                            .background(
-                                                                when {
-                                                                    chIdx == 0 && inInterpolatedSpan && cameraSettings.autoInterpolate ->
-                                                                        OrangeAccent.copy(alpha = 0.24f)
-                                                                    inPairSpan -> OrangeAccent.copy(alpha = 0.16f)
-                                                                    else -> Color.Transparent
-                                                                }
-                                                            ),
-                                                        contentAlignment = Alignment.Center
-                                                    ) {
-                                                        Text(
-                                                            text = if (isDiamond) "◆" else "·",
-                                                            fontSize = if (isDiamond) 10.sp else 9.sp,
-                                                            color = when {
-                                                                isPairEndpoint -> Color(0xFFFFD600)
-                                                                isDiamond -> OrangeAccent
-                                                                else -> textColor.copy(alpha = 0.28f)
+                                                            .height(contextRowHeightDp)
+                                                            .background(bgColor.copy(alpha = 0.35f))
+                                                            .clickable {
+                                                                onSelectStageTarget(StageSelection(StageTargetType.CAMERA, "camera"))
                                                             }
-                                                        )
+                                                    ) {
+                                                        cameraSettings.keyframes.forEach { ckf ->
+                                                            if (ckf.frameIndex in 0 until totalRulerTicks) {
+                                                                Box(
+                                                                    modifier = Modifier
+                                                                        .align(Alignment.CenterStart)
+                                                                        .offset(x = tickWidth * (ckf.frameIndex + 0.5f) - 5.dp)
+                                                                        .size(10.dp),
+                                                                    contentAlignment = Alignment.Center
+                                                                ) {
+                                                                    Text("◆", fontSize = 8.sp, color = accentColor.copy(alpha = 0.78f))
+                                                                }
+                                                            }
+                                                        }
                                                     }
+                                                }
+                                            }
+
+                                            // Full-height Draggable Cyan Pinça Needle
+                                            val pincaCenterPx = (effectiveTickFloat.coerceIn(0f, (totalRulerTicks - 1).toFloat()) + 0.5f) * tickPx
+                                            val halfNeedlePx = with(density) { 6.dp.toPx() }
+                                            Box(
+                                                modifier = Modifier
+                                                    .offset { IntOffset((pincaCenterPx - halfNeedlePx).roundToInt(), 0) }
+                                                    .width(12.dp)
+                                                    .height(gridTotalHeightDp)
+                                                    .testTag("camera_timeline_pinca")
+                                                    .pointerInput(totalRulerTicks, safeFps, tickPx) {
+                                                        val maxScrubMs = TimelineTrackEngine.tickToTimeMs(
+                                                            (totalRulerTicks - 1).coerceAtLeast(1),
+                                                            safeFps
+                                                        )
+                                                        var scrubMsFloat = TimelineTrackEngine.tickToTimeMs(currentTimelineTick, safeFps).toFloat()
+                                                        detectHorizontalDragGestures(
+                                                            onDragStart = {
+                                                                scrubMsFloat = (effectiveTickFloat / safeFps.toFloat()) * 1000f
+                                                                onScrubToMs(scrubMsFloat.toLong().coerceIn(0L, maxScrubMs))
+                                                            },
+                                                            onDragEnd = { onEndScrub() },
+                                                            onDragCancel = { onEndScrub() }
+                                                        ) { change, dragAmount ->
+                                                            change.consume()
+                                                            val deltaTicks = dragAmount / tickPx
+                                                            scrubMsFloat = (scrubMsFloat + (deltaTicks / safeFps.toFloat()) * 1000f)
+                                                                .coerceIn(0f, maxScrubMs.toFloat())
+                                                            onScrubToMs(scrubMsFloat.toLong())
+                                                        }
+                                                    },
+                                                contentAlignment = Alignment.TopCenter
+                                            ) {
+                                                Column(
+                                                    modifier = Modifier.fillMaxSize(),
+                                                    horizontalAlignment = Alignment.CenterHorizontally
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .width(10.dp)
+                                                            .height(7.dp)
+                                                            .clip(RoundedCornerShape(bottomStart = 4.dp, bottomEnd = 4.dp))
+                                                            .background(CyanAccent)
+                                                    )
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .width(2.dp)
+                                                            .weight(1f)
+                                                            .background(CyanAccent.copy(alpha = 0.92f))
+                                                    )
                                                 }
                                             }
                                         }
                                     }
                                 }
 
-                                // Easing curve strip
-                                Row(
+                                // 2-Point Span Interpolation Selector Bar (Animate-style direct tween editor!)
+                                Surface(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                                        .testTag("two_point_tween_inspector"),
+                                    color = bgColor.copy(alpha = 0.68f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = androidx.compose.foundation.BorderStroke(
+                                        0.9.dp,
+                                        if (activeSpanStart != null && activeSpanEnd != null) OrangeAccent.copy(alpha = 0.55f)
+                                        else textColor.copy(alpha = 0.16f)
+                                    )
                                 ) {
-                                    Text("Interp:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
-                                    CameraEasingCurve.entries.forEach { curve ->
-                                        val isSel = evaluatedKf.easing == curve
-                                        CamPill(curve.labelPt, isSel, accentColor, textColor) {
-                                            onAddOrUpdateKeyframe(curve)
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 8.dp, vertical = 5.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            val headerInfo = when {
+                                                isPairSelectMode && selectedPairA != null && selectedPairB == null ->
+                                                    "Ponto 1: T${selectedPairA!! + 1} ◆ — Toque no Ponto 2 na linha do tempo"
+                                                activeSpanStart != null && activeSpanEnd != null -> {
+                                                    val durSpan = (activeSpanEnd - activeSpanStart).coerceAtLeast(1)
+                                                    val curveTxt = if (!cameraSettings.autoInterpolate) "Desligada"
+                                                    else (activeSpanEasing?.labelPt ?: "Bézier Suave")
+                                                    "Trecho: T${activeSpanStart + 1} ◆ ━━► ◆ T${activeSpanEnd + 1} (${durSpan}q) • $curveTxt"
+                                                }
+                                                else ->
+                                                    "Toque em 'Escolher 2 Pontos' ou toque duplo na trilha para criar chaves ◆"
+                                            }
+                                            Text(
+                                                text = headerInfo,
+                                                fontSize = 8.5.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (activeSpanStart != null && activeSpanEnd != null) OrangeAccent else textColor.copy(alpha = 0.80f),
+                                                maxLines = 1,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            if (isCameraTarget && activeSpanStart != null && activeSpanEnd != null) {
+                                                CamPill(
+                                                    label = if (showInlineBezierCurve) "Fechar Curva" else "Curva Manual",
+                                                    active = showInlineBezierCurve,
+                                                    activeColor = CyanAccent,
+                                                    textColor = textColor,
+                                                    icon = Icons.Default.ShowChart
+                                                ) {
+                                                    showInlineBezierCurve = !showInlineBezierCurve
+                                                }
+                                            }
+                                        }
+
+                                        // Curve Chips with Visual Mini Easing Graph Previews
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            CameraEasingCurve.entries.forEach { curve ->
+                                                val isSel = activeSpanEasing == curve || (activeSpanEasing == null && evaluatedKf.easing == curve)
+                                                val chipColor = when (curve) {
+                                                    CameraEasingCurve.DEGRAU -> NeonPink
+                                                    CameraEasingCurve.LINEAR -> CyanAccent
+                                                    CameraEasingCurve.BEZIER_SUAVE -> accentColor
+                                                    CameraEasingCurve.BEZIER_GRAFICO -> NeonGreen
+                                                    CameraEasingCurve.ACELERAR -> OrangeAccent
+                                                    CameraEasingCurve.DESACELERAR -> NeonGreen
+                                                    CameraEasingCurve.ELASTICO -> NeonPink
+                                                }
+                                                val labelText = if (curve == CameraEasingCurve.DEGRAU) "Sem Interp." else curve.labelPt
+                                                Surface(
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(7.dp))
+                                                        .clickable {
+                                                            if (activeSpanStart != null && activeSpanEnd != null) {
+                                                                onApplyTweenBetween(activeSpanStart, activeSpanEnd, curve)
+                                                                if (curve == CameraEasingCurve.BEZIER_GRAFICO && isCameraTarget) {
+                                                                    showInlineBezierCurve = true
+                                                                }
+                                                            } else {
+                                                                if (isCameraTarget) onAddOrUpdateKeyframe(curve)
+                                                                else onAddOrUpdateSelectedKeyframe(curve)
+                                                            }
+                                                        }
+                                                        .testTag("tween_curve_chip_${curve.name}"),
+                                                    color = if (isSel) chipColor.copy(alpha = 0.24f) else textColor.copy(alpha = 0.08f),
+                                                    shape = RoundedCornerShape(7.dp),
+                                                    border = androidx.compose.foundation.BorderStroke(
+                                                        width = if (isSel) 1.2.dp else 0.7.dp,
+                                                        color = if (isSel) chipColor else textColor.copy(alpha = 0.20f)
+                                                    )
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                                    ) {
+                                                        MiniEasingCurveIcon(
+                                                            curve = curve,
+                                                            color = if (isSel) chipColor else textColor.copy(alpha = 0.78f)
+                                                        )
+                                                        Text(
+                                                            text = labelText,
+                                                            fontSize = 8.5.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = if (isSel) chipColor else textColor
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Inline Interactive Bezier Curve Graph for the selected 2-point span!
+                                        if (showInlineBezierCurve && isCameraTarget && onUpdateBezierHandles != null) {
+                                            val bezierSourceKf = activeSpanStart?.let { s ->
+                                                cameraSettings.keyframes.firstOrNull { it.frameIndex == s }
+                                            } ?: activeOrNearestKf
+                                            BezierGraphCurveEditor(
+                                                p1x = bezierSourceKf.bezierP1X,
+                                                p1y = bezierSourceKf.bezierP1Y,
+                                                p2x = bezierSourceKf.bezierP2X,
+                                                p2y = bezierSourceKf.bezierP2Y,
+                                                bgColor = bgColor,
+                                                textColor = textColor,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(92.dp)
+                                            ) { np1x, np1y, np2x, np2y ->
+                                                onUpdateBezierHandles(bezierSourceKf.frameIndex, np1x, np1y, np2x, np2y)
+                                            }
                                         }
                                     }
                                 }
@@ -732,7 +1807,6 @@ fun CameraTimelinePanel(
                         }
 
                         if (isWidePc) {
-                            // True PC Studio Layout: Dope Sheet on the Left + Live Camera Inspector on the Right
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -742,14 +1816,13 @@ fun CameraTimelinePanel(
                                 Column(
                                     modifier = Modifier
                                         .weight(1f)
-                                        .heightIn(max = 185.dp)
+                                        .heightIn(max = 195.dp)
                                         .verticalScroll(rememberScrollState())
                                 ) {
-                                    CameraTransformControlsContent(compactForSplit = true)
+                                    TargetTransformControlsContent(compactForSplit = true)
                                 }
                             }
                         } else {
-                            // Clean Portrait Mobile Layout: Dedicated spacious Dope Sheet + quick link pill to Câmera tab
                             DopeSheetBlock(modifier = Modifier.fillMaxWidth())
                             Row(
                                 modifier = Modifier
@@ -758,534 +1831,1039 @@ fun CameraTimelinePanel(
                                 horizontalArrangement = Arrangement.spacedBy(5.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                val quickLabel = if (isCameraTarget) {
+                                    "Zoom ${(evaluatedKf.zoom * 100).roundToInt()}% • Giro ${evaluatedKf.rotationZ.roundToInt()}° • FOV ${evaluatedKf.fovDegrees.roundToInt()}° (Transform ▸)"
+                                } else {
+                                    "$targetDisplayName • X:${evaluatedObjKf.x.roundToInt()} Y:${evaluatedObjKf.y.roundToInt()} Z:${evaluatedObjKf.z.roundToInt()} (Transform ▸)"
+                                }
                                 CamPill(
-                                    label = "Zoom ${(evaluatedKf.zoom * 100).roundToInt()}% • Giro ${evaluatedKf.rotationZ.roundToInt()}° • FOV ${evaluatedKf.fovDegrees.roundToInt()}° (Ajustar ▸)",
+                                    label = quickLabel,
                                     active = true,
                                     activeColor = OrangeAccent,
                                     textColor = textColor,
                                     icon = Icons.Default.Tune
                                 ) { activeTab = 1 }
-                                CamPill("←", false, CyanAccent, textColor) { onNudgeCameraPan(-24f, 0f) }
-                                CamPill("→", false, CyanAccent, textColor) { onNudgeCameraPan(24f, 0f) }
-                                CamPill("Z-", false, accentColor, textColor) { onZoomCameraBy(0.9f) }
-                                CamPill("Z+", false, accentColor, textColor) { onZoomCameraBy(1.1f) }
+                                if (isCameraTarget) {
+                                    CamPill("←", false, CyanAccent, textColor) { onNudgeCameraPan(-24f, 0f) }
+                                    CamPill("→", false, CyanAccent, textColor) { onNudgeCameraPan(24f, 0f) }
+                                    CamPill("Z-", false, accentColor, textColor) { onZoomCameraBy(0.9f) }
+                                    CamPill("Z+", false, accentColor, textColor) { onZoomCameraBy(1.1f) }
+                                }
                             }
                         }
                     }
 
+                    // =========================================================================
+                    // TAB 1: TRANSFORM (Câmera & Lente OU Camada 2D / Objeto 3D selecionado)
+                    // =========================================================================
                     1 -> {
-                        // Dedicated Spacious Camera Transform, Nudge, Lenses & Resolution Tab
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 210.dp)
+                                .heightIn(max = 215.dp)
                                 .verticalScroll(rememberScrollState()),
                             verticalArrangement = Arrangement.spacedBy(5.dp)
                         ) {
-                            CameraTransformControlsContent(compactForSplit = false)
+                            TargetTransformControlsContent(compactForSplit = false)
                         }
                     }
 
+                    // =========================================================================
+                    // TAB 2: CENAS 3D (Importação de Cenas + Texturas UV + Primitivas + Seleção)
+                    // =========================================================================
                     2 -> {
-                    // Interactive Graph Curve Editor
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 190.dp, max = 260.dp)
-                            .verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                Icon(Icons.Default.ShowChart, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(14.dp))
-                                Text(
-                                    text = "Curva de Interpolação (Q${activeOrNearestKf.frameIndex + 1})",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = CyanAccent
-                                )
-                            }
-                            Text(
-                                text = "P1(${String.format("%.2f", activeOrNearestKf.bezierP1X)}, ${String.format("%.2f", activeOrNearestKf.bezierP1Y)}) • P2(${String.format("%.2f", activeOrNearestKf.bezierP2X)}, ${String.format("%.2f", activeOrNearestKf.bezierP2Y)})",
-                                fontSize = 9.sp,
-                                color = textColor.copy(alpha = 0.72f)
-                            )
-                        }
-
-                        Row(
+                        val sceneTintSwatches = listOf(
+                            0xFFFFFFFFL, 0xFF42A5F5L, 0xFFFFB74DL,
+                            0xFF66BB6AL, 0xFFEF5350L, 0xFFAB47BCL
+                        )
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                .heightIn(max = 225.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            CameraEasingCurve.entries.forEach { curve ->
-                                val isSel = activeOrNearestKf.easing == curve
-                                CamPill(curve.labelPt, isSel, CyanAccent, textColor) {
-                                    onAddOrUpdateKeyframe(curve)
-                                }
-                            }
-                        }
-
-                        BezierGraphCurveEditor(
-                            p1x = activeOrNearestKf.bezierP1X,
-                            p1y = activeOrNearestKf.bezierP1Y,
-                            p2x = activeOrNearestKf.bezierP2X,
-                            p2y = activeOrNearestKf.bezierP2Y,
-                            bgColor = bgColor,
-                            textColor = textColor,
-                            onHandlesChanged = { np1x, np1y, np2x, np2y ->
-                                if (onUpdateBezierHandles != null) {
-                                    onUpdateBezierHandles(activeOrNearestKf.frameIndex, np1x, np1y, np2x, np2y)
-                                } else {
-                                    onUpdateCurrentCamera {
-                                        it.copy(
-                                            easing = CameraEasingCurve.BEZIER_GRAFICO,
-                                            bezierP1X = np1x,
-                                            bezierP1Y = np1y,
-                                            bezierP2X = np2x,
-                                            bezierP2Y = np2y
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(RoundedCornerShape(9.dp))
+                                        .clickable { onImport3DSceneClick() }
+                                        .testTag("import_3d_scene_btn"),
+                                    color = CyanAccent.copy(alpha = 0.2f),
+                                    shape = RoundedCornerShape(9.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, CyanAccent.copy(alpha = 0.7f))
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Icon(Icons.Default.FolderOpen, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(15.dp))
+                                        Text(
+                                            text = "Importar Cena 3D (.glb/.gltf/.obj/.zip + UV)",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = textColor,
+                                            maxLines = 1
                                         )
                                     }
                                 }
-                            }
-                        )
-                    }
-                }
-
-                3 -> {
-                    // Built-in Camera Auto Effects (Range / Pinch) + Persistent "Pasta Animada"
-                    val targetStart = if (effectApplyToPair && pairMin != null && pairMax != null) pairMin else currentFrameIndex
-                    val targetEnd = if (effectApplyToPair && pairMin != null && pairMax != null) pairMax else (currentFrameIndex + pinchEffectDuration - 1).coerceAtMost((totalFrames - 1).coerceAtLeast(currentFrameIndex))
-
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 178.dp)
-                            .verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        // Range Targeting Row (Entre 2 Pontos vs Pinça N quadros)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            CamPill(
-                                label = "Na Pinça (Q${currentFrameIndex + 1}..${(currentFrameIndex + pinchEffectDuration).coerceAtMost(totalFrames.coerceAtLeast(1))})",
-                                active = !effectApplyToPair,
-                                activeColor = secondaryColor,
-                                textColor = textColor,
-                                testTag = "effect_target_pinch_btn"
-                            ) { effectApplyToPair = false }
-
-                            CamPill(
-                                label = if (pairMin != null && pairMax != null) "Entre Pontos (Q${pairMin + 1}..${pairMax + 1})" else "Entre 2 Pontos",
-                                active = effectApplyToPair,
-                                activeColor = OrangeAccent,
-                                textColor = textColor,
-                                testTag = "effect_target_pair_btn"
-                            ) { effectApplyToPair = true }
-
-                            if (!effectApplyToPair) {
-                                Text("Dur.:", fontSize = 9.sp, color = textColor.copy(alpha = 0.8f))
-                                Box(
-                                    modifier = Modifier
-                                        .size(22.dp)
-                                        .clip(RoundedCornerShape(5.dp))
-                                        .background(textColor.copy(alpha = 0.14f))
-                                        .clickable { pinchEffectDuration = (pinchEffectDuration - 1).coerceIn(2, 60) },
-                                    contentAlignment = Alignment.Center
-                                ) { Text("-", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = textColor) }
-                                Text("${pinchEffectDuration}q", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = secondaryColor)
-                                Box(
-                                    modifier = Modifier
-                                        .size(22.dp)
-                                        .clip(RoundedCornerShape(5.dp))
-                                        .background(textColor.copy(alpha = 0.14f))
-                                        .clickable { pinchEffectDuration = (pinchEffectDuration + 1).coerceIn(2, 60) },
-                                    contentAlignment = Alignment.Center
-                                ) { Text("+", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = textColor) }
-                            }
-                        }
-
-                        CamSlider(
-                            label = "Força",
-                            valueText = "${(effectIntensity * 100).roundToInt()}%",
-                            value = effectIntensity,
-                            range = 0.25f..2.0f,
-                            accentColor = secondaryColor,
-                            textColor = textColor,
-                            modifier = Modifier.fillMaxWidth()
-                        ) { effectIntensity = it }
-
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            CameraBuiltInEffect.entries.forEach { eff ->
-                                Surface(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(9.dp))
-                                        .clickable {
-                                            if (onApplyEffectInRange != null) {
-                                                onApplyEffectInRange(eff, targetStart, targetEnd, effectIntensity)
-                                            } else {
-                                                onApplyBuiltInEffect(eff)
-                                            }
-                                        }
-                                        .testTag("camera_apply_effect_${eff.name}"),
-                                    color = secondaryColor.copy(alpha = 0.14f),
-                                    shape = RoundedCornerShape(9.dp),
-                                    border = androidx.compose.foundation.BorderStroke(1.dp, secondaryColor.copy(alpha = 0.45f))
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                    ) {
-                                        Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = secondaryColor, modifier = Modifier.size(13.dp))
-                                        Text(eff.labelPt, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
-                                    }
+                                CamPill("Focar Sel.", false, OrangeAccent, textColor, Icons.Default.CenterFocusStrong) {
+                                    onFocusStageTarget()
                                 }
                             }
-                        }
 
-                        // Active effect spans applied to timeline
-                        if (cameraSettings.effectSpans.isNotEmpty()) {
+                            // Built-in 3D Primitives Row
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                cameraSettings.effectSpans.forEach { span ->
-                                    Surface(
-                                        color = bgColor.copy(alpha = 0.65f),
-                                        shape = RoundedCornerShape(7.dp),
-                                        border = androidx.compose.foundation.BorderStroke(1.dp, secondaryColor.copy(alpha = 0.5f))
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(start = 7.dp, end = 3.dp, top = 3.dp, bottom = 3.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                        ) {
-                                            Text(
-                                                "${span.effect.labelPt}: Q${span.startFrame + 1}–Q${span.endFrame + 1}",
-                                                fontSize = 9.5.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = textColor
-                                            )
-                                            IconButton(
-                                                onClick = { onRemoveEffectSpan?.invoke(span.id) },
-                                                modifier = Modifier.size(18.dp)
-                                            ) {
-                                                Icon(Icons.Default.Close, contentDescription = "Remover efeito", tint = NeonPink, modifier = Modifier.size(11.dp))
-                                            }
-                                        }
-                                    }
+                                Text("Adicionar 3D:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
+                                BuiltIn3DPrimitive.entries.forEach { prim ->
+                                    CamPill(
+                                        label = "+ ${prim.labelPt}",
+                                        active = false,
+                                        activeColor = NeonGreen,
+                                        textColor = textColor,
+                                        icon = Icons.Default.ViewInAr,
+                                        testTag = "add_3d_prim_${prim.name}"
+                                    ) { onAddBuiltIn3DPrimitive(prim) }
                                 }
                             }
-                        }
 
-                        // Pasta Animada (Save & Reuse)
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(Icons.Default.FolderSpecial, contentDescription = null, tint = OrangeAccent, modifier = Modifier.size(15.dp))
-                            OutlinedTextField(
-                                value = templateNameInput,
-                                onValueChange = { templateNameInput = it },
-                                placeholder = { Text("Nome na Pasta Animada...", fontSize = 10.sp) },
-                                singleLine = true,
-                                modifier = Modifier.weight(1f).height(44.dp)
-                            )
+                            // Outliner: Câmera + Objetos 3D + Camadas 2D
                             Surface(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .clickable {
-                                        onSaveTemplateToFolder(templateNameInput)
-                                        templateNameInput = ""
-                                    },
-                                color = OrangeAccent.copy(alpha = 0.22f),
+                                color = if (isCameraTarget) accentColor.copy(alpha = 0.16f) else bgColor.copy(alpha = 0.5f),
                                 shape = RoundedCornerShape(8.dp),
-                                border = androidx.compose.foundation.BorderStroke(1.dp, OrangeAccent.copy(alpha = 0.65f))
+                                border = androidx.compose.foundation.BorderStroke(
+                                    width = if (isCameraTarget) 1.2.dp else 0.7.dp,
+                                    color = if (isCameraTarget) accentColor else textColor.copy(alpha = 0.16f)
+                                )
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 8.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onSelectStageTarget(StageSelection(StageTargetType.CAMERA, "camera")) }
+                                        .padding(horizontal = 8.dp, vertical = 5.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Icon(Icons.Default.CreateNewFolder, contentDescription = "Salvar na Pasta Animada", tint = OrangeAccent, modifier = Modifier.size(14.dp))
-                                    Text("Salvar Pasta", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Icon(Icons.Default.Videocam, contentDescription = null, tint = accentColor, modifier = Modifier.size(14.dp))
+                                        Text("Câmera Principal (◆${cameraSettings.keyframes.size})", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
+                                    }
+                                    CamPill("Focar", false, CyanAccent, textColor, Icons.Default.CenterFocusStrong) {
+                                        onSelectStageTarget(StageSelection(StageTargetType.CAMERA, "camera"))
+                                        onFocusStageTarget()
+                                    }
                                 }
                             }
-                        }
 
-                        if (savedTemplates.isNotEmpty()) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                savedTemplates.forEach { tpl ->
-                                    Surface(
-                                        color = bgColor.copy(alpha = 0.65f),
-                                        shape = RoundedCornerShape(8.dp),
-                                        border = androidx.compose.foundation.BorderStroke(1.dp, OrangeAccent.copy(alpha = 0.4f))
+                            cameraSettings.scene3DObjects.forEach { obj ->
+                                val isSel = stageSelection.type == StageTargetType.OBJECT_3D && stageSelection.id == obj.id
+                                Surface(
+                                    color = if (isSel) OrangeAccent.copy(alpha = 0.16f) else bgColor.copy(alpha = 0.5f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = androidx.compose.foundation.BorderStroke(
+                                        width = if (isSel) 1.3.dp else 0.7.dp,
+                                        color = if (isSel) OrangeAccent else textColor.copy(alpha = 0.16f)
+                                    )
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { onSelectStageTarget(StageSelection(StageTargetType.OBJECT_3D, obj.id)) }
+                                            .padding(horizontal = 8.dp, vertical = 5.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
                                         Row(
-                                            modifier = Modifier
-                                                .clickable { onApplyTemplateFromFolder(tpl) }
-                                                .padding(start = 8.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                                            modifier = Modifier.fillMaxWidth(),
                                             verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            horizontalArrangement = Arrangement.SpaceBetween
                                         ) {
-                                            Text(tpl.name, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
-                                            IconButton(
-                                                onClick = { onDeleteTemplate(tpl.id) },
-                                                modifier = Modifier.size(20.dp)
+                                            Row(
+                                                modifier = Modifier.weight(1f),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(5.dp)
                                             ) {
-                                                Icon(Icons.Default.Close, contentDescription = "Excluir pasta", tint = NeonPink, modifier = Modifier.size(12.dp))
+                                                Icon(Icons.Default.ViewInAr, contentDescription = null, tint = OrangeAccent, modifier = Modifier.size(14.dp))
+                                                Text("${obj.name} [${obj.formatTag}] • ◆${obj.keyframes.size}", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor, maxLines = 1)
                                             }
+                                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                CamPill("Focar", false, CyanAccent, textColor) {
+                                                    onSelectStageTarget(StageSelection(StageTargetType.OBJECT_3D, obj.id))
+                                                    onFocusStageTarget()
+                                                }
+                                                IconButton(onClick = { onToggle3DObjectVisibility(obj.id) }, modifier = Modifier.size(24.dp)) {
+                                                    Icon(
+                                                        if (obj.isVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                                        contentDescription = "Visibilidade 3D",
+                                                        tint = if (obj.isVisible) NeonGreen else textColor.copy(alpha = 0.4f),
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                }
+                                                IconButton(onClick = { onDelete3DObject(obj.id) }, modifier = Modifier.size(24.dp)) {
+                                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Remover Objeto 3D", tint = NeonPink, modifier = Modifier.size(14.dp))
+                                                }
+                                            }
+                                        }
+                                        if (isSel) {
+                                            BgColorSwatchRow(
+                                                label = "Matiz 3D:",
+                                                swatches = sceneTintSwatches,
+                                                selectedColor = obj.colorTint,
+                                                accentColor = OrangeAccent,
+                                                textColor = textColor,
+                                                onSelect = { c -> onSet3DObjectTint(obj.id, c) }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            layers.forEach { layer ->
+                                val isSel = stageSelection.type == StageTargetType.LAYER && stageSelection.id == layer.id
+                                val trackCount = cameraSettings.layerTransformTracks.firstOrNull { it.layerId == layer.id }?.keyframes?.size ?: 0
+                                Surface(
+                                    color = if (isSel) CyanAccent.copy(alpha = 0.16f) else bgColor.copy(alpha = 0.4f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = androidx.compose.foundation.BorderStroke(
+                                        width = if (isSel) 1.2.dp else 0.7.dp,
+                                        color = if (isSel) CyanAccent else textColor.copy(alpha = 0.14f)
+                                    )
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { onSelectStageTarget(StageSelection(StageTargetType.LAYER, layer.id)) }
+                                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                            Icon(Icons.Default.Layers, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(13.dp))
+                                            Text("Camada: ${layer.name} (${layer.strokes.size} traços • ◆$trackCount)", fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold, color = textColor)
+                                        }
+                                        CamPill("Focar", false, CyanAccent, textColor) {
+                                            onSelectStageTarget(StageSelection(StageTargetType.LAYER, layer.id))
+                                            onFocusStageTarget()
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                4 -> {
-                    // Cena Post-Effects
-                    val fx = cameraSettings.postEffects
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 185.dp)
-                            .verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                Icon(Icons.Default.Tune, contentDescription = null, tint = NeonPink, modifier = Modifier.size(14.dp))
-                                Text("Pós-Efeitos da Cena", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = NeonPink)
-                            }
-                            CamPill("Zerar Pós-Efeitos", false, NeonPink, NeonPink) { onResetPostEffects() }
-                        }
+                    // =========================================================================
+                    // TAB 3: EFEITOS (Sub-abas: Auto Efeitos & Pasta | Curva Gráfica | Pós-FX)
+                    // =========================================================================
+                    3 -> {
+                        val targetStart = if (effectApplyToPair && pairMin != null && pairMax != null) pairMin else currentTimelineTick
+                        val targetEnd = if (effectApplyToPair && pairMin != null && pairMax != null) pairMax else (currentTimelineTick + pinchEffectDuration - 1).coerceAtMost((totalRulerTicks - 1).coerceAtLeast(currentTimelineTick))
 
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CamSlider("Vinheta", "${(fx.vignette * 100).roundToInt()}%", fx.vignette, 0f..1f, NeonPink, textColor, Modifier.weight(1f)) {
-                                onUpdatePostEffects(fx.copy(vignette = it))
-                            }
-                            CamSlider("Bloom", "${(fx.bloom * 100).roundToInt()}%", fx.bloom, 0f..1f, NeonPink, textColor, Modifier.weight(1f)) {
-                                onUpdatePostEffects(fx.copy(bloom = it))
-                            }
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CamSlider("Aberração", "${(fx.chromaticAberration * 100).roundToInt()}%", fx.chromaticAberration, 0f..1f, secondaryColor, textColor, Modifier.weight(1f)) {
-                                onUpdatePostEffects(fx.copy(chromaticAberration = it))
-                            }
-                            CamSlider("Grão Filme", "${(fx.filmGrain * 100).roundToInt()}%", fx.filmGrain, 0f..1f, secondaryColor, textColor, Modifier.weight(1f)) {
-                                onUpdatePostEffects(fx.copy(filmGrain = it))
-                            }
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CamSlider("Sépia", "${(fx.sepia * 100).roundToInt()}%", fx.sepia, 0f..1f, OrangeAccent, textColor, Modifier.weight(1f)) {
-                                onUpdatePostEffects(fx.copy(sepia = it))
-                            }
-                            CamSlider("Desf. Radial", "${(fx.radialBlur * 100).roundToInt()}%", fx.radialBlur, 0f..1f, OrangeAccent, textColor, Modifier.weight(1f)) {
-                                onUpdatePostEffects(fx.copy(radialBlur = it))
-                            }
-                        }
-                        CamSlider("Contraste", "${(fx.contrastBoost * 100).roundToInt()}%", fx.contrastBoost, -0.45f..0.45f, accentColor, textColor, Modifier.fillMaxWidth()) {
-                            onUpdatePostEffects(fx.copy(contrastBoost = it))
-                        }
-                    }
-                }
-
-                else -> {
-                    // Tab 4: Fundo do Canvas & Céu 3D (afeta Palco 3D, Fundo do Canvas 2D quando Transparente/Configurado e Exportação)
-                    val bgSwatches = listOf(
-                        0xFFFFFFFFL,
-                        0xFFFFF8E8L,
-                        0xFFE5EAF5L,
-                        0xFF9EA7B8L,
-                        0xFF28314AL,
-                        0xFF151926L,
-                        0xFF0A0C12L,
-                        0xFF00C853L,
-                        0xFF00A2FFL,
-                        0xFFFF6D00L
-                    )
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 215.dp)
-                            .verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(Icons.Default.Wallpaper, contentDescription = null, tint = NeonGreen, modifier = Modifier.size(14.dp))
-                            Text(
-                                text = "Fundo da Folha (2D/3D) & Céu Espacial",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = NeonGreen
-                            )
-                        }
-
-                        // Estilo do Fundo da Folha
-                        Row(
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                                .heightIn(min = 175.dp, max = 240.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Text("Papel:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
-                            CanvasBackgroundStyle.entries.forEach { st ->
-                                val isSel = canvasBackground.style == st
-                                CamPill(st.labelPt, isSel, NeonGreen, textColor, testTag = "cam_bg_style_${st.name}") {
-                                    onUpdateCanvasBackground(canvasBackground.copy(style = st))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CamPill("Auto & Pasta", activeEffectsSubTab == 0, secondaryColor, textColor, testTag = "cam_tab_effects_auto") {
+                                    activeEffectsSubTab = 0
+                                }
+                                CamPill("Curva Gráfica", activeEffectsSubTab == 1, CyanAccent, textColor, Icons.Default.ShowChart, testTag = "cam_tab_curves") {
+                                    activeEffectsSubTab = 1
+                                }
+                                CamPill("Pós-FX", activeEffectsSubTab == 2, NeonPink, textColor, Icons.Default.Tune, testTag = "cam_tab_post") {
+                                    activeEffectsSubTab = 2
+                                }
+                            }
+
+                            when (activeEffectsSubTab) {
+                                0 -> {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        CamPill(
+                                            label = "Na Pinça (T${currentTimelineTick + 1}..${(currentTimelineTick + pinchEffectDuration).coerceAtMost(totalRulerTicks.coerceAtLeast(1))})",
+                                            active = !effectApplyToPair,
+                                            activeColor = secondaryColor,
+                                            textColor = textColor,
+                                            testTag = "effect_target_pinch_btn"
+                                        ) { effectApplyToPair = false }
+
+                                        CamPill(
+                                            label = if (pairMin != null && pairMax != null) "Entre Pontos (T${pairMin + 1}..T${pairMax + 1})" else "Entre 2 Pontos",
+                                            active = effectApplyToPair,
+                                            activeColor = OrangeAccent,
+                                            textColor = textColor,
+                                            testTag = "effect_target_pair_btn"
+                                        ) { effectApplyToPair = true }
+
+                                        if (!effectApplyToPair) {
+                                            Text("Dur.:", fontSize = 9.sp, color = textColor.copy(alpha = 0.8f))
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(22.dp)
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(textColor.copy(alpha = 0.14f))
+                                                    .clickable { pinchEffectDuration = (pinchEffectDuration - 1).coerceIn(2, 60) },
+                                                contentAlignment = Alignment.Center
+                                            ) { Text("-", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = textColor) }
+                                            Text("${pinchEffectDuration}q", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = secondaryColor)
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(22.dp)
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(textColor.copy(alpha = 0.14f))
+                                                    .clickable { pinchEffectDuration = (pinchEffectDuration + 1).coerceIn(2, 60) },
+                                                contentAlignment = Alignment.Center
+                                            ) { Text("+", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = textColor) }
+                                        }
+                                    }
+
+                                    CamSlider(
+                                        label = "Força",
+                                        valueText = "${(effectIntensity * 100).roundToInt()}%",
+                                        value = effectIntensity,
+                                        range = 0.25f..2.0f,
+                                        accentColor = secondaryColor,
+                                        textColor = textColor,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) { effectIntensity = it }
+
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        CameraBuiltInEffect.entries.forEach { eff ->
+                                            Surface(
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(9.dp))
+                                                    .clickable {
+                                                        if (onApplyEffectInRange != null) {
+                                                            onApplyEffectInRange(eff, targetStart, targetEnd, effectIntensity)
+                                                        } else {
+                                                            onApplyBuiltInEffect(eff)
+                                                        }
+                                                    }
+                                                    .testTag("camera_apply_effect_${eff.name}"),
+                                                color = secondaryColor.copy(alpha = 0.14f),
+                                                shape = RoundedCornerShape(9.dp),
+                                                border = androidx.compose.foundation.BorderStroke(1.dp, secondaryColor.copy(alpha = 0.45f))
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                                ) {
+                                                    Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = secondaryColor, modifier = Modifier.size(13.dp))
+                                                    Text(eff.labelPt, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (cameraSettings.effectSpans.isNotEmpty()) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                        ) {
+                                            cameraSettings.effectSpans.forEach { span ->
+                                                Surface(
+                                                    color = bgColor.copy(alpha = 0.65f),
+                                                    shape = RoundedCornerShape(7.dp),
+                                                    border = androidx.compose.foundation.BorderStroke(1.dp, secondaryColor.copy(alpha = 0.5f))
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(start = 7.dp, end = 3.dp, top = 3.dp, bottom = 3.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                                    ) {
+                                                        Text(
+                                                            "${span.effect.labelPt}: Q${span.startFrame + 1}–Q${span.endFrame + 1}",
+                                                            fontSize = 9.5.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = textColor
+                                                        )
+                                                        IconButton(
+                                                            onClick = { onRemoveEffectSpan?.invoke(span.id) },
+                                                            modifier = Modifier.size(18.dp)
+                                                        ) {
+                                                            Icon(Icons.Default.Close, contentDescription = "Remover efeito", tint = NeonPink, modifier = Modifier.size(11.dp))
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Icon(Icons.Default.FolderSpecial, contentDescription = null, tint = OrangeAccent, modifier = Modifier.size(15.dp))
+                                        OutlinedTextField(
+                                            value = templateNameInput,
+                                            onValueChange = { templateNameInput = it },
+                                            placeholder = { Text("Nome na Pasta Animada...", fontSize = 10.sp) },
+                                            singleLine = true,
+                                            modifier = Modifier.weight(1f).height(44.dp)
+                                        )
+                                        Surface(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .clickable {
+                                                    onSaveTemplateToFolder(templateNameInput)
+                                                    templateNameInput = ""
+                                                },
+                                            color = OrangeAccent.copy(alpha = 0.22f),
+                                            shape = RoundedCornerShape(8.dp),
+                                            border = androidx.compose.foundation.BorderStroke(1.dp, OrangeAccent.copy(alpha = 0.65f))
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 8.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Icon(Icons.Default.CreateNewFolder, contentDescription = "Salvar na Pasta Animada", tint = OrangeAccent, modifier = Modifier.size(14.dp))
+                                                Text("Salvar Pasta", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
+                                            }
+                                        }
+                                    }
+
+                                    if (savedTemplates.isNotEmpty()) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            savedTemplates.forEach { tpl ->
+                                                Surface(
+                                                    color = bgColor.copy(alpha = 0.65f),
+                                                    shape = RoundedCornerShape(8.dp),
+                                                    border = androidx.compose.foundation.BorderStroke(1.dp, OrangeAccent.copy(alpha = 0.4f))
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .clickable { onApplyTemplateFromFolder(tpl) }
+                                                            .padding(start = 8.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                                    ) {
+                                                        Text(tpl.name, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
+                                                        IconButton(
+                                                            onClick = { onDeleteTemplate(tpl.id) },
+                                                            modifier = Modifier.size(20.dp)
+                                                        ) {
+                                                            Icon(Icons.Default.Close, contentDescription = "Excluir pasta", tint = NeonPink, modifier = Modifier.size(12.dp))
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                1 -> {
+                                    // Bezier Curve Graph Editor
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Curva de Interpolação (Q${activeOrNearestKf.frameIndex + 1})",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = CyanAccent
+                                        )
+                                        Text(
+                                            text = "P1(${String.format("%.2f", activeOrNearestKf.bezierP1X)}, ${String.format("%.2f", activeOrNearestKf.bezierP1Y)}) • P2(${String.format("%.2f", activeOrNearestKf.bezierP2X)}, ${String.format("%.2f", activeOrNearestKf.bezierP2Y)})",
+                                            fontSize = 9.sp,
+                                            color = textColor.copy(alpha = 0.72f)
+                                        )
+                                    }
+
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                    ) {
+                                        CameraEasingCurve.entries.forEach { curve ->
+                                            val isSel = activeOrNearestKf.easing == curve
+                                            CamPill(curve.labelPt, isSel, CyanAccent, textColor) {
+                                                onAddOrUpdateKeyframe(curve)
+                                            }
+                                        }
+                                    }
+
+                                    BezierGraphCurveEditor(
+                                        p1x = activeOrNearestKf.bezierP1X,
+                                        p1y = activeOrNearestKf.bezierP1Y,
+                                        p2x = activeOrNearestKf.bezierP2X,
+                                        p2y = activeOrNearestKf.bezierP2Y,
+                                        bgColor = bgColor,
+                                        textColor = textColor,
+                                        onHandlesChanged = { np1x, np1y, np2x, np2y ->
+                                            if (onUpdateBezierHandles != null) {
+                                                onUpdateBezierHandles(activeOrNearestKf.frameIndex, np1x, np1y, np2x, np2y)
+                                            } else {
+                                                onUpdateCurrentCamera {
+                                                    it.copy(
+                                                        easing = CameraEasingCurve.BEZIER_GRAFICO,
+                                                        bezierP1X = np1x,
+                                                        bezierP1Y = np1y,
+                                                        bezierP2X = np2x,
+                                                        bezierP2Y = np2y
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    )
+                                }
+
+                                else -> {
+                                    // Pós-FX
+                                    val fx = cameraSettings.postEffects
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("Pós-Efeitos da Cena", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = NeonPink)
+                                        CamPill("Zerar Pós-Efeitos", false, NeonPink, NeonPink) { onResetPostEffects() }
+                                    }
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        CamSlider("Vinheta", "${(fx.vignette * 100).roundToInt()}%", fx.vignette, 0f..1f, NeonPink, textColor, Modifier.weight(1f)) {
+                                            onUpdatePostEffects(fx.copy(vignette = it))
+                                        }
+                                        CamSlider("Bloom", "${(fx.bloom * 100).roundToInt()}%", fx.bloom, 0f..1f, NeonPink, textColor, Modifier.weight(1f)) {
+                                            onUpdatePostEffects(fx.copy(bloom = it))
+                                        }
+                                    }
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        CamSlider("Aberração", "${(fx.chromaticAberration * 100).roundToInt()}%", fx.chromaticAberration, 0f..1f, secondaryColor, textColor, Modifier.weight(1f)) {
+                                            onUpdatePostEffects(fx.copy(chromaticAberration = it))
+                                        }
+                                        CamSlider("Grão Filme", "${(fx.filmGrain * 100).roundToInt()}%", fx.filmGrain, 0f..1f, secondaryColor, textColor, Modifier.weight(1f)) {
+                                            onUpdatePostEffects(fx.copy(filmGrain = it))
+                                        }
+                                    }
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        CamSlider("Sépia", "${(fx.sepia * 100).roundToInt()}%", fx.sepia, 0f..1f, OrangeAccent, textColor, Modifier.weight(1f)) {
+                                            onUpdatePostEffects(fx.copy(sepia = it))
+                                        }
+                                        CamSlider("Desf. Radial", "${(fx.radialBlur * 100).roundToInt()}%", fx.radialBlur, 0f..1f, OrangeAccent, textColor, Modifier.weight(1f)) {
+                                            onUpdatePostEffects(fx.copy(radialBlur = it))
+                                        }
+                                    }
+                                    CamSlider("Contraste", "${(fx.contrastBoost * 100).roundToInt()}%", fx.contrastBoost, -0.45f..0.45f, accentColor, textColor, Modifier.fillMaxWidth()) {
+                                        onUpdatePostEffects(fx.copy(contrastBoost = it))
+                                    }
                                 }
                             }
                         }
+                    }
 
-                        if (canvasBackground.style != CanvasBackgroundStyle.TRANSPARENTE) {
-                            BgColorSwatchRow(
-                                label = "Cor 1:",
-                                swatches = bgSwatches,
-                                selectedColor = canvasBackground.primaryColor,
-                                accentColor = NeonGreen,
-                                textColor = textColor,
-                                onSelect = { c ->
-                                    onUpdateCanvasBackground(canvasBackground.copy(primaryColor = c))
-                                }
-                            )
+                    // =========================================================================
+                    // TAB 4: FUNDO & CÉU (Papel + Ponto Claro / Escuro + Stops + Roda de Cores HSV)
+                    // =========================================================================
+                    else -> {
+                        val effectiveLightColor = if (canvasBackground.skyLightColor != 0L) canvasBackground.skyLightColor else canvasBackground.skyTopColor
+                        val effectiveDarkColor = if (canvasBackground.skyDarkColor != 0L) canvasBackground.skyDarkColor else canvasBackground.skyBottomColor
+                        val sortedStops = remember(canvasBackground.skyGradientStops) {
+                            canvasBackground.skyGradientStops.sortedBy { it.position }
+                        }
+                        val activeStop = sortedStops.firstOrNull { it.id == selectedSkyStopId } ?: sortedStops.firstOrNull()
+
+                        val currentWheelColor = when (skyWheelTarget) {
+                            0 -> effectiveLightColor
+                            1 -> effectiveDarkColor
+                            2 -> activeStop?.color ?: effectiveLightColor
+                            3 -> canvasBackground.primaryColor
+                            4 -> canvasBackground.secondaryColor
+                            else -> effectiveLightColor
                         }
 
-                        if (canvasBackground.style == CanvasBackgroundStyle.DEGRADE || canvasBackground.style == CanvasBackgroundStyle.TEXTURA) {
-                            BgColorSwatchRow(
-                                label = "Cor 2:",
-                                swatches = bgSwatches,
-                                selectedColor = canvasBackground.secondaryColor,
-                                accentColor = CyanAccent,
-                                textColor = textColor,
-                                onSelect = { c ->
-                                    onUpdateCanvasBackground(canvasBackground.copy(secondaryColor = c))
+                        fun applyWheelColor(newColor: Long) {
+                            when (skyWheelTarget) {
+                                0 -> onUpdateCanvasBackground(
+                                    canvasBackground.copy(skyLightColor = newColor, skyTopColor = newColor)
+                                )
+                                1 -> onUpdateCanvasBackground(
+                                    canvasBackground.copy(skyDarkColor = newColor, skyBottomColor = newColor)
+                                )
+                                2 -> {
+                                    val stopId = activeStop?.id ?: return
+                                    val updatedStops = canvasBackground.skyGradientStops.map {
+                                        if (it.id == stopId) it.copy(color = newColor) else it
+                                    }
+                                    onUpdateCanvasBackground(canvasBackground.copy(skyGradientStops = updatedStops))
                                 }
-                            )
+                                3 -> onUpdateCanvasBackground(canvasBackground.copy(primaryColor = newColor))
+                                4 -> onUpdateCanvasBackground(canvasBackground.copy(secondaryColor = newColor))
+                            }
                         }
 
-                        if (canvasBackground.style == CanvasBackgroundStyle.DEGRADE) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 250.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            // Estilo do Papel + Textura
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Papel:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
+                                CanvasBackgroundStyle.entries.forEach { st ->
+                                    val isSel = canvasBackground.style == st
+                                    CamPill(st.labelPt, isSel, NeonGreen, textColor, testTag = "cam_bg_style_${st.name}") {
+                                        onUpdateCanvasBackground(canvasBackground.copy(style = st))
+                                    }
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Textura:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
+                                CanvasTexturePattern.entries.forEach { pat ->
+                                    val isSel = canvasBackground.texturePattern == pat
+                                    CamPill(pat.labelPt, isSel, OrangeAccent, textColor) {
+                                        val nextStyle = if (pat != CanvasTexturePattern.NENHUMA && canvasBackground.style == CanvasBackgroundStyle.SOLIDO) {
+                                            CanvasBackgroundStyle.TEXTURA
+                                        } else canvasBackground.style
+                                        onUpdateCanvasBackground(canvasBackground.copy(texturePattern = pat, style = nextStyle))
+                                    }
+                                }
+                            }
+                            if (canvasBackground.texturePattern != CanvasTexturePattern.NENHUMA) {
+                                CamSlider("Força Tex", "${(canvasBackground.textureIntensity * 100).roundToInt()}%", canvasBackground.textureIntensity, 0.05f..0.85f, OrangeAccent, textColor, Modifier.fillMaxWidth()) { inten ->
+                                    onUpdateCanvasBackground(canvasBackground.copy(textureIntensity = inten))
+                                }
+                            }
+
+                            // Modo Céu + Ângulo do Céu
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Céu:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
+                                SkyBackdropMode.entries.forEach { sky ->
+                                    val isSel = canvasBackground.skyMode == sky
+                                    CamPill(sky.labelPt, isSel, secondaryColor, textColor, testTag = "cam_sky_mode_${sky.name}") {
+                                        onUpdateCanvasBackground(canvasBackground.copy(skyMode = sky))
+                                    }
+                                }
+                            }
+
                             CamSlider(
-                                label = "Ângulo",
-                                valueText = "${canvasBackground.gradientAngleDeg.roundToInt()}°",
-                                value = canvasBackground.gradientAngleDeg,
+                                label = "Âng. Céu",
+                                valueText = "${canvasBackground.skyGradientAngleDeg.roundToInt()}°",
+                                value = canvasBackground.skyGradientAngleDeg,
                                 range = 0f..360f,
-                                accentColor = CyanAccent,
+                                accentColor = secondaryColor,
                                 textColor = textColor,
                                 modifier = Modifier.fillMaxWidth()
                             ) { ang ->
-                                onUpdateCanvasBackground(canvasBackground.copy(gradientAngleDeg = ang))
+                                onUpdateCanvasBackground(canvasBackground.copy(skyGradientAngleDeg = ang))
                             }
-                        }
 
-                        // Textura de Fundo
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("Textura:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
-                            CanvasTexturePattern.entries.forEach { pat ->
-                                val isSel = canvasBackground.texturePattern == pat
-                                CamPill(pat.labelPt, isSel, OrangeAccent, textColor) {
-                                    val nextStyle = if (pat != CanvasTexturePattern.NENHUMA && canvasBackground.style == CanvasBackgroundStyle.SOLIDO) {
-                                        CanvasBackgroundStyle.TEXTURA
-                                    } else {
-                                        canvasBackground.style
+                            // Multi-Stop Sky Gradient Preview Bar
+                            val previewColorStops = remember(effectiveLightColor, effectiveDarkColor, sortedStops) {
+                                buildList {
+                                    add(0f to Color(effectiveLightColor))
+                                    sortedStops.forEach { st ->
+                                        add(st.position.coerceIn(0.02f, 0.98f) to Color(st.color))
                                     }
-                                    onUpdateCanvasBackground(canvasBackground.copy(texturePattern = pat, style = nextStyle))
+                                    add(1f to Color(effectiveDarkColor))
+                                }.toTypedArray()
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(18.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(Brush.horizontalGradient(colorStops = previewColorStops))
+                                    .border(0.8.dp, textColor.copy(alpha = 0.25f), RoundedCornerShape(6.dp))
+                            )
+
+                            // Ponto Claro / Ponto Escuro / Pontos extras + Papel Cores
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                ColorPointPill(
+                                    label = "Ponto Claro",
+                                    color = Color(effectiveLightColor),
+                                    selected = skyWheelTarget == 0,
+                                    accentColor = OrangeAccent,
+                                    textColor = textColor,
+                                    testTag = "sky_point_light_btn"
+                                ) { skyWheelTarget = 0 }
+
+                                ColorPointPill(
+                                    label = "Ponto Escuro",
+                                    color = Color(effectiveDarkColor),
+                                    selected = skyWheelTarget == 1,
+                                    accentColor = CyanAccent,
+                                    textColor = textColor,
+                                    testTag = "sky_point_dark_btn"
+                                ) { skyWheelTarget = 1 }
+
+                                sortedStops.forEachIndexed { idx, stop ->
+                                    val isSel = skyWheelTarget == 2 && activeStop?.id == stop.id
+                                    ColorPointPill(
+                                        label = "Cor #${idx + 1} (${(stop.position * 100).roundToInt()}%)",
+                                        color = Color(stop.color),
+                                        selected = isSel,
+                                        accentColor = NeonGreen,
+                                        textColor = textColor,
+                                        testTag = "sky_stop_pill_$idx"
+                                    ) {
+                                        selectedSkyStopId = stop.id
+                                        skyWheelTarget = 2
+                                    }
+                                }
+
+                                CamPill("+ Ponto", false, NeonGreen, textColor, Icons.Default.Add, testTag = "add_sky_stop_btn") {
+                                    val nextPos = if (sortedStops.isEmpty()) 0.5f else ((sortedStops.last().position + 0.15f).coerceIn(0.1f, 0.9f))
+                                    val newStop = GradientColorStop(position = nextPos, color = 0xFF3E6C9AL)
+                                    val updated = (canvasBackground.skyGradientStops + newStop).sortedBy { it.position }
+                                    onUpdateCanvasBackground(canvasBackground.copy(skyGradientStops = updated))
+                                    selectedSkyStopId = newStop.id
+                                    skyWheelTarget = 2
+                                }
+
+                                if (skyWheelTarget == 2 && activeStop != null) {
+                                    CamPill("Remover", false, NeonPink, NeonPink, Icons.Default.DeleteOutline) {
+                                        val updated = canvasBackground.skyGradientStops.filterNot { it.id == activeStop.id }
+                                        onUpdateCanvasBackground(canvasBackground.copy(skyGradientStops = updated))
+                                        selectedSkyStopId = updated.firstOrNull()?.id
+                                        if (updated.isEmpty()) skyWheelTarget = 0
+                                    }
+                                }
+
+                                if (canvasBackground.style != CanvasBackgroundStyle.TRANSPARENTE) {
+                                    ColorPointPill(
+                                        label = "Papel 1",
+                                        color = Color(canvasBackground.primaryColor),
+                                        selected = skyWheelTarget == 3,
+                                        accentColor = accentColor,
+                                        textColor = textColor
+                                    ) { skyWheelTarget = 3 }
+                                    if (canvasBackground.style == CanvasBackgroundStyle.DEGRADE || canvasBackground.style == CanvasBackgroundStyle.TEXTURA) {
+                                        ColorPointPill(
+                                            label = "Papel 2",
+                                            color = Color(canvasBackground.secondaryColor),
+                                            selected = skyWheelTarget == 4,
+                                            accentColor = secondaryColor,
+                                            textColor = textColor
+                                        ) { skyWheelTarget = 4 }
+                                    }
                                 }
                             }
-                        }
-                        if (canvasBackground.texturePattern != CanvasTexturePattern.NENHUMA) {
-                            CamSlider(
-                                label = "Força Tex",
-                                valueText = "${(canvasBackground.textureIntensity * 100).roundToInt()}%",
-                                value = canvasBackground.textureIntensity,
-                                range = 0.05f..0.85f,
-                                accentColor = OrangeAccent,
+
+                            if (skyWheelTarget == 2 && activeStop != null) {
+                                CamSlider(
+                                    label = "Posição",
+                                    valueText = "${(activeStop.position * 100).roundToInt()}%",
+                                    value = activeStop.position,
+                                    range = 0.05f..0.95f,
+                                    accentColor = NeonGreen,
+                                    textColor = textColor,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) { pos ->
+                                    val updated = canvasBackground.skyGradientStops.map {
+                                        if (it.id == activeStop.id) it.copy(position = pos) else it
+                                    }
+                                    onUpdateCanvasBackground(canvasBackground.copy(skyGradientStops = updated))
+                                }
+                            }
+
+                            // Inline HSV Roda de Cores (sem precisar de diálogo ou confirmar!)
+                            InlineSkyHsvWheel(
+                                selectedColor = currentWheelColor,
                                 textColor = textColor,
-                                modifier = Modifier.fillMaxWidth()
-                            ) { inten ->
-                                onUpdateCanvasBackground(canvasBackground.copy(textureIntensity = inten))
-                            }
+                                accentColor = accentColor,
+                                onColorChanged = { applyWheelColor(it) }
+                            )
                         }
-
-                        // Céu do Estúdio 3D (e exibido no modo 2D quando papel estiver Transparente)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("Céu 3D/2D:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
-                            SkyBackdropMode.entries.forEach { sky ->
-                                val isSel = canvasBackground.skyMode == sky
-                                CamPill(sky.labelPt, isSel, secondaryColor, textColor, testTag = "cam_sky_mode_${sky.name}") {
-                                    onUpdateCanvasBackground(canvasBackground.copy(skyMode = sky))
-                                }
-                            }
-                        }
-
-                        BgColorSwatchRow(
-                            label = "Céu Topo:",
-                            swatches = bgSwatches,
-                            selectedColor = canvasBackground.skyTopColor,
-                            accentColor = secondaryColor,
-                            textColor = textColor,
-                            onSelect = { c ->
-                                onUpdateCanvasBackground(canvasBackground.copy(skyTopColor = c))
-                            }
-                        )
-                        BgColorSwatchRow(
-                            label = "Céu Base:",
-                            swatches = bgSwatches,
-                            selectedColor = canvasBackground.skyBottomColor,
-                            accentColor = secondaryColor,
-                            textColor = textColor,
-                            onSelect = { c ->
-                                onUpdateCanvasBackground(canvasBackground.copy(skyBottomColor = c))
-                            }
-                        )
                     }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun ColorPointPill(
+    label: String,
+    color: Color,
+    selected: Boolean,
+    accentColor: Color,
+    textColor: Color,
+    testTag: String? = null,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (selected) accentColor.copy(alpha = 0.22f) else textColor.copy(alpha = 0.08f))
+            .border(if (selected) 1.3.dp else 0.7.dp, if (selected) accentColor else textColor.copy(alpha = 0.2f), RoundedCornerShape(8.dp))
+            .clickable { onClick() }
+            .padding(horizontal = 7.dp, vertical = 4.dp)
+            .let { if (testTag != null) it.testTag(testTag) else it },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(12.dp)
+                .clip(CircleShape)
+                .background(color)
+                .border(0.8.dp, Color.White.copy(alpha = 0.7f), CircleShape)
+        )
+        Text(
+            text = label,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (selected) accentColor else textColor
+        )
+    }
+}
+
+@Composable
+private fun InlineSkyHsvWheel(
+    selectedColor: Long,
+    textColor: Color,
+    accentColor: Color,
+    onColorChanged: (Long) -> Unit
+) {
+    val hsvInit = remember(selectedColor) {
+        val arr = FloatArray(3)
+        val argb = selectedColor.toInt()
+        android.graphics.Color.RGBToHSV(
+            (argb ushr 16) and 0xFF,
+            (argb ushr 8) and 0xFF,
+            argb and 0xFF,
+            arr
+        )
+        arr
+    }
+    var hue by remember { mutableFloatStateOf(hsvInit[0]) }
+    var sat by remember { mutableFloatStateOf(hsvInit[1]) }
+    var bri by remember { mutableFloatStateOf(hsvInit[2]) }
+
+    LaunchedEffect(selectedColor) {
+        val currentArgb = android.graphics.Color.HSVToColor(floatArrayOf(hue, sat, bri))
+        if ((0xFF000000L or (currentArgb.toLong() and 0xFFFFFFL)) != selectedColor) {
+            hue = hsvInit[0]
+            sat = hsvInit[1]
+            bri = hsvInit[2]
+        }
+    }
+
+    fun emitColor(h: Float, s: Float, v: Float) {
+        val rgb = android.graphics.Color.HSVToColor(floatArrayOf(h.coerceIn(0f, 360f), s.coerceIn(0f, 1f), v.coerceIn(0f, 1f)))
+        onColorChanged(0xFF000000L or (rgb.toLong() and 0xFFFFFFL))
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        // Roda de Cores HSV (anel Matiz + disco interno Saturação)
+        Canvas(
+            modifier = Modifier
+                .size(92.dp)
+                .testTag("sky_hsv_color_wheel")
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val cx = size.width / 2f
+                        val cy = size.height / 2f
+                        val rMax = size.width / 2f
+                        val ringInner = rMax * 0.68f
+                        val dist0 = hypot(down.position.x - cx, down.position.y - cy)
+                        val editingRing = dist0 >= ringInner
+
+                        fun applyPos(pos: Offset) {
+                            val dx = pos.x - cx
+                            val dy = pos.y - cy
+                            var ang = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
+                            if (ang < 0f) ang += 360f
+                            if (editingRing) {
+                                hue = ang
+                            } else {
+                                val dist = hypot(dx, dy).coerceIn(0f, ringInner)
+                                hue = ang
+                                sat = (dist / ringInner.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                            }
+                            emitColor(hue, sat, bri)
+                        }
+
+                        down.consume()
+                        applyPos(down.position)
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!ch.pressed) break
+                            ch.consume()
+                            applyPos(ch.position)
+                        }
+                    }
+                }
+        ) {
+            val radius = size.width / 2f
+            val center = Offset(radius, radius)
+            val strokeW = radius * 0.28f
+            val ringMidR = radius - strokeW / 2f
+            val innerR = radius - strokeW
+
+            val sweepColors = listOf(
+                Color.Red, Color.Yellow, Color.Green,
+                Color.Cyan, Color.Blue, Color.Magenta, Color.Red
+            )
+            drawCircle(
+                brush = Brush.sweepGradient(sweepColors, center),
+                radius = ringMidR,
+                style = Stroke(width = strokeW)
+            )
+            drawCircle(
+                brush = Brush.sweepGradient(sweepColors, center),
+                radius = innerR - 2f
+            )
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(Color.White, Color.White.copy(alpha = 0f)),
+                    center = center,
+                    radius = innerR - 2f
+                ),
+                radius = innerR - 2f
+            )
+
+            // Hue indicator dot on ring
+            val rad = Math.toRadians(hue.toDouble())
+            val hPos = Offset(
+                center.x + (ringMidR * cos(rad)).toFloat(),
+                center.y + (ringMidR * sin(rad)).toFloat()
+            )
+            drawCircle(Color.White, radius = 5f, center = hPos)
+            drawCircle(Color.Black, radius = 5f, center = hPos, style = Stroke(1.5f))
+
+            // Saturation indicator dot inside disk
+            val sR = (innerR - 3f) * sat
+            val sPos = Offset(
+                center.x + (sR * cos(rad)).toFloat(),
+                center.y + (sR * sin(rad)).toFloat()
+            )
+            drawCircle(Color.White, radius = 5.5f, center = sPos)
+            drawCircle(Color(selectedColor), radius = 3.5f, center = sPos)
+        }
+
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(Color(selectedColor))
+                        .border(1.dp, Color.White.copy(alpha = 0.6f), RoundedCornerShape(5.dp))
+                )
+                Text(
+                    text = "Roda Livre • H:${hue.roundToInt()}° S:${(sat * 100).roundToInt()}% L:${(bri * 100).roundToInt()}%",
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = textColor.copy(alpha = 0.85f)
+                )
+            }
+            CamSlider("Brilho", "${(bri * 100).roundToInt()}%", bri, 0.02f..1f, accentColor, textColor) { newV ->
+                bri = newV
+                emitColor(hue, sat, bri)
+            }
+            CamSlider("Saturação", "${(sat * 100).roundToInt()}%", sat, 0f..1f, NeonGreen, textColor) { newS ->
+                sat = newS
+                emitColor(hue, sat, bri)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MiniEasingCurveIcon(
+    curve: CameraEasingCurve,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier.size(16.dp, 12.dp)) {
+        val w = size.width
+        val h = size.height
+        val pad = 1.5f
+        val uw = (w - pad * 2f).coerceAtLeast(2f)
+        val uh = (h - pad * 2f).coerceAtLeast(2f)
+        val p = Path()
+        val steps = 10
+        for (i in 0..steps) {
+            val t = i.toFloat() / steps
+            val yVal = Camera3DEngine.applyEasing(t, curve).coerceIn(-0.15f, 1.15f)
+            val px = pad + t * uw
+            val py = pad + (1f - yVal) * uh
+            if (i == 0) p.moveTo(px, py) else p.lineTo(px, py)
+        }
+        drawPath(p, color = color, style = Stroke(width = 1.7f))
     }
 }
 
@@ -1297,6 +2875,7 @@ private fun BezierGraphCurveEditor(
     p2y: Float,
     bgColor: Color,
     textColor: Color,
+    modifier: Modifier = Modifier.fillMaxWidth().height(136.dp),
     onHandlesChanged: (Float, Float, Float, Float) -> Unit
 ) {
     var localP1x by remember(p1x) { mutableFloatStateOf(p1x) }
@@ -1305,9 +2884,7 @@ private fun BezierGraphCurveEditor(
     var localP2y by remember(p2y) { mutableFloatStateOf(p2y) }
 
     Canvas(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(142.dp)
+        modifier = modifier
             .clip(RoundedCornerShape(10.dp))
             .background(bgColor.copy(alpha = 0.78f))
             .border(1.dp, CyanAccent.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
@@ -1353,7 +2930,6 @@ private fun BezierGraphCurveEditor(
         val usableW = (size.width - padX * 2f).coerceAtLeast(10f)
         val usableH = (size.height - padY * 2f).coerceAtLeast(10f)
 
-        // Subtle grid lines
         for (i in 0..4) {
             val f = i / 4f
             val x = padX + f * usableW
@@ -1367,25 +2943,18 @@ private fun BezierGraphCurveEditor(
         val p2 = Offset(padX + localP2x * usableW, padY + (1f - localP2y) * usableH)
         val p3 = Offset(padX + usableW, padY)
 
-        // Linear diagonal guide
         drawLine(textColor.copy(alpha = 0.22f), p0, p3, strokeWidth = 1.2f)
-
-        // Handle tangent stems
         drawLine(CyanAccent.copy(alpha = 0.65f), p0, p1, strokeWidth = 1.8f)
         drawLine(NeonPink.copy(alpha = 0.65f), p3, p2, strokeWidth = 1.8f)
 
-        // Cubic Bezier curve
         val curvePath = Path().apply {
             moveTo(p0.x, p0.y)
             cubicTo(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y)
         }
         drawPath(curvePath, color = OrangeAccent, style = Stroke(width = 3.2f))
 
-        // Endpoints
         drawCircle(textColor.copy(alpha = 0.8f), radius = 4f, center = p0)
         drawCircle(textColor.copy(alpha = 0.8f), radius = 4f, center = p3)
-
-        // Draggable P1 and P2 handles
         drawCircle(Color.White, radius = 8f, center = p1)
         drawCircle(CyanAccent, radius = 6f, center = p1)
         drawCircle(Color.White, radius = 8f, center = p2)
@@ -1471,7 +3040,7 @@ private fun CamSlider(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-        Text(label, fontSize = 9.sp, color = textColor.copy(alpha = 0.8f), modifier = Modifier.width(48.dp))
+        Text(label, fontSize = 9.sp, color = textColor.copy(alpha = 0.8f), modifier = Modifier.width(50.dp))
         Slider(
             value = value.coerceIn(range.start, range.endInclusive),
             onValueChange = onValueChange,

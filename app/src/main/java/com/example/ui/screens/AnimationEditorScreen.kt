@@ -153,6 +153,14 @@ fun AnimationEditorScreen(
         }
     }
 
+    val scene3DPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            viewModel.import3DSceneFromUri(context, uri)
+        }
+    }
+
     // File picker for .kodanima project files
     val projectFilePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -273,7 +281,36 @@ fun AnimationEditorScreen(
                         onZoomCameraBy = { viewModel.zoomCameraBy(it) },
                         onRotateCameraBy = { viewModel.rotateCameraBy(it) },
                         onTiltOrbitCameraBy = { dYaw, dPitch -> viewModel.tiltOrbitCameraBy(dYaw, dPitch) },
-                        onAddFrame = { viewModel.addFrame() }
+                        onAddFrame = { viewModel.addFrame() },
+                        layers = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers ?: emptyList(),
+                        stageSelection = uiState.stageSelection,
+                        onSelectStageTarget = { viewModel.selectStageTarget(it) },
+                        onFocusStageTarget = { viewModel.focusSelectedStageTarget() },
+                        onMoveKeyframe = { fromFrame, toFrame -> viewModel.moveSelectedTargetKeyframe(fromFrame, toFrame) },
+                        onUpdateSelectedObjectTransform = { viewModel.updateSelectedObjectTransform(it) },
+                        onAddOrUpdateSelectedKeyframe = { viewModel.addOrUpdateSelectedTargetKeyframe(it) },
+                        onDeleteSelectedKeyframeAt = { viewModel.deleteSelectedTargetKeyframe(it) },
+                        onResetSelectedTarget = { viewModel.resetSelectedObjectTransformAtCurrentFrame() },
+                        onImport3DSceneClick = { scene3DPicker.launch(arrayOf("*/*")) },
+                        onAddBuiltIn3DPrimitive = { viewModel.addBuiltIn3DPrimitive(it) },
+                        onToggle3DObjectVisibility = { viewModel.toggleSceneObject3DVisibility(it) },
+                        onDelete3DObject = { viewModel.deleteSceneObject3D(it) },
+                        onSet3DObjectTint = { id, tint -> viewModel.setSceneObject3DTint(id, tint) },
+                        projectFrames = uiState.project.frames,
+                        fps = uiState.project.fps,
+                        activeLayerIndex = uiState.activeLayerIndex,
+                        currentTimelineTick = uiState.currentTimelineTick,
+                        activeScrubTimeMs = uiState.activeScrubTimeMs,
+                        playbackTimeMs = uiState.playbackTimeMs,
+                        onSelectTick = { viewModel.goToTimelineTick(it) },
+                        onScrubToMs = { viewModel.scrubToTimelineMs(it) },
+                        onEndScrub = { viewModel.endAudioScrub() },
+                        onSetLayerCelHold = { lIdx, fIdx, h -> viewModel.setLayerCelDuration(lIdx, fIdx, h) },
+                        onMoveLayerCel = { lIdx, fIdx, tick -> viewModel.moveLayerCelToTick(lIdx, fIdx, tick) },
+                        onAddCelAtTick = { lIdx, tick -> viewModel.activateOrAddCelOnLayerAtTick(lIdx, tick) },
+                        onSetKeyframeHold = { tickIdx, hold -> viewModel.setSelectedTargetKeyframeHold(tickIdx, hold) },
+                        onApplyTweenBetween = { tickA, tickB, curve -> viewModel.applyTweenBetweenTwoPoints(tickA, tickB, curve) },
+                        onAddKeyframeAtTick = { tick -> viewModel.addSelectedTargetKeyframeAtTick(tick) }
                     )
                 } else {
                     TimelineBar(
@@ -300,7 +337,16 @@ fun AnimationEditorScreen(
                         onScrubToMs = { viewModel.scrubToTimelineMs(it) },
                         onEndScrub = { viewModel.endAudioScrub() },
                         onionSkinOpacity = uiState.project.onionSkin.opacity,
-                        onChangeOnionSkinOpacity = { viewModel.setOnionSkinOpacity(it) }
+                        onChangeOnionSkinOpacity = { viewModel.setOnionSkinOpacity(it) },
+                        layers = uiState.project.frames.firstOrNull()?.layers ?: emptyList(),
+                        activeLayerIndex = uiState.activeLayerIndex,
+                        currentTimelineTick = uiState.currentTimelineTick,
+                        playbackTimeMs = uiState.playbackTimeMs,
+                        onSelectLayerCel = { lIdx, fIdx, tick -> viewModel.selectLayerCel(lIdx, fIdx, tick) },
+                        onSetLayerCelHold = { lIdx, fIdx, hold -> viewModel.setLayerCelDuration(lIdx, fIdx, hold) },
+                        onMoveLayerCel = { lIdx, fIdx, tick -> viewModel.moveLayerCelToTick(lIdx, fIdx, tick) },
+                        onAddCelAtTick = { lIdx, tick -> viewModel.activateOrAddCelOnLayerAtTick(lIdx, tick) },
+                        onSelectTick = { viewModel.goToTimelineTick(it) }
                     )
                 }
             }
@@ -426,6 +472,16 @@ fun AnimationEditorScreen(
                     if (abs(fovDelta) > 0.01f) viewModel.adjustCameraFov(fovDelta)
                     if (abs(dYaw) > 0.01f || abs(dPitch) > 0.01f) viewModel.tiltOrbitCameraBy(dYaw, dPitch)
                 },
+                cameraViewportNavTarget = uiState.cameraViewportNavTarget,
+                stageSelection = uiState.stageSelection,
+                stageFocusNonce = uiState.stageFocusRequestNonce,
+                onStageTargetSelected = { viewModel.selectStageTarget(it) },
+                onSelectedStageObjectDelta = { dx, dy, dz, rx, ry, rz, sf ->
+                    viewModel.applySelectedStageObjectDelta(dx, dy, dz, rx, ry, rz, sf)
+                },
+                currentTimelineTick = uiState.currentTimelineTick,
+                playbackTimeMs = uiState.playbackTimeMs,
+                isPlaying = uiState.isPlaying,
                 theme = currentTheme
             )
 
@@ -448,7 +504,7 @@ fun AnimationEditorScreen(
                     )
                 }
 
-                if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideBrushBar) {
+                if (!uiState.isCameraTimelineOpen && (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideBrushBar)) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -543,7 +599,7 @@ fun AnimationEditorScreen(
                 }
 
                 // Floating Mobile Eraser Options Toolbar (when ToolType.ERASER is active)
-                if (uiState.selectedTool == ToolType.ERASER && !uiState.isZenModeActive) {
+                if (!uiState.isCameraTimelineOpen && uiState.selectedTool == ToolType.ERASER && !uiState.isZenModeActive) {
                     Surface(
                         modifier = Modifier
                             .shadow(6.dp, RoundedCornerShape(12.dp))
@@ -650,7 +706,7 @@ fun AnimationEditorScreen(
                 }
 
                 // Quick Config. Balde chip when Bucket tool is selected
-                if (uiState.selectedTool == ToolType.BUCKET && !uiState.isZenModeActive) {
+                if (!uiState.isCameraTimelineOpen && uiState.selectedTool == ToolType.BUCKET && !uiState.isZenModeActive) {
                     Surface(
                         modifier = Modifier
                             .shadow(6.dp, RoundedCornerShape(999.dp))
@@ -677,7 +733,7 @@ fun AnimationEditorScreen(
                 }
 
                 // Floating FlipaClip-style Selection Actions Toolbar
-                if (uiState.activeSelection.isActive && !uiState.isZenModeActive) {
+                if (!uiState.isCameraTimelineOpen && uiState.activeSelection.isActive && !uiState.isZenModeActive) {
                     Surface(
                         modifier = Modifier
                             .shadow(10.dp, RoundedCornerShape(20.dp))
@@ -769,7 +825,7 @@ fun AnimationEditorScreen(
 
                 // Floating Mobile Video Transform HUD (when Transformar Vídeo mode is active)
                 val activeVideoAsset = uiState.project.mediaAssets.firstOrNull { it.type == "video" || it.type == "gif" }
-                if (uiState.isVideoTransformMode && activeVideoAsset != null && !uiState.isZenModeActive) {
+                if (!uiState.isCameraTimelineOpen && uiState.isVideoTransformMode && activeVideoAsset != null && !uiState.isZenModeActive) {
                     Surface(
                         modifier = Modifier
                             .shadow(8.dp, RoundedCornerShape(14.dp))
@@ -822,7 +878,7 @@ fun AnimationEditorScreen(
                     uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers?.getOrNull(uiState.activeLayerIndex)
                 } else null
                 val activeLayerImgAttachment = activeLayerImageTarget?.imageAttachment
-                if (activeLayerImageTarget != null && activeLayerImgAttachment != null && !uiState.isZenModeActive) {
+                if (!uiState.isCameraTimelineOpen && activeLayerImageTarget != null && activeLayerImgAttachment != null && !uiState.isZenModeActive) {
                     TimelineLayerImageTransformHud(
                         layerName = activeLayerImageTarget.name,
                         attachment = activeLayerImgAttachment,
@@ -865,7 +921,7 @@ fun AnimationEditorScreen(
 
                 // Procreate-style Krita Brush Library Drawer (12 Native + Imported .kpp/.bundle)
                 ProcreateBrushPickerSheet(
-                    visible = showProcreateBrushes && !uiState.isZenModeActive,
+                    visible = showProcreateBrushes && !uiState.isZenModeActive && !uiState.isCameraTimelineOpen,
                     activePreset = uiState.activeBrushPreset,
                     brushSize = uiState.brushSize,
                     brushOpacity = uiState.brushOpacity,
@@ -902,6 +958,9 @@ fun AnimationEditorScreen(
                         onToggleSideView3D = { viewModel.toggleCameraSideView3D() },
                         onResetCurrentKeyframe = { viewModel.resetCameraAtCurrentFrame() },
                         onCloseCameraMode = { viewModel.closeCameraTimeline() },
+                        cameraViewportNavTarget = uiState.cameraViewportNavTarget,
+                        onToggleViewportNavTarget = { viewModel.toggleCameraViewportNavTarget() },
+                        onFocusSelected = { viewModel.focusSelectedStageTarget() },
                         modifier = Modifier
                             .align(Alignment.CenterStart)
                             .padding(start = 8.dp)
@@ -940,7 +999,7 @@ fun AnimationEditorScreen(
 
             // Floating Mobile Brush Studio Configurator Drawer
             BrushStudioDrawer(
-                visible = uiState.isBrushStudioOpen && !showExtraToolsMenu && !uiState.isZenModeActive,
+                visible = uiState.isBrushStudioOpen && !showExtraToolsMenu && !uiState.isZenModeActive && !uiState.isCameraTimelineOpen,
                 activePreset = uiState.activeBrushPreset,
                 nativePresets = uiState.nativeBrushPresets,
                 importedPresets = uiState.importedKritaBrushes,
@@ -1016,13 +1075,17 @@ fun AnimationEditorScreen(
                 onToggleQuickPalette = { viewModel.toggleQuickPalette() },
                 onOpenCameraTimeline = { viewModel.toggleCameraTimeline() },
                 isCameraTimelineOpen = uiState.isCameraTimelineOpen,
+                show3DInCanvas = uiState.project.canvasBackground.show3DInCanvas,
+                canvas3DRenderMode = uiState.project.canvasBackground.canvas3DRenderMode,
+                onToggleShow3DInCanvas = { viewModel.toggleShow3DInCanvas() },
+                onSelectCanvas3DRenderMode = { viewModel.setCanvas3DBackgroundRenderMode(it) },
                 modifier = Modifier
                     .align(Alignment.CenterStart)
                     .padding(start = 58.dp)
             )
 
             // Popover Flutuante Config. Balde (Expandir px + Pintar por baixo + Camadas Referência)
-            if (uiState.showBucketConfig && !uiState.isZenModeActive) {
+            if (!uiState.isCameraTimelineOpen && uiState.showBucketConfig && !uiState.isZenModeActive) {
                 val currFrameBucket = uiState.project.frames.getOrNull(uiState.currentFrameIndex)
                 BucketConfigPopover(
                     config = uiState.bucketConfig,

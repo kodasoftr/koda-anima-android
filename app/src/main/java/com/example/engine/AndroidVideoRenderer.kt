@@ -69,7 +69,7 @@ object AndroidVideoRenderer {
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             var trackIndex = -1
             val bufferInfo = MediaCodec.BufferInfo()
-            val totalFrames = max(1, project.frames.size)
+            val totalTicks = TimelineTrackEngine.computeTotalTicks(project, includeCameraRunway = useCameraCrop)
 
             fun drainEncoder(endOfStream: Boolean) {
                 val enc = encoder ?: return
@@ -110,24 +110,26 @@ object AndroidVideoRenderer {
             pooledFrameBitmap = KodanimaBitmapPool.acquire(width, height, Bitmap.Config.ARGB_8888, Color.WHITE)
             val surface = inputSurface!!
 
-            for (i in project.frames.indices) {
-                val frame = project.frames[i]
+            for (tick in 0 until totalTicks) {
+                val frame = TimelineTrackEngine.composeFrameAtTick(project, tick, activeLayerIndex = 0, fallbackFrameIndex = 0)
                 onProgress(
-                    0.1f + 0.7f * (i.toFloat() / totalFrames),
-                    "Codificando quadro ${i + 1}/$totalFrames via hardware GPU..."
+                    0.1f + 0.7f * (tick.toFloat() / totalTicks.coerceAtLeast(1)),
+                    "Codificando quadro ${tick + 1}/$totalTicks via hardware GPU..."
                 )
 
-                if (useCameraCrop || project.camera3D.postEffects.hasAnyEffect()) {
+                if (useCameraCrop || project.camera3D.postEffects.hasAnyEffect() || project.canvasBackground.show3DInCanvas) {
                     Camera3DEngine.renderFrameWithCameraAndEffects(
                         frame = frame,
                         settings = project.camera3D,
-                        frameIndex = i,
+                        frameIndex = tick,
                         projectWidth = project.resolution.width,
                         projectHeight = project.resolution.height,
                         targetBitmap = pooledFrameBitmap,
                         cropToCamera = useCameraCrop,
                         background = project.canvasBackground,
-                        renderTransparentAsSky = true
+                        renderTransparentAsSky = true,
+                        tickFloat = tick.toFloat(),
+                        fps = fps
                     )
                 } else {
                     KodanimaGraphicsEngine.drawFrameToBitmap(
@@ -139,18 +141,16 @@ object AndroidVideoRenderer {
                     )
                 }
 
-                repeat(max(1, frame.holdFrames)) {
-                    drainEncoder(false)
-                    val canvas: Canvas = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        surface.lockHardwareCanvas()
-                    } else {
-                        surface.lockCanvas(null)
-                    }
-                    try {
-                        canvas.drawBitmap(pooledFrameBitmap, 0f, 0f, null)
-                    } finally {
-                        surface.unlockCanvasAndPost(canvas)
-                    }
+                drainEncoder(false)
+                val canvas: Canvas = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    surface.lockHardwareCanvas()
+                } else {
+                    surface.lockCanvas(null)
+                }
+                try {
+                    canvas.drawBitmap(pooledFrameBitmap, 0f, 0f, null)
+                } finally {
+                    surface.unlockCanvasAndPost(canvas)
                 }
             }
 
@@ -189,21 +189,24 @@ object AndroidVideoRenderer {
 
         try {
             ZipOutputStream(FileOutputStream(zipFile)).use { zipOut ->
-                val total = max(1, project.frames.size)
-                for (i in project.frames.indices) {
-                    onProgress(0.1f + 0.8f * (i.toFloat() / total), "Compactando quadro ${i + 1}/$total...")
-                    val frame = project.frames[i]
-                    if (useCameraCrop || project.camera3D.postEffects.hasAnyEffect()) {
+                val totalTicks = TimelineTrackEngine.computeTotalTicks(project, includeCameraRunway = useCameraCrop)
+                for (tick in 0 until totalTicks) {
+                    onProgress(0.1f + 0.8f * (tick.toFloat() / totalTicks.coerceAtLeast(1)), "Compactando quadro ${tick + 1}/$totalTicks...")
+                    val frame = TimelineTrackEngine.composeFrameAtTick(project, tick, activeLayerIndex = 0, fallbackFrameIndex = 0)
+                    val exportFps = max(1, min(60, project.fps))
+                    if (useCameraCrop || project.camera3D.postEffects.hasAnyEffect() || project.canvasBackground.show3DInCanvas) {
                         Camera3DEngine.renderFrameWithCameraAndEffects(
                             frame = frame,
                             settings = project.camera3D,
-                            frameIndex = i,
+                            frameIndex = tick,
                             projectWidth = project.resolution.width,
                             projectHeight = project.resolution.height,
                             targetBitmap = scratchBmp,
                             cropToCamera = useCameraCrop,
                             background = project.canvasBackground,
-                            renderTransparentAsSky = false
+                            renderTransparentAsSky = false,
+                            tickFloat = tick.toFloat(),
+                            fps = exportFps
                         )
                     } else {
                         KodanimaGraphicsEngine.drawFrameToBitmap(
@@ -214,7 +217,7 @@ object AndroidVideoRenderer {
                             drawSkyWhenTransparent = false
                         )
                     }
-                    val entryName = String.format("frame_%06d.png", i + 1)
+                    val entryName = String.format("frame_%06d.png", tick + 1)
                     zipOut.putNextEntry(ZipEntry(entryName))
                     scratchBmp.compress(Bitmap.CompressFormat.PNG, 100, zipOut)
                     zipOut.closeEntry()

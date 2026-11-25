@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.ViewInAr
 import androidx.compose.material.icons.filled.ViewTimeline
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.WifiTethering
@@ -73,6 +74,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.model.Canvas3DBackgroundRenderMode
 import com.example.model.ConnectedFriendInfo
 import com.example.model.GridRulerSettings
 import com.example.model.KodanimaTheme
@@ -292,6 +294,10 @@ fun ExtraToolsFloatingMenu(
     onToggleQuickPalette: (() -> Unit)? = null,
     onOpenCameraTimeline: (() -> Unit)? = null,
     isCameraTimelineOpen: Boolean = false,
+    show3DInCanvas: Boolean = false,
+    canvas3DRenderMode: Canvas3DBackgroundRenderMode = Canvas3DBackgroundRenderMode.STATIC_2D_CACHE,
+    onToggleShow3DInCanvas: (() -> Unit)? = null,
+    onSelectCanvas3DRenderMode: ((Canvas3DBackgroundRenderMode) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     BoxWithConstraints(modifier = modifier) {
@@ -436,6 +442,73 @@ fun ExtraToolsFloatingMenu(
                         modifier = Modifier.testTag("three_wheels_camera_3d_btn")
                     ) {
                         onOpenCameraTimeline(); onDismiss()
+                    }
+                }
+                if (onToggleShow3DInCanvas != null) {
+                    ExtraToolRow(
+                        icon = Icons.Default.ViewInAr,
+                        label = if (show3DInCanvas) "Mostrar 3D no Canvas (Ativo)" else "Mostrar 3D no Canvas",
+                        isActive = show3DInCanvas,
+                        textColor = textColor,
+                        accentColor = accentColor,
+                        trailingActionText = if (show3DInCanvas) "3D" else null,
+                        modifier = Modifier.testTag("three_wheels_show_3d_canvas_btn")
+                    ) {
+                        onToggleShow3DInCanvas()
+                    }
+                    if (show3DInCanvas && onSelectCanvas3DRenderMode != null) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(textColor.copy(alpha = 0.06f))
+                                .border(0.8.dp, accentColor.copy(alpha = 0.35f), RoundedCornerShape(8.dp))
+                                .padding(7.dp),
+                            verticalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Text(
+                                text = "Otimização do Fundo 3D:",
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = accentColor
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Canvas3DBackgroundRenderMode.entries.forEach { mode ->
+                                    val selected = canvas3DRenderMode == mode
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(if (selected) accentColor else textColor.copy(alpha = 0.12f))
+                                            .border(
+                                                width = 0.8.dp,
+                                                color = if (selected) accentColor else textColor.copy(alpha = 0.18f),
+                                                shape = RoundedCornerShape(6.dp)
+                                            )
+                                            .clickable { onSelectCanvas3DRenderMode(mode) }
+                                            .padding(horizontal = 7.dp, vertical = 5.dp)
+                                            .testTag("canvas_3d_mode_${mode.name}")
+                                    ) {
+                                        Text(
+                                            text = mode.labelPt,
+                                            fontSize = 8.8.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (selected) Color.Black else textColor
+                                        )
+                                    }
+                                }
+                            }
+                            Text(
+                                text = canvas3DRenderMode.descPt,
+                                fontSize = 8.2.sp,
+                                lineHeight = 11.sp,
+                                color = textColor.copy(alpha = 0.75f)
+                            )
+                        }
                     }
                 }
                 ExtraToolRow(Icons.Default.Flip, "Espelhar Visualização", mirrorHorizontal, textColor, accentColor) {

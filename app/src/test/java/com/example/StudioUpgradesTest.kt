@@ -4,11 +4,15 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
+import com.example.engine.BuiltIn3DPrimitive
 import com.example.engine.Camera3DEngine
 import com.example.engine.FileImportExportManager
 import com.example.engine.KodanimaGraphicsEngine
 import com.example.engine.KritaBrushImporter
+import com.example.engine.Mesh3DImporter
 import com.example.engine.PreferencesStorageManager
+import com.example.engine.TimelineTrackEngine
+import com.example.model.AnimationProject
 import com.example.model.BucketFillConfig
 import com.example.model.BucketReferenceMode
 import com.example.model.BrushDynamicParams
@@ -21,6 +25,8 @@ import com.example.model.CameraEffectSpan
 import com.example.model.CameraMode
 import com.example.model.CameraPostEffectSettings
 import com.example.model.CameraToolAction
+import com.example.model.CameraViewportNavTarget
+import com.example.model.Canvas3DBackgroundRenderMode
 import com.example.model.CanvasBackgroundSettings
 import com.example.model.CanvasBackgroundStyle
 import com.example.model.CanvasTexturePattern
@@ -29,16 +35,21 @@ import com.example.model.DrawingStroke
 import com.example.viewmodel.EditorDialog
 import com.example.model.Frame
 import com.example.model.GestureAction
+import com.example.model.GradientColorStop
 import com.example.model.GridRulerSettings
 import com.example.model.KritaBrushEngineKind
 import com.example.model.Layer
 import com.example.model.LayerBlendEffect
 import com.example.model.MultiFingerGesture
+import com.example.model.ObjectTransformKeyframe
 import com.example.model.PerspectiveRulerSettings
 import com.example.model.ProjectResolution
+import com.example.model.SceneObject3D
 import com.example.model.ShortcutAction
 import com.example.model.ShortcutRegistry
 import com.example.model.SkyBackdropMode
+import com.example.model.StageSelection
+import com.example.model.StageTargetType
 import com.example.model.StrokePoint
 import com.example.model.ToolType
 import com.example.model.TouchGestureRegistry
@@ -1457,7 +1468,570 @@ class StudioUpgradesTest {
         assertEquals("predefined", linkedBrush.dynamicParams.shapeKind)
         assertNotNull("Bundle must resolve URL-encoded brush tip filename", linkedBrush.dynamicParams.tipStampBase64)
     }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `3d scene import obj mtl uv and glb hierarchy, multi-stop sky gradient, off-canvas zoomed-out render, stage object animation and keyframe drag work`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+
+        // 1. OBJ + MTL + PNG UV Texture Import
+        val uvBmp = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)
+        uvBmp.eraseColor(android.graphics.Color.rgb(235, 30, 30))
+        val uvPngBytes = ByteArrayOutputStream().apply {
+            uvBmp.compress(Bitmap.CompressFormat.PNG, 100, this)
+        }.toByteArray()
+        uvBmp.recycle()
+
+        val mtlBytes = """
+            newmtl RedTextured
+            Kd 1.0 1.0 1.0
+            map_Kd diffuse_red.png
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+
+        val objBytes = """
+            mtllib scene_uv.mtl
+            usemtl RedTextured
+            v -1.0 -1.0 0.0
+            v 1.0 -1.0 0.0
+            v 0.0 1.0 0.0
+            vt 0.0 0.0
+            vt 1.0 0.0
+            vt 0.5 1.0
+            vn 0.0 0.0 1.0
+            f 1/1/1 2/2/1 3/3/1
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+
+        val objScene = Mesh3DImporter.parseSceneBytesForTest(objBytes, "character.obj") { ref ->
+            when {
+                ref.endsWith(".mtl", ignoreCase = true) -> mtlBytes
+                ref.endsWith(".png", ignoreCase = true) -> uvPngBytes
+                else -> null
+            }
+        }
+        assertNotNull("OBJ+MTL+PNG scene must parse", objScene)
+        assertEquals(1, objScene!!.totalTriangles)
+        val firstSub = objScene.subMeshes.first()
+        assertNotNull("UV texture pixels must decode from MTL map_Kd", firstSub.texturePixels)
+        assertTrue(android.graphics.Color.red(firstSub.texturePixels!![0]) > 200)
+
+        // 2. Binary GLB 2.0 with Parent->Child Node Hierarchy
+        val binBuf = ByteBuffer.allocate(36 + 6).order(ByteOrder.LITTLE_ENDIAN)
+            .putFloat(0f).putFloat(0f).putFloat(0f)
+            .putFloat(1f).putFloat(0f).putFloat(0f)
+            .putFloat(0f).putFloat(1f).putFloat(0f)
+            .putShort(0).putShort(1).putShort(2)
+            .array()
+        val binPaddedLen = ((binBuf.size + 3) / 4) * 4
+        val gltfJsonRaw = """
+            {"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"translation":[2,0,0],"children":[1]},{"translation":[0,3,0],"mesh":0}],"meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],"buffers":[{"byteLength":${binBuf.size}}],"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":6}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}]}
+        """.trim().toByteArray(Charsets.UTF_8)
+        val jsonPaddedLen = ((gltfJsonRaw.size + 3) / 4) * 4
+        val totalGlbSize = 12 + 8 + jsonPaddedLen + 8 + binPaddedLen
+        val glbOut = ByteBuffer.allocate(totalGlbSize).order(ByteOrder.LITTLE_ENDIAN)
+            .put('g'.code.toByte()).put('l'.code.toByte()).put('T'.code.toByte()).put('F'.code.toByte())
+            .putInt(2)
+            .putInt(totalGlbSize)
+            .putInt(jsonPaddedLen)
+            .putInt(0x4E4F534A)
+            .put(gltfJsonRaw)
+        while (glbOut.position() < 12 + 8 + jsonPaddedLen) glbOut.put(0x20.toByte())
+        glbOut.putInt(binPaddedLen)
+            .putInt(0x004E4942)
+            .put(binBuf)
+        while (glbOut.position() < totalGlbSize) glbOut.put(0.toByte())
+
+        val glbScene = Mesh3DImporter.parseSceneBytesForTest(glbOut.array(), "prop.glb")
+        assertNotNull("Binary GLB scene with node hierarchy must parse", glbScene)
+        assertEquals(1, glbScene!!.totalTriangles)
+        assertTrue(glbScene.boundingRadius > 0.1f)
+
+        // 3. Multi-Stop Sky Gradient (Light point, intermediate stop, Dark point)
+        val skyBmp = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
+        val skyCfg = CanvasBackgroundSettings(
+            style = CanvasBackgroundStyle.TRANSPARENTE,
+            skyMode = SkyBackdropMode.GRADIENTE_CEU,
+            skyLightColor = 0xFFFF0000L,
+            skyDarkColor = 0xFF0000FFL,
+            skyGradientStops = listOf(GradientColorStop(position = 0.5f, color = 0xFF00FF00L)),
+            skyGradientAngleDeg = 90f
+        )
+        KodanimaGraphicsEngine.drawSkyBackdropToCanvas(android.graphics.Canvas(skyBmp), 100f, 100f, skyCfg)
+        val topPix = skyBmp.getPixel(50, 2)
+        val midPix = skyBmp.getPixel(50, 50)
+        val botPix = skyBmp.getPixel(50, 98)
+        assertTrue("Top/Light point must be red ($topPix)", android.graphics.Color.red(topPix) > 200 && android.graphics.Color.blue(topPix) < 50)
+        assertTrue("Middle stop must be green ($midPix)", android.graphics.Color.green(midPix) > 200)
+        assertTrue("Bottom/Dark point must be blue ($botPix)", android.graphics.Color.blue(botPix) > 200 && android.graphics.Color.red(botPix) < 50)
+        skyBmp.recycle()
+
+        // 4. Software 3D Rasterizer + Zoomed-out Off-Canvas Render
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("Cena3D", ProjectResolution.PRESETS[0], 24)
+        vm.addFrame()
+        vm.addFrame()
+        vm.addFrame() // 4 frames (0..3)
+
+        vm.addBuiltIn3DPrimitive(BuiltIn3DPrimitive.CUBE)
+        val addedObj = vm.uiState.value.project.camera3D.scene3DObjects.firstOrNull()
+        assertNotNull("addBuiltIn3DPrimitive must append SceneObject3D", addedObj)
+        assertEquals(StageTargetType.OBJECT_3D, vm.uiState.value.stageSelection.type)
+        assertEquals(addedObj!!.id, vm.uiState.value.stageSelection.id)
+        assertTrue(vm.uiState.value.stageFocusRequestNonce >= 1)
+
+        val render3D = Camera3DEngine.renderSceneObjectsSoftware3D(
+            outW = 160,
+            outH = 120,
+            sceneObjects = listOf(addedObj),
+            frameIndex = 0,
+            autoInterpolate = true,
+            camYawDeg = 20f,
+            camPitchDeg = 12f,
+            camRollDeg = 0f,
+            camPanX = 0f,
+            camPanY = 0f,
+            focalPx = 320f,
+            vpCx = 80f,
+            vpCy = 60f,
+            worldUnitScale = 1.0f
+        )
+        assertNotNull("3D software renderer must produce bitmap", render3D)
+        val (objBmp, objBounds) = render3D!!
+        assertTrue("Projected 3D bounds must be recorded for tap selection", objBounds.containsKey(addedObj.id))
+        var opaqueCount = 0
+        for (py in 0 until objBmp.height) {
+            for (px in 0 until objBmp.width) {
+                if (((objBmp.getPixel(px, py) ushr 24) and 0xFF) > 128) opaqueCount++
+            }
+        }
+        assertTrue("Rendered 3D cube must cover visible pixels ($opaqueCount)", opaqueCount > 50)
+        objBmp.recycle()
+
+        // Zoomed-out (zoom = 0.4f) render with transparent paper renders sky outside 2D canvas bounds
+        val zoomOutCam = Camera3DSettings(
+            isEnabled = true,
+            cameraMode = CameraMode.MODE_2D,
+            keyframes = listOf(Camera3DKeyframe(frameIndex = 0, zoom = 0.4f))
+        )
+        val zoomOutBmp = Bitmap.createBitmap(200, 120, Bitmap.Config.ARGB_8888)
+        Camera3DEngine.renderFrameWithCameraAndEffects(
+            frame = vm.uiState.value.project.frames[0],
+            settings = zoomOutCam,
+            frameIndex = 0,
+            projectWidth = 200,
+            projectHeight = 120,
+            targetBitmap = zoomOutBmp,
+            cropToCamera = true,
+            background = CanvasBackgroundSettings(
+                style = CanvasBackgroundStyle.TRANSPARENTE,
+                skyMode = SkyBackdropMode.SOLIDO,
+                skyLightColor = 0xFF11AA44L
+            ),
+            renderTransparentAsSky = true
+        )
+        val outerBorderPix = zoomOutBmp.getPixel(4, 4)
+        assertEquals("Off-canvas area when zoomed out must render configured sky", 0xFF11AA44.toInt(), outerBorderPix)
+        zoomOutBmp.recycle()
+
+        // 5. Keyframe Dragging + Layer Animation + 2D Viewport Nav Target Toggle
+        assertEquals(CameraViewportNavTarget.CAMERA, vm.uiState.value.cameraViewportNavTarget)
+        vm.toggleCameraViewportNavTarget()
+        assertEquals(CameraViewportNavTarget.CANVAS, vm.uiState.value.cameraViewportNavTarget)
+
+        vm.goToFrame(1)
+        vm.nudgeCameraPan(80f, -40f)
+        assertTrue(vm.uiState.value.project.camera3D.keyframes.any { it.frameIndex == 1 })
+        vm.moveCameraKeyframe(fromFrame = 1, toFrame = 3)
+        assertFalse("Source frame 1 must no longer hold moved camera keyframe", vm.uiState.value.project.camera3D.keyframes.any { it.frameIndex == 1 })
+        val movedCamKf = vm.uiState.value.project.camera3D.keyframes.firstOrNull { it.frameIndex == 3 }
+        assertNotNull("Target frame 3 must receive moved camera keyframe", movedCamKf)
+        assertEquals(80f, movedCamKf!!.x, 0.01f)
+
+        // Layer Transform Track animation & long-press move
+        val layer0Id = vm.uiState.value.project.frames[0].layers[0].id
+        vm.selectStageTarget(StageSelection(StageTargetType.LAYER, layer0Id))
+        vm.goToFrame(0)
+        vm.updateSelectedObjectTransform { ObjectTransformKeyframe(frameIndex = 0, x = 0f, rotY = 0f) }
+        vm.goToFrame(2)
+        vm.updateSelectedObjectTransform { ObjectTransformKeyframe(frameIndex = 2, x = 200f, rotY = 60f) }
+        val midLayerEval = Camera3DEngine.evaluateLayerTransformAtFrame(vm.uiState.value.project.camera3D.layerTransformTracks, layer0Id, frameIndex = 1)
+        assertEquals(100f, midLayerEval.x, 10f)
+        assertEquals(30f, midLayerEval.rotY, 5f)
+        vm.moveSelectedTargetKeyframe(fromFrame = 2, toFrame = 3)
+        val movedLayerTrack = vm.uiState.value.project.camera3D.layerTransformTracks.first { it.layerId == layer0Id }
+        assertFalse(movedLayerTrack.keyframes.any { it.frameIndex == 2 })
+        assertEquals(200f, movedLayerTrack.keyframes.first { it.frameIndex == 3 }.x, 0.01f)
+    }
+
+    @Test
+    fun `decoupled per-layer cel timing stretch move onion skin and continuous camera timing work independently`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("CamadasIndependentes", ProjectResolution.PRESETS[0], 24)
+        vm.addLayer() // Now 2 layers: index 0 and index 1
+        vm.addFrame() // 2 frames (frameIndex 0 and frameIndex 1)
+
+        // Mark distinct strokes on each layer/frame so composed frames can be verified
+        vm.selectLayer(0)
+        vm.selectFrame(0)
+        vm.addStrokeToCurrentLayer(DrawingStroke(points = listOf(StrokePoint(10f, 10f)), color = 0xFFFF0000L, brushSize = 4f))
+        vm.selectLayer(1)
+        vm.selectFrame(0)
+        vm.addStrokeToCurrentLayer(DrawingStroke(points = listOf(StrokePoint(20f, 20f)), color = 0xFF00FF00L, brushSize = 4f))
+        vm.selectLayer(1)
+        vm.selectFrame(1)
+        vm.addStrokeToCurrentLayer(DrawingStroke(points = listOf(StrokePoint(30f, 30f)), color = 0xFF0000FFL, brushSize = 4f))
+
+        // 1. Stretching layer 0 cel 0 to 4 ticks MUST NOT stretch or shift layer 1
+        vm.setLayerCelDuration(layerIndex = 0, frameIndex = 0, holdTicks = 4)
+        val projAfterStretch = vm.uiState.value.project
+        val l0Cels = TimelineTrackEngine.computeLayerCels(projAfterStretch, 0)
+        val l1Cels = TimelineTrackEngine.computeLayerCels(projAfterStretch, 1)
+        assertEquals("Layer 0 cel 0 must have duration 4 ticks", 4, l0Cels[0].durationTicks)
+        assertEquals("Layer 1 cel 0 must stay unaffected at 1 tick", 1, l1Cels[0].durationTicks)
+        assertEquals("Layer 1 cel 1 must still start at tick 1", 1, l1Cels[1].startTick)
+        assertEquals("Project total ticks must match longest layer", 4, TimelineTrackEngine.computeTotalTicks(projAfterStretch))
+
+        // Composing tick 2 yields layer 0 cel 0's red stroke while layer 1 has moved past cel 1 (blank gap)
+        val composedTick2 = TimelineTrackEngine.composeFrameAtTick(projAfterStretch, tick = 2, activeLayerIndex = 0)
+        assertEquals(0xFFFF0000L, composedTick2.layers[0].strokes.firstOrNull()?.color)
+        assertTrue("Layer 1 has ended by tick 2 without being stretched by layer 0", composedTick2.layers[1].strokes.isEmpty())
+
+        // Onion skin at tick 2 (still inside stretched layer 0 cel 0) must NOT ghost cel 0 over itself
+        val prevOnionAtTick2 = TimelineTrackEngine.resolveOnionSkinLayersAtTick(projAfterStretch, tick = 2, stepOffset = -1)
+        assertFalse(
+            "Stretched cel 0 on layer 0 must not ghost onto itself at tick 2",
+            prevOnionAtTick2.any { it.strokes.any { s -> s.color == 0xFFFF0000L } }
+        )
+
+        // 2. Moving cel 1 on layer 1 to tick 3 shifts ONLY layer 1
+        vm.moveLayerCelToTick(layerIndex = 1, frameIndex = 1, targetTick = 3)
+        val projAfterMove = vm.uiState.value.project
+        val movedL1Cels = TimelineTrackEngine.computeLayerCels(projAfterMove, 1)
+        val untouchedL0Cels = TimelineTrackEngine.computeLayerCels(projAfterMove, 0)
+        assertEquals("Layer 0 cel 0 remains at startTick 0", 0, untouchedL0Cels[0].startTick)
+        assertEquals("Layer 1 cel 1 moved independently to tick 3", 3, movedL1Cels[1].startTick)
+        val composedTick3 = TimelineTrackEngine.composeFrameAtTick(projAfterMove, tick = 3, activeLayerIndex = 1)
+        assertEquals(0xFFFF0000L, composedTick3.layers[0].strokes.firstOrNull()?.color)
+        assertEquals(0xFF0000FFL, composedTick3.layers[1].strokes.firstOrNull()?.color)
+
+        // 3. Independent continuous camera timing & holdTicks across a single held drawing cel (8 ticks)
+        vm.setLayerCelDuration(layerIndex = 0, frameIndex = 0, holdTicks = 8)
+        vm.toggleCameraEnabled()
+        vm.goToTimelineTick(0)
+        vm.addOrUpdateCameraKeyframeAtCurrentFrame(CameraEasingCurve.LINEAR)
+        vm.setCameraKeyframeHold(tickIndex = 0, holdTicks = 2) // Holds flat on ticks 0..1 before easing at tick 2
+        vm.goToTimelineTick(6)
+        vm.updateCameraAtCurrentFrame { it.copy(zoom = 2.0f, x = 200f) }
+
+        val camSettings = vm.uiState.value.project.camera3D
+        // During hold plateau (tick 1.0f <= end of hold at 1.0 + 1 -> transitions from tick 1? Wait: key0 at 0 with holdTicks=2 holds through 0..1)
+        val evalHoldMid = Camera3DEngine.evaluateCameraAtTick(camSettings, tickFloat = 0.8f)
+        assertEquals("Camera holds keyframe 0 value during holdTicks plateau", 1.0f, evalHoldMid.zoom, 0.01f)
+
+        // Midpoint of transition ticks [1..6] is 3.5f -> 50% of zoom 1.0..2.0 = 1.5f
+        val evalSubTickMid = Camera3DEngine.evaluateCameraAtTick(camSettings, tickFloat = 3.5f)
+        assertTrue("Continuous sub-tick interpolation advances smoothly between keyframes (zoom=${evalSubTickMid.zoom})", evalSubTickMid.zoom > 1.25f && evalSubTickMid.zoom < 1.75f)
+        assertTrue("Continuous X pan interpolates smoothly (${evalSubTickMid.x})", evalSubTickMid.x > 60f && evalSubTickMid.x < 140f)
+
+        // 4. Serialization round-trip preserves celHoldTicks, celStartTick, and keyframe holdTicks
+        val json = FileImportExportManager.projectToJson(vm.uiState.value.project)
+        val restored: AnimationProject = FileImportExportManager.projectFromJson(json)
+        assertEquals(8, restored.frames[0].layers[0].celHoldTicks)
+        assertEquals(3, restored.frames[1].layers[1].celStartTick)
+        assertEquals(2, restored.camera3D.keyframes.first { it.frameIndex == 0 }.holdTicks)
+    }
+
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Test
+    fun `show 3D in canvas toggle modes serialization and 3D background rasterization work cleanly`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("Fundo3DCanvas", ProjectResolution.PRESETS[0], 12)
+
+        assertFalse(vm.uiState.value.project.canvasBackground.show3DInCanvas)
+        assertEquals(Canvas3DBackgroundRenderMode.STATIC_2D_CACHE, vm.uiState.value.project.canvasBackground.canvas3DRenderMode)
+
+        vm.toggleShow3DInCanvas()
+        assertTrue(vm.uiState.value.project.canvasBackground.show3DInCanvas)
+
+        vm.setCanvas3DBackgroundRenderMode(Canvas3DBackgroundRenderMode.PRE_RENDER_ON_PLAY)
+        assertEquals(Canvas3DBackgroundRenderMode.PRE_RENDER_ON_PLAY, vm.uiState.value.project.canvasBackground.canvas3DRenderMode)
+
+        vm.setCanvas3DBackgroundRenderMode(Canvas3DBackgroundRenderMode.REALTIME_3D)
+        assertEquals(Canvas3DBackgroundRenderMode.REALTIME_3D, vm.uiState.value.project.canvasBackground.canvas3DRenderMode)
+
+        val (cubeUri, _) = Mesh3DImporter.createBuiltInSceneAsset(BuiltIn3DPrimitive.CUBE)
+        val projWithCube = vm.uiState.value.project.copy(
+            camera3D = vm.uiState.value.project.camera3D.copy(
+                scene3DObjects = listOf(
+                    SceneObject3D(id = "cube_bg_test", name = "Cubo Palco", meshAssetPath = cubeUri)
+                )
+            )
+        )
+        val bgBitmap = Camera3DEngine.renderCanvas3DBackgroundBitmap(
+            outW = 160,
+            outH = 120,
+            project = projWithCube,
+            tickFloat = 0f,
+            fps = 12
+        )
+        assertEquals(160, bgBitmap.width)
+        assertEquals(120, bgBitmap.height)
+        val pixels = IntArray(bgBitmap.width * bgBitmap.height)
+        bgBitmap.getPixels(pixels, 0, bgBitmap.width, 0, 0, bgBitmap.width, bgBitmap.height)
+        val uniqueColors = pixels.toSet().size
+        assertTrue("3D canvas background should render sky, floor grid, and 3D cube ($uniqueColors colors)", uniqueColors > 4)
+        bgBitmap.recycle()
+
+        val json = FileImportExportManager.projectToJson(projWithCube)
+        val restored = FileImportExportManager.projectFromJson(json)
+        assertTrue(restored.canvasBackground.show3DInCanvas)
+        assertEquals(Canvas3DBackgroundRenderMode.REALTIME_3D, restored.canvasBackground.canvas3DRenderMode)
+    }
+
+    @Test
+    fun `glTF animated node evaluation updates triangle positions cleanly across time`() {
+        // Minimal self-contained animated glTF triangle (translates along +X from 0 to +4 between t=0s and t=2s)
+        val bb = java.nio.ByteBuffer.allocate(3 * 3 * 4 + 2 * 4 + 2 * 3 * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        // Positions (3 verts: 36 bytes)
+        bb.putFloat(0f); bb.putFloat(0f); bb.putFloat(0f)
+        bb.putFloat(1f); bb.putFloat(0f); bb.putFloat(0f)
+        bb.putFloat(0f); bb.putFloat(1f); bb.putFloat(0f)
+        // Keyframe times (2 floats: 8 bytes at offset 36)
+        bb.putFloat(0f); bb.putFloat(2f)
+        // Keyframe translation values (2 vec3s: 24 bytes at offset 44)
+        bb.putFloat(0f); bb.putFloat(0f); bb.putFloat(0f)
+        bb.putFloat(4f); bb.putFloat(0f); bb.putFloat(0f)
+        val binB64 = android.util.Base64.encodeToString(bb.array(), android.util.Base64.NO_WRAP)
+
+        val gltfJson = """
+            {
+              "asset": {"version": "2.0"},
+              "buffers": [{"uri": "data:application/octet-stream;base64,$binB64", "byteLength": ${bb.capacity()}}],
+              "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 8},
+                {"buffer": 0, "byteOffset": 44, "byteLength": 24}
+              ],
+              "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0,0,0], "max": [1,1,0]},
+                {"bufferView": 1, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0], "max": [2]},
+                {"bufferView": 2, "componentType": 5126, "count": 2, "type": "VEC3"}
+              ],
+              "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+              "nodes": [{"mesh": 0, "translation": [0, 0, 0]}],
+              "scenes": [{"nodes": [0]}],
+              "scene": 0,
+              "animations": [{
+                "name": "SlideX",
+                "samplers": [{"input": 1, "interpolation": "LINEAR", "output": 2}],
+                "channels": [{"sampler": 0, "target": {"node": 0, "path": "translation"}}]
+              }]
+            }
+        """.trimIndent()
+
+        val scene = Mesh3DImporter.parseSceneBytesForTest(gltfJson.toByteArray(Charsets.UTF_8), "anim_tri.gltf")
+        assertNotNull(scene)
+        assertTrue("glTF animation clip must be detected", scene!!.hasAnimations)
+        val meshT0 = Mesh3DImporter.evaluateSceneAtTime(scene, 0f).first()
+        val meshT1 = Mesh3DImporter.evaluateSceneAtTime(scene, 1f).first()
+        assertTrue(
+            "Vertex X should advance smoothly at t=1.0s (t0=${meshT0.vertices[0]}, t1=${meshT1.vertices[0]})",
+            meshT1.vertices[0] > meshT0.vertices[0] + 0.5f
+        )
+    }
+
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Test
+    fun `native brushes 7 through 12 render cleanly without overlap seam darkening`() {
+        val brushes = BrushPreset.ALL_12_PRESETS.filter { it.id in 7..12 }
+        assertEquals(6, brushes.size)
+
+        val points = listOf(
+            StrokePoint(16f, 64f, 0.8f),
+            StrokePoint(48f, 58f, 0.9f),
+            StrokePoint(80f, 64f, 0.9f),
+            StrokePoint(112f, 70f, 0.8f)
+        )
+
+        brushes.forEach { preset ->
+            val bmp = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bmp)
+            val stroke = DrawingStroke(
+                points = points,
+                color = 0xCC2266DDL,
+                brushSize = preset.defaultSize.coerceAtLeast(14f),
+                opacity = preset.defaultOpacity,
+                tool = preset.toolType,
+                brushPresetId = preset.id,
+                customBrushParams = preset.dynamicParams.toCompactJson()
+            )
+            KodanimaGraphicsEngine.drawStrokeToCanvas(stroke, canvas)
+
+            val px = IntArray(128 * 128)
+            bmp.getPixels(px, 0, 128, 0, 0, 128, 128)
+            val nonZero = px.count { ((it ushr 24) and 0xFF) > 0 }
+            assertTrue("Brush #${preset.id} (${preset.namePt}) must render visible pixels (got $nonZero)", nonZero > 40)
+
+            // Verify translucent #7 Marker & #9 Bristle Glaze stay smooth and never double-darken above single stroke alpha ceiling
+            if (preset.id == 7 || preset.id == 9) {
+                val maxAlpha = px.maxOf { (it ushr 24) and 0xFF }
+                val expectedMax = ((204 * preset.defaultOpacity) + 12f).toInt()
+                assertTrue(
+                    "Brush #${preset.id} must isolate overlapping dabs (maxAlpha=$maxAlpha, ceiling=$expectedMax)",
+                    maxAlpha <= expectedMax
+                )
+            }
+            bmp.recycle()
+        }
+    }
+
+    @Test
+    fun `krita importer supports pattern files percentage opacity fade hardness paintopids and shared tips vault`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+
+        // 1. GIMP .pat ('GPAT') pattern parsing
+        val patW = 8
+        val patH = 8
+        val headerSize = 28 // 24 + "Quad" (4 bytes)
+        val patBuf = java.nio.ByteBuffer.allocate(headerSize + patW * patH).order(java.nio.ByteOrder.BIG_ENDIAN)
+        patBuf.putInt(headerSize)
+        patBuf.putInt(1)
+        patBuf.putInt(patW)
+        patBuf.putInt(patH)
+        patBuf.putInt(1)
+        patBuf.put("GPAT".toByteArray(Charsets.US_ASCII))
+        patBuf.put("Quad".toByteArray(Charsets.US_ASCII))
+        for (i in 0 until patW * patH) {
+            patBuf.put(((i % 2) * 200 + 30).toByte())
+        }
+        val patPreset = KritaBrushImporter.parsePatPresetBytes(patBuf.array(), "quad_grain.pat", 1201)
+        assertNotNull(patPreset)
+        assertNotNull(patPreset!!.dynamicParams.tipStampBase64)
+
+        // 2. Save shared .gbr tip in vault, then parse standalone XML referencing it with % Opacity/Flow + fade + colorsmudge
+        val gbrHeaderSize = 32
+        val gbrBuf = java.nio.ByteBuffer.allocate(gbrHeaderSize + 16).order(java.nio.ByteOrder.BIG_ENDIAN)
+        gbrBuf.putInt(gbrHeaderSize)
+        gbrBuf.putInt(2)
+        gbrBuf.putInt(4)
+        gbrBuf.putInt(4)
+        gbrBuf.putInt(1)
+        gbrBuf.put("GIMP".toByteArray(Charsets.US_ASCII))
+        gbrBuf.putInt(15)
+        gbrBuf.put("leaf".toByteArray(Charsets.US_ASCII))
+        repeat(16) { gbrBuf.put(220.toByte()) }
+
+        KritaBrushImporter.saveSharedTips(context, mapOf("leaf_tip.gbr" to gbrBuf.array()))
+        val loadedTips = KritaBrushImporter.loadSharedTipMap(context)
+        assertTrue(loadedTips.containsKey("leaf_tip.gbr"))
+
+        val xml = """
+            <Preset name="Aquarela Leaf" paintopid="colorsmudge">
+              <param name="OpacityValue">80</param>
+              <param name="FlowValue">60</param>
+              <param name="brush_definition"><![CDATA[<Brush type="gbr_brush" filename="leaf_tip.gbr" spacing="0.12"><MaskGenerator radius="12" fade="0.2" ratio="0.8"/></Brush>]]></param>
+            </Preset>
+        """.trimIndent()
+        val parsed = KritaBrushImporter.parseRawPresetXmlBytes(
+            rawBytes = xml.toByteArray(Charsets.UTF_8),
+            fileName = "aquarela_leaf.xml",
+            presetId = 1202,
+            externalBrushTips = loadedTips
+        )
+        assertNotNull(parsed)
+        assertEquals(KritaBrushEngineKind.BLENDER_WET_SOFT, parsed!!.engineKind)
+        assertEquals(0.80f, parsed.defaultOpacity, 0.02f)
+        assertEquals(0.60f, parsed.dynamicParams.flow, 0.02f)
+        assertEquals("predefined", parsed.dynamicParams.shapeKind)
+        assertNotNull(parsed.dynamicParams.tipStampBase64)
+        assertTrue("fade=0.2 should yield soft hardness < 0.65 (got ${parsed.dynamicParams.hardness})", parsed.dynamicParams.hardness < 0.65f)
+    }
+
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Test
+    fun `3D canvas background aligns with active camera parameters and reuses pooled bitmap`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("Alinhamento3D", ProjectResolution.PRESETS[0], 12)
+        val (cubeUri, _) = Mesh3DImporter.createBuiltInSceneAsset(BuiltIn3DPrimitive.CUBE)
+
+        val baseProj = vm.uiState.value.project.copy(
+            canvasBackground = CanvasBackgroundSettings(
+                style = CanvasBackgroundStyle.TRANSPARENTE,
+                show3DInCanvas = true,
+                canvas3DRenderMode = Canvas3DBackgroundRenderMode.REALTIME_3D
+            ),
+            camera3D = Camera3DSettings(
+                isEnabled = false,
+                cameraMode = CameraMode.MODE_3D,
+                keyframes = listOf(
+                    Camera3DKeyframe(frameIndex = 0, x = 0f, y = 0f, zoom = 1.0f, pitchX = 0f, yawY = 0f, fovDegrees = 50f)
+                ),
+                scene3DObjects = listOf(
+                    SceneObject3D(id = "cube_align", name = "Cubo Alinhado", meshAssetPath = cubeUri)
+                )
+            )
+        )
+
+        val bmpHeadOn = Camera3DEngine.renderCanvas3DBackgroundBitmap(
+            outW = 160,
+            outH = 120,
+            project = baseProj,
+            tickFloat = 0f,
+            fps = 12
+        )
+        val pxHeadOn = IntArray(160 * 120)
+        bmpHeadOn.getPixels(pxHeadOn, 0, 160, 0, 0, 160, 120)
+
+        // Rotated camera even while isEnabled == false must match the active camera angle instead of a hardcoded tilt
+        val rotatedProj = baseProj.copy(
+            camera3D = baseProj.camera3D.copy(
+                keyframes = listOf(
+                    Camera3DKeyframe(frameIndex = 0, x = 80f, y = -40f, zoom = 1.45f, pitchX = 24f, yawY = -36f, fovDegrees = 68f)
+                )
+            )
+        )
+        val bmpReused = Camera3DEngine.renderCanvas3DBackgroundBitmap(
+            outW = 160,
+            outH = 120,
+            project = rotatedProj,
+            tickFloat = 0f,
+            fps = 12,
+            reuseBitmap = bmpHeadOn
+        )
+        assertTrue("reuseBitmap should reuse the exact same Bitmap instance", bmpReused === bmpHeadOn)
+
+        val pxRotated = IntArray(160 * 120)
+        bmpReused.getPixels(pxRotated, 0, 160, 0, 0, 160, 120)
+        val diffCount = pxHeadOn.indices.count { pxHeadOn[it] != pxRotated[it] }
+        assertTrue(
+            "3D canvas background must visibly follow camera pitch/yaw/zoom/fov parameters (diff=$diffCount)",
+            diffCount > 1200
+        )
+
+        // With isEnabled == true in MODE_3D and matching keyframe, output should match renderCanvas3DBackgroundBitmap's sky+grid+cube framing
+        val enabledProj = rotatedProj.copy(camera3D = rotatedProj.camera3D.copy(isEnabled = true))
+        val bmpEnabled = Camera3DEngine.renderCanvas3DBackgroundBitmap(
+            outW = 160,
+            outH = 120,
+            project = enabledProj,
+            tickFloat = 0f,
+            fps = 12
+        )
+        val pxEnabled = IntArray(160 * 120)
+        bmpEnabled.getPixels(pxEnabled, 0, 160, 0, 0, 160, 120)
+        assertTrue("Enabled and preview 3D background should match identically", pxRotated.contentEquals(pxEnabled))
+
+        bmpHeadOn.recycle()
+        bmpEnabled.recycle()
+    }
 }
+
 
 
 

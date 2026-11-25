@@ -127,6 +127,7 @@ object FileImportExportManager {
                     put("bezierP1Y", kf.bezierP1Y.toDouble())
                     put("bezierP2X", kf.bezierP2X.toDouble())
                     put("bezierP2Y", kf.bezierP2Y.toDouble())
+                    put("holdTicks", kf.holdTicks)
                 })
             }
             put("keyframes", kArr)
@@ -150,6 +151,27 @@ object FileImportExportManager {
                 put("radialBlur", cam.postEffects.radialBlur.toDouble())
                 put("contrastBoost", cam.postEffects.contrastBoost.toDouble())
             })
+            val layerTrackArr = JSONArray()
+            cam.layerTransformTracks.forEach { track ->
+                layerTrackArr.put(JSONObject().apply {
+                    put("layerId", track.layerId)
+                    put("keyframes", objectKeyframesToJsonArray(track.keyframes))
+                })
+            }
+            put("layerTransformTracks", layerTrackArr)
+            val objArr = JSONArray()
+            cam.scene3DObjects.forEach { obj ->
+                objArr.put(JSONObject().apply {
+                    put("id", obj.id)
+                    put("name", obj.name)
+                    put("meshAssetPath", obj.meshAssetPath)
+                    put("formatTag", obj.formatTag)
+                    put("isVisible", obj.isVisible)
+                    put("colorTint", obj.colorTint)
+                    put("keyframes", objectKeyframesToJsonArray(obj.keyframes))
+                })
+            }
+            put("scene3DObjects", objArr)
         }
         root.put("camera3D", camObj)
 
@@ -164,6 +186,19 @@ object FileImportExportManager {
             put("skyMode", bg.skyMode.name)
             put("skyTopColor", bg.skyTopColor)
             put("skyBottomColor", bg.skyBottomColor)
+            put("skyLightColor", bg.skyLightColor)
+            put("skyDarkColor", bg.skyDarkColor)
+            put("skyGradientAngleDeg", bg.skyGradientAngleDeg.toDouble())
+            put("show3DInCanvas", bg.show3DInCanvas)
+            put("canvas3DRenderMode", bg.canvas3DRenderMode.name)
+            val stopsArr = JSONArray()
+            bg.skyGradientStops.forEach { st ->
+                stopsArr.put(JSONObject().apply {
+                    put("position", st.position.toDouble())
+                    put("color", st.color)
+                })
+            }
+            put("skyGradientStops", stopsArr)
         })
 
         // Frames
@@ -352,7 +387,8 @@ object FileImportExportManager {
                             bezierP1X = ko.optDouble("bezierP1X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
                             bezierP1Y = ko.optDouble("bezierP1Y", 0.1).toFloat().coerceIn(-0.4f, 1.4f),
                             bezierP2X = ko.optDouble("bezierP2X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
-                            bezierP2Y = ko.optDouble("bezierP2Y", 1.0).toFloat().coerceIn(-0.4f, 1.4f)
+                            bezierP2Y = ko.optDouble("bezierP2Y", 1.0).toFloat().coerceIn(-0.4f, 1.4f),
+                            holdTicks = ko.optInt("holdTicks", 1).coerceIn(1, 240)
                         )
                     )
                 }
@@ -391,6 +427,41 @@ object FileImportExportManager {
                     contrastBoost = po.optDouble("contrastBoost", 0.0).toFloat()
                 )
             } else CameraPostEffectSettings()
+            val layerTracksParsed = mutableListOf<com.example.model.LayerTransformTrack>()
+            val ltArr = camObjParsed.optJSONArray("layerTransformTracks")
+            if (ltArr != null) {
+                for (i in 0 until ltArr.length()) {
+                    val to = ltArr.optJSONObject(i) ?: continue
+                    val lid = to.optString("layerId", "")
+                    if (lid.isNotBlank()) {
+                        layerTracksParsed.add(
+                            com.example.model.LayerTransformTrack(
+                                layerId = lid,
+                                keyframes = parseObjectKeyframes(to.optJSONArray("keyframes"))
+                            )
+                        )
+                    }
+                }
+            }
+            val sceneObjsParsed = mutableListOf<com.example.model.SceneObject3D>()
+            val soArr = camObjParsed.optJSONArray("scene3DObjects")
+            if (soArr != null) {
+                for (i in 0 until soArr.length()) {
+                    val oo = soArr.optJSONObject(i) ?: continue
+                    val kfs = parseObjectKeyframes(oo.optJSONArray("keyframes"))
+                    sceneObjsParsed.add(
+                        com.example.model.SceneObject3D(
+                            id = oo.optString("id", java.util.UUID.randomUUID().toString()),
+                            name = oo.optString("name", "Objeto 3D"),
+                            meshAssetPath = oo.optString("meshAssetPath", ""),
+                            formatTag = oo.optString("formatTag", "obj"),
+                            isVisible = oo.optBoolean("isVisible", true),
+                            colorTint = oo.optLong("colorTint", 0xFFFFFFFFL),
+                            keyframes = if (kfs.isEmpty()) listOf(com.example.model.ObjectTransformKeyframe(0)) else kfs
+                        )
+                    )
+                }
+            }
             Camera3DSettings(
                 isEnabled = camObjParsed.optBoolean("isEnabled", false),
                 showCaptureFrame = camObjParsed.optBoolean("showCaptureFrame", true),
@@ -401,7 +472,9 @@ object FileImportExportManager {
                 keyframes = if (kfList.isEmpty()) listOf(Camera3DKeyframe(frameIndex = 0)) else kfList,
                 postEffects = postEffects,
                 cameraMode = camMode,
-                effectSpans = spansList
+                effectSpans = spansList,
+                layerTransformTracks = layerTracksParsed,
+                scene3DObjects = sceneObjsParsed
             )
         } else {
             Camera3DSettings(
@@ -421,6 +494,24 @@ object FileImportExportManager {
             val skyMode = try {
                 SkyBackdropMode.valueOf(bgObj.optString("skyMode", SkyBackdropMode.GRADE_ESPACIAL.name))
             } catch (_: Exception) { SkyBackdropMode.GRADE_ESPACIAL }
+            val parsedStops = mutableListOf<com.example.model.GradientColorStop>()
+            val stArr = bgObj.optJSONArray("skyGradientStops")
+            if (stArr != null) {
+                for (si in 0 until stArr.length()) {
+                    val so = stArr.optJSONObject(si) ?: continue
+                    parsedStops.add(
+                        com.example.model.GradientColorStop(
+                            position = so.optDouble("position", 0.5).toFloat().coerceIn(0f, 1f),
+                            color = so.optLong("color", 0xFF3A528CL)
+                        )
+                    )
+                }
+            }
+            val render3DMode = try {
+                com.example.model.Canvas3DBackgroundRenderMode.valueOf(
+                    bgObj.optString("canvas3DRenderMode", com.example.model.Canvas3DBackgroundRenderMode.STATIC_2D_CACHE.name)
+                )
+            } catch (_: Exception) { com.example.model.Canvas3DBackgroundRenderMode.STATIC_2D_CACHE }
             CanvasBackgroundSettings(
                 style = bgStyle,
                 primaryColor = bgObj.optLong("primaryColor", 0xFFFFFFFFL),
@@ -430,7 +521,13 @@ object FileImportExportManager {
                 textureIntensity = bgObj.optDouble("textureIntensity", 0.28).toFloat().coerceIn(0.05f, 1.0f),
                 skyMode = skyMode,
                 skyTopColor = bgObj.optLong("skyTopColor", 0xFF151926L),
-                skyBottomColor = bgObj.optLong("skyBottomColor", 0xFF28314AL)
+                skyBottomColor = bgObj.optLong("skyBottomColor", 0xFF28314AL),
+                skyLightColor = bgObj.optLong("skyLightColor", 0xFF3E4E75L),
+                skyDarkColor = bgObj.optLong("skyDarkColor", 0xFF0E1320L),
+                skyGradientStops = parsedStops,
+                skyGradientAngleDeg = bgObj.optDouble("skyGradientAngleDeg", 90.0).toFloat(),
+                show3DInCanvas = bgObj.optBoolean("show3DInCanvas", false),
+                canvas3DRenderMode = render3DMode
             )
         } else CanvasBackgroundSettings()
 
@@ -499,6 +596,8 @@ object FileImportExportManager {
         if (layer.isBucketReference) {
             layerObj.put("isBucketReference", true)
         }
+        layer.celHoldTicks?.let { layerObj.put("celHoldTicks", it) }
+        layer.celStartTick?.let { layerObj.put("celStartTick", it) }
         layer.imageAttachment?.let { att ->
             val attObj = JSONObject().apply {
                 put("uriString", att.uriString)
@@ -685,7 +784,64 @@ object FileImportExportManager {
             isClippingMask = isClippingMask,
             imageAttachment = imageAttachment,
             isBucketLayer = isBucketLayer,
-            isBucketReference = isBucketReference
+            isBucketReference = isBucketReference,
+            celHoldTicks = if (lObj.has("celHoldTicks")) lObj.optInt("celHoldTicks", 1).coerceIn(0, 240) else null,
+            celStartTick = if (lObj.has("celStartTick")) lObj.optInt("celStartTick", 0).coerceAtLeast(0) else null
         )
+    }
+
+    private fun objectKeyframesToJsonArray(
+        keyframes: List<com.example.model.ObjectTransformKeyframe>
+    ): JSONArray {
+        val arr = JSONArray()
+        keyframes.forEach { kf ->
+            arr.put(JSONObject().apply {
+                put("frameIndex", kf.frameIndex)
+                put("x", kf.x.toDouble())
+                put("y", kf.y.toDouble())
+                put("z", kf.z.toDouble())
+                put("rotX", kf.rotX.toDouble())
+                put("rotY", kf.rotY.toDouble())
+                put("rotZ", kf.rotZ.toDouble())
+                put("scaleX", kf.scaleX.toDouble())
+                put("scaleY", kf.scaleY.toDouble())
+                put("scaleZ", kf.scaleZ.toDouble())
+                put("opacity", kf.opacity.toDouble())
+                put("easing", kf.easing.name)
+                put("holdTicks", kf.holdTicks)
+            })
+        }
+        return arr
+    }
+
+    private fun parseObjectKeyframes(arr: JSONArray?): List<com.example.model.ObjectTransformKeyframe> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<com.example.model.ObjectTransformKeyframe>(arr.length())
+        for (i in 0 until arr.length()) {
+            val ko = arr.optJSONObject(i) ?: continue
+            val easing = try {
+                CameraEasingCurve.valueOf(ko.optString("easing", CameraEasingCurve.BEZIER_SUAVE.name))
+            } catch (_: Exception) {
+                CameraEasingCurve.BEZIER_SUAVE
+            }
+            out.add(
+                com.example.model.ObjectTransformKeyframe(
+                    frameIndex = ko.optInt("frameIndex", 0).coerceAtLeast(0),
+                    x = ko.optDouble("x", 0.0).toFloat(),
+                    y = ko.optDouble("y", 0.0).toFloat(),
+                    z = ko.optDouble("z", 0.0).toFloat(),
+                    rotX = ko.optDouble("rotX", 0.0).toFloat(),
+                    rotY = ko.optDouble("rotY", 0.0).toFloat(),
+                    rotZ = ko.optDouble("rotZ", 0.0).toFloat(),
+                    scaleX = ko.optDouble("scaleX", 1.0).toFloat().coerceIn(0.05f, 20f),
+                    scaleY = ko.optDouble("scaleY", 1.0).toFloat().coerceIn(0.05f, 20f),
+                    scaleZ = ko.optDouble("scaleZ", 1.0).toFloat().coerceIn(0.05f, 20f),
+                    opacity = ko.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f),
+                    easing = easing,
+                    holdTicks = ko.optInt("holdTicks", 1).coerceIn(1, 240)
+                )
+            )
+        }
+        return out
     }
 }

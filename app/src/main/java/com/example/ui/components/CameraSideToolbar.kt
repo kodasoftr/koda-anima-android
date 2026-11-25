@@ -29,7 +29,9 @@ import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.RotateRight
+import androidx.compose.material.icons.filled.CropLandscape
 import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
@@ -47,6 +49,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.model.CameraToolAction
+import com.example.model.CameraViewportNavTarget
 import com.example.model.KodanimaTheme
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.NeonGreen
@@ -57,7 +60,7 @@ import com.example.ui.theme.OrangeAccent
  * Barra lateral dedicada ao Modo Câmera (2D Plano e 3D Espacial).
  * Substitui a barra de desenho quando o painel de câmera está aberto, oferecendo
  * modos de manipulação direta por toque/mouse (Mover, Zoom, Girar, Lente FOV, Órbita 3D),
- * atalhos rápidos de keyframe e alternância para o Estúdio 3D.
+ * alternância entre mover Câmera vs mover Canvas em 2D, atalhos de keyframe e Estúdio 3D.
  */
 @Composable
 fun CameraSideToolbar(
@@ -73,6 +76,9 @@ fun CameraSideToolbar(
     onToggleSideView3D: () -> Unit,
     onResetCurrentKeyframe: () -> Unit,
     onCloseCameraMode: () -> Unit,
+    cameraViewportNavTarget: CameraViewportNavTarget = CameraViewportNavTarget.CAMERA,
+    onToggleViewportNavTarget: () -> Unit = {},
+    onFocusSelected: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val panelColor = Color(theme.panel)
@@ -113,6 +119,33 @@ fun CameraSideToolbar(
                     fontWeight = FontWeight.ExtraBold,
                     color = if (is3DMode) OrangeAccent else CyanAccent
                 )
+
+                if (!isSideView3D) {
+                    val isCanvasNav = cameraViewportNavTarget == CameraViewportNavTarget.CANVAS
+                    CameraActionBtn(
+                        icon = if (isCanvasNav) Icons.Default.CropLandscape else Icons.Default.CenterFocusWeak,
+                        label = if (isCanvasNav) "Canvas" else "Câmera",
+                        isSelected = true,
+                        accent = if (isCanvasNav) NeonGreen else OrangeAccent,
+                        textColor = textColor,
+                        bgColor = bgColor,
+                        size = btnSize,
+                        testTag = "cam_tool_nav_target",
+                        onClick = onToggleViewportNavTarget
+                    )
+                } else {
+                    CameraActionBtn(
+                        icon = Icons.Default.GpsFixed,
+                        label = "Focar",
+                        isSelected = false,
+                        accent = NeonGreen,
+                        textColor = NeonGreen,
+                        bgColor = bgColor,
+                        size = btnSize,
+                        testTag = "cam_tool_focus",
+                        onClick = onFocusSelected
+                    )
+                }
 
                 CameraActionBtn(
                     icon = Icons.Default.OpenWith,

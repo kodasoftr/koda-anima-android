@@ -177,7 +177,9 @@ data class Layer(
     val isClippingMask: Boolean = false,
     val imageAttachment: LayerImageAttachment? = null,
     val isBucketLayer: Boolean = false,
-    val isBucketReference: Boolean = false
+    val isBucketReference: Boolean = false,
+    val celHoldTicks: Int? = null,
+    val celStartTick: Int? = null
 )
 
 enum class BucketReferenceMode(val labelPt: String) {
@@ -280,6 +282,27 @@ enum class SkyBackdropMode(val labelPt: String) {
     SOLIDO("Cor Única")
 }
 
+enum class Canvas3DBackgroundRenderMode(val labelPt: String, val descPt: String) {
+    STATIC_2D_CACHE(
+        labelPt = "1x 2D Estático",
+        descPt = "Renderiza 1 fundo 3D em 2D leve e reaproveita em todos os quadros"
+    ),
+    PRE_RENDER_ON_PLAY(
+        labelPt = "Pré-render Play",
+        descPt = "Ao tocar Play, pré-renderiza os quadros 3D em 2D leve em cache"
+    ),
+    REALTIME_3D(
+        labelPt = "Tempo Real 3D",
+        descPt = "Atualiza o fundo 3D em tempo real (ideal para personagens 3D animados)"
+    )
+}
+
+data class GradientColorStop(
+    val position: Float = 0.5f,
+    val color: Long = 0xFF3A528CL,
+    val id: String = UUID.randomUUID().toString()
+)
+
 data class CanvasBackgroundSettings(
     val style: CanvasBackgroundStyle = CanvasBackgroundStyle.SOLIDO,
     val primaryColor: Long = 0xFFFFFFFFL,
@@ -289,7 +312,13 @@ data class CanvasBackgroundSettings(
     val textureIntensity: Float = 0.28f,
     val skyMode: SkyBackdropMode = SkyBackdropMode.GRADE_ESPACIAL,
     val skyTopColor: Long = 0xFF151926L,
-    val skyBottomColor: Long = 0xFF28314AL
+    val skyBottomColor: Long = 0xFF28314AL,
+    val skyLightColor: Long = 0xFF3E4E75L,
+    val skyDarkColor: Long = 0xFF0E1320L,
+    val skyGradientStops: List<GradientColorStop> = emptyList(),
+    val skyGradientAngleDeg: Float = 90f,
+    val show3DInCanvas: Boolean = false,
+    val canvas3DRenderMode: Canvas3DBackgroundRenderMode = Canvas3DBackgroundRenderMode.STATIC_2D_CACHE
 )
 
 data class AnimationProject(
@@ -348,6 +377,22 @@ enum class CameraMode(val labelPt: String) {
     MODE_2D("2D Plano"),
     MODE_3D("3D Espacial")
 }
+
+enum class CameraViewportNavTarget(val labelPt: String) {
+    CAMERA("Mover Câmera"),
+    CANVAS("Mover Canvas")
+}
+
+enum class StageTargetType(val labelPt: String) {
+    CAMERA("Câmera"),
+    LAYER("Camada"),
+    OBJECT_3D("Objeto 3D")
+}
+
+data class StageSelection(
+    val type: StageTargetType = StageTargetType.CAMERA,
+    val id: String = "camera"
+)
 
 enum class CameraToolAction(val labelPt: String) {
     PAN_2D("Mover"),
@@ -410,7 +455,39 @@ data class Camera3DKeyframe(
     val bezierP1X: Float = 0.25f,
     val bezierP1Y: Float = 0.1f,
     val bezierP2X: Float = 0.25f,
-    val bezierP2Y: Float = 1.0f
+    val bezierP2Y: Float = 1.0f,
+    val holdTicks: Int = 1
+)
+
+data class ObjectTransformKeyframe(
+    val frameIndex: Int = 0,
+    val x: Float = 0f,
+    val y: Float = 0f,
+    val z: Float = 0f,
+    val rotX: Float = 0f,
+    val rotY: Float = 0f,
+    val rotZ: Float = 0f,
+    val scaleX: Float = 1f,
+    val scaleY: Float = 1f,
+    val scaleZ: Float = 1f,
+    val opacity: Float = 1f,
+    val easing: CameraEasingCurve = CameraEasingCurve.BEZIER_SUAVE,
+    val holdTicks: Int = 1
+)
+
+data class LayerTransformTrack(
+    val layerId: String = "",
+    val keyframes: List<ObjectTransformKeyframe> = emptyList()
+)
+
+data class SceneObject3D(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "Objeto 3D",
+    val meshAssetPath: String = "",
+    val formatTag: String = "obj",
+    val isVisible: Boolean = true,
+    val colorTint: Long = 0xFFFFFFFFL,
+    val keyframes: List<ObjectTransformKeyframe> = listOf(ObjectTransformKeyframe(frameIndex = 0))
 )
 
 data class CameraEffectSpan(
@@ -441,6 +518,8 @@ data class Camera3DSettings(
     val keyframes: List<Camera3DKeyframe> = listOf(Camera3DKeyframe(frameIndex = 0)),
     val postEffects: CameraPostEffectSettings = CameraPostEffectSettings(),
     val cameraMode: CameraMode = CameraMode.MODE_3D,
-    val effectSpans: List<CameraEffectSpan> = emptyList()
+    val effectSpans: List<CameraEffectSpan> = emptyList(),
+    val layerTransformTracks: List<LayerTransformTrack> = emptyList(),
+    val scene3DObjects: List<SceneObject3D> = emptyList()
 )
 

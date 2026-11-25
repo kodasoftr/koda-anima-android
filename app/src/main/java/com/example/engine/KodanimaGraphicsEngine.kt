@@ -35,6 +35,7 @@ import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -73,9 +74,47 @@ object KodanimaGraphicsEngine {
     private val DST_IN_XFERMODE = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
 
     private val tipBitmapCache = object : LruCache<String, Bitmap>(64) {}
+    private val softMaskBitmapCache = object : LruCache<Int, Bitmap>(24) {}
     private val dynamicParamsCache = object : LruCache<String, BrushDynamicParams>(96) {}
     private val tintColorFilterCache = object : LruCache<Int, PorterDuffColorFilter>(64) {}
     private val layerImageBitmapCache = object : LruCache<String, Bitmap>(16) {}
+
+    private fun resolveSoftMaskBitmap(hardness: Float): Bitmap {
+        val hClamped = hardness.coerceIn(0.05f, 0.99f)
+        val key = (hClamped * 20f).roundToInt()
+        softMaskBitmapCache.get(key)?.takeIf { !it.isRecycled }?.let { return it }
+        val size = 64
+        val pixels = IntArray(size * size)
+        val half = (size - 1) * 0.5f
+        val invHalf = 1f / half
+        val innerR = hClamped * 0.70f
+        val falloffSpan = (1f - innerR).coerceAtLeast(0.08f)
+        for (y in 0 until size) {
+            val dy = (y - half) * invHalf
+            val dy2 = dy * dy
+            val rowOff = y * size
+            for (x in 0 until size) {
+                val dx = (x - half) * invHalf
+                val dist = sqrt(dx * dx + dy2)
+                val alphaF = when {
+                    dist >= 1.0f -> 0f
+                    dist <= innerR -> 1.0f
+                    else -> {
+                        val u = ((dist - innerR) / falloffSpan).coerceIn(0f, 1f)
+                        val smooth = (1f - u) * (1f - u) * (1f + 2f * u)
+                        val gauss = kotlin.math.exp((-2.1f * u * u).toDouble()).toFloat()
+                        (smooth * 0.65f + gauss * 0.35f * (1f - u)).coerceIn(0f, 1f)
+                    }
+                }
+                val a = (alphaF * 255f).roundToInt().coerceIn(0, 255)
+                pixels[rowOff + x] = (a shl 24) or 0x00FFFFFF
+            }
+        }
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(pixels, 0, size, 0, 0, size, size)
+        softMaskBitmapCache.put(key, bmp)
+        return bmp
+    }
 
     private fun resolveTipStampBitmap(base64: String?): Bitmap? {
         if (base64.isNullOrBlank()) return null
@@ -172,6 +211,8 @@ object KodanimaGraphicsEngine {
             style = Paint.Style.FILL
         }
         val layerAlphaPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+        val strokeIsolationPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+        val innerLayerSavePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
         val haloPaint = Paint(PAINT_QUALITY_FLAGS).apply {
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
@@ -418,39 +459,71 @@ object KodanimaGraphicsEngine {
         height: Float,
         bgSettings: CanvasBackgroundSettings
     ) {
-        val topCol = bgSettings.skyTopColor.toInt()
-        val botCol = bgSettings.skyBottomColor.toInt()
+        if (width <= 0f || height <= 0f) return
+        val lightCol = if (bgSettings.skyLightColor != 0xFF3E4E75L) {
+            bgSettings.skyLightColor.toInt()
+        } else {
+            bgSettings.skyTopColor.toInt()
+        }
+        val darkCol = if (bgSettings.skyDarkColor != 0xFF0E1320L) {
+            bgSettings.skyDarkColor.toInt()
+        } else {
+            bgSettings.skyBottomColor.toInt()
+        }
+        val orderedStops = buildList {
+            if (bgSettings.skyGradientStops.none { it.position <= 0.01f }) {
+                add(com.example.model.GradientColorStop(0f, lightCol.toLong()))
+            }
+            addAll(bgSettings.skyGradientStops.map { it.copy(position = it.position.coerceIn(0f, 1f)) })
+            if (bgSettings.skyGradientStops.none { it.position >= 0.99f }) {
+                add(com.example.model.GradientColorStop(1f, darkCol.toLong()))
+            }
+        }.sortedBy { it.position }
+        val stopColors = orderedStops.map { it.color.toInt() }.toIntArray()
+        val stopPositions = orderedStops.map { it.position }.toFloatArray()
+
+        fun buildSkyGradientShader(): LinearGradient {
+            val rad = Math.toRadians(bgSettings.skyGradientAngleDeg.toDouble())
+            val dx = cos(rad).toFloat() * width * 0.5f
+            val dy = sin(rad).toFloat() * height * 0.5f
+            val cx = width * 0.5f
+            val cy = height * 0.5f
+            return LinearGradient(
+                cx - dx, cy - dy, cx + dx, cy + dy,
+                stopColors,
+                stopPositions,
+                Shader.TileMode.CLAMP
+            )
+        }
+
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         when (bgSettings.skyMode) {
             SkyBackdropMode.SOLIDO -> {
-                paint.color = topCol
+                paint.color = lightCol
                 canvas.drawRect(0f, 0f, width, height, paint)
             }
             SkyBackdropMode.ESTUDIO_ESCURO -> {
-                paint.shader = LinearGradient(
-                    0f, 0f, 0f, height,
-                    intArrayOf(0xFF1A1E29.toInt(), 0xFF282E3E.toInt()),
-                    null,
-                    Shader.TileMode.CLAMP
-                )
+                if (bgSettings.skyGradientStops.isNotEmpty() ||
+                    bgSettings.skyLightColor != 0xFF3E4E75L ||
+                    bgSettings.skyDarkColor != 0xFF0E1320L
+                ) {
+                    paint.shader = buildSkyGradientShader()
+                } else {
+                    paint.shader = LinearGradient(
+                        0f, 0f, 0f, height,
+                        intArrayOf(0xFF1A1E29.toInt(), 0xFF282E3E.toInt()),
+                        null,
+                        Shader.TileMode.CLAMP
+                    )
+                }
                 canvas.drawRect(0f, 0f, width, height, paint)
             }
             SkyBackdropMode.GRADIENTE_CEU -> {
-                paint.shader = LinearGradient(
-                    0f, 0f, 0f, height,
-                    intArrayOf(topCol, botCol),
-                    null,
-                    Shader.TileMode.CLAMP
-                )
+                paint.shader = buildSkyGradientShader()
                 canvas.drawRect(0f, 0f, width, height, paint)
             }
             SkyBackdropMode.GRADE_ESPACIAL -> {
-                paint.shader = LinearGradient(
-                    0f, 0f, 0f, height,
-                    intArrayOf(topCol, botCol),
-                    null,
-                    Shader.TileMode.CLAMP
-                )
+                paint.shader = buildSkyGradientShader()
                 canvas.drawRect(0f, 0f, width, height, paint)
                 val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     color = android.graphics.Color.argb(34, 255, 255, 255)
@@ -470,12 +543,7 @@ object KodanimaGraphicsEngine {
                 }
             }
             SkyBackdropMode.ESTRELAS_NOTURNO -> {
-                paint.shader = LinearGradient(
-                    0f, 0f, 0f, height,
-                    intArrayOf(topCol, botCol),
-                    null,
-                    Shader.TileMode.CLAMP
-                )
+                paint.shader = buildSkyGradientShader()
                 canvas.drawRect(0f, 0f, width, height, paint)
                 val starPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
                 val starCount = 110
@@ -1138,9 +1206,10 @@ object KodanimaGraphicsEngine {
                 }
             }
             val pad = stroke.brushSize * 1.85f + 16f
-            val isoPaint = scratch.layerAlphaPaint.apply {
+            val isoPaint = scratch.strokeIsolationPaint.apply {
                 alpha = (effStrokeOpacity * 255f).toInt().coerceIn(0, 255)
                 colorFilter = null
+                xfermode = null
             }
             strokeSaveLayerCount = canvas.saveLayer(
                 sMinX - pad, sMinY - pad, sMaxX + pad, sMaxY + pad, isoPaint
@@ -1385,11 +1454,20 @@ object KodanimaGraphicsEngine {
 
         val smCount = smoothPointsQuadratic(points, scratch, maxSubdivisionsPerSeg = 6)
         val sm = scratch.smoothXYZ
-        val spacingRatio = params.spacing.coerceIn(0.05f, 0.85f)
-        val minStep = max(1.4f, baseWidth * spacingRatio * 0.68f)
+        val spacingRatio = params.spacing.coerceIn(0.04f, 0.85f)
+        val minStep = max(1.0f, baseWidth * spacingRatio * 0.45f)
+
+        var totalLen = 0f
+        for (i in 1 until smCount) {
+            val b0 = (i - 1) * 3
+            val b1 = i * 3
+            totalLen += hypot2(sm[b1] - sm[b0], sm[b1 + 1] - sm[b0 + 1])
+        }
+        val safeTotalLen = max(0.01f, totalLen)
 
         var accum = minStep // stamp first point immediately
         var dabIdx = 0
+        var distSoFar = 0f
         for (i in 1 until smCount) {
             val b0 = (i - 1) * 3
             val b1 = i * 3
@@ -1411,7 +1489,7 @@ object KodanimaGraphicsEngine {
                     val sx = x0 + dx * t
                     val sy = y0 + dy * t
                     val sp = (p0 + (p1 - p0) * t).coerceIn(0.12f, 1.15f)
-                    val prog = (i.toFloat() / max(1, smCount - 1)).coerceIn(0f, 1f)
+                    val prog = ((distSoFar + walked) / safeTotalLen).coerceIn(0f, 1f)
                     val taper = if (params.taperStrength > 0.05f) {
                         val sT = if (prog < 0.09f) (1f - (1f - prog / 0.09f) * 0.6f * params.taperStrength) else 1f
                         val eT = if (prog > 0.90f) (1f - ((prog - 0.90f) / 0.10f) * 0.6f * params.taperStrength) else 1f
@@ -1440,6 +1518,7 @@ object KodanimaGraphicsEngine {
                     walked = segLen
                 }
             }
+            distSoFar += segLen
         }
     }
 
@@ -1473,7 +1552,7 @@ object KodanimaGraphicsEngine {
             colorFilter = colorFilterOverride
             xfermode = overrideXfermode
         }
-        val softness = (1f - hardness).coerceIn(0f, 0.9f)
+        val softness = (1f - hardness).coerceIn(0f, 0.95f)
         if (spikes > 2 && overrideXfermode == null) {
             val p = scratch.path
             p.reset()
@@ -1489,13 +1568,21 @@ object KodanimaGraphicsEngine {
             canvas.drawPath(p, fillPaint)
         } else if (shapeKind == "rect") {
             canvas.drawRect(-halfW, -halfH, halfW, halfH, fillPaint)
-        } else if ((softness > 0.2f || shapeKind == "gauss" || shapeKind == "soft") && overrideXfermode == null) {
-            fillPaint.alpha = (dabAlpha * 0.35f).toInt().coerceIn(3, 255)
-            scratch.rectF.set(-halfW * 1.28f, -halfH * 1.28f, halfW * 1.28f, halfH * 1.28f)
-            canvas.drawOval(scratch.rectF, fillPaint)
-            fillPaint.alpha = (dabAlpha * 0.85f).toInt().coerceIn(4, 255)
-            scratch.rectF.set(-halfW * 0.82f, -halfH * 0.82f, halfW * 0.82f, halfH * 0.82f)
-            canvas.drawOval(scratch.rectF, fillPaint)
+        } else if ((softness > 0.18f || shapeKind == "gauss" || shapeKind == "soft") && overrideXfermode == null) {
+            val maskHardness = when (shapeKind) {
+                "gauss" -> min(hardness, 0.25f)
+                "soft" -> min(hardness, 0.40f)
+                else -> hardness
+            }
+            val maskBmp = resolveSoftMaskBitmap(maskHardness)
+            val bmpPaint = scratch.layerAlphaPaint
+            bmpPaint.alpha = dabAlpha
+            bmpPaint.colorFilter = colorFilterOverride ?: resolveTintFilter(dabRgb)
+            bmpPaint.xfermode = null
+            val spread = 1.15f + softness * 0.25f
+            scratch.rectF.set(-halfW * spread, -halfH * spread, halfW * spread, halfH * spread)
+            canvas.drawBitmap(maskBmp, null, scratch.rectF, bmpPaint)
+            bmpPaint.colorFilter = null
         } else {
             scratch.rectF.set(-halfW, -halfH, halfW, halfH)
             canvas.drawOval(scratch.rectF, fillPaint)
@@ -1757,17 +1844,52 @@ object KodanimaGraphicsEngine {
                 KritaBrushEngineKind.PIXEL_ROUND_SIZE, KritaBrushEngineKind.INK_GPEN -> {
                     canvas.drawCircle(p.x, p.y, rad, fillPaint)
                 }
-                KritaBrushEngineKind.PIXEL_OPACITY, KritaBrushEngineKind.BLENDER_WET_SOFT -> {
-                    fillPaint.alpha = (effectiveOrigAlpha * 0.45f).toInt().coerceIn(6, 255)
-                    canvas.drawCircle(p.x, p.y, rad * 1.25f, fillPaint)
-                    fillPaint.alpha = (effectiveOrigAlpha * 0.85f).toInt()
-                    canvas.drawCircle(p.x, p.y, rad * 0.72f, fillPaint)
+                KritaBrushEngineKind.PIXEL_OPACITY -> {
+                    val softMask = resolveSoftMaskBitmap(params.hardness)
+                    val bmpPaint = scratch.layerAlphaPaint
+                    bmpPaint.alpha = (effectiveOrigAlpha * 0.85f).toInt().coerceIn(6, 255)
+                    bmpPaint.colorFilter = colorFilterOverride ?: resolveTintFilter(rgb)
+                    scratch.rectF.set(p.x - rad * 1.15f, p.y - rad * 1.15f, p.x + rad * 1.15f, p.y + rad * 1.15f)
+                    canvas.drawBitmap(softMask, null, scratch.rectF, bmpPaint)
+                    bmpPaint.colorFilter = null
+                }
+                KritaBrushEngineKind.BLENDER_WET_SOFT -> {
+                    val wetMask = resolveSoftMaskBitmap(0.24f)
+                    val bmpPaint = scratch.layerAlphaPaint
+                    bmpPaint.alpha = (effectiveOrigAlpha * 0.62f).toInt().coerceIn(6, 255)
+                    bmpPaint.colorFilter = colorFilterOverride ?: resolveTintFilter(rgb)
+                    val outerR = rad * 1.38f
+                    scratch.rectF.set(p.x - outerR, p.y - outerR, p.x + outerR, p.y + outerR)
+                    canvas.drawBitmap(wetMask, null, scratch.rectF, bmpPaint)
+                    bmpPaint.colorFilter = null
+                    paint.alpha = (effectiveOrigAlpha * 0.22f).toInt().coerceIn(4, 255)
+                    paint.strokeWidth = max(1f, rad * 0.14f)
+                    canvas.drawCircle(p.x, p.y, rad * 1.05f, paint)
+                }
+                KritaBrushEngineKind.CHALK_GRAINY -> {
+                    val grains = (14 * densityMultiplier).toInt().coerceIn(6, 18)
+                    val chalkMask = resolveSoftMaskBitmap(0.55f)
+                    val bmpPaint = scratch.layerAlphaPaint
+                    bmpPaint.alpha = (effectiveOrigAlpha * 0.45f).toInt().coerceIn(8, 255)
+                    bmpPaint.colorFilter = colorFilterOverride ?: resolveTintFilter(rgb)
+                    scratch.rectF.set(p.x - rad * 0.9f, p.y - rad * 0.9f, p.x + rad * 0.9f, p.y + rad * 0.9f)
+                    canvas.drawBitmap(chalkMask, null, scratch.rectF, bmpPaint)
+                    bmpPaint.colorFilter = null
+                    for (s in 0 until grains) {
+                        val lutIdx = (fastHashNoise(p.x, p.y, s * 11) * LUT_SIZE).toInt() and LUT_MASK
+                        val dist = rad * (0.12f + 0.92f * sqrt(fastHashNoise(p.x, p.y, s + 29)))
+                        val gx = p.x + COS_LUT[lutIdx] * dist
+                        val gy = p.y + SIN_LUT[lutIdx] * dist
+                        val cr = max(0.8f, rad * (0.14f + 0.16f * fastHashNoise(gx, gy, s)))
+                        fillPaint.alpha = (effectiveOrigAlpha * (0.35f + 0.50f * fastHashNoise(gx, gy, s + 7))).toInt().coerceIn(8, 255)
+                        canvas.drawCircle(gx, gy, cr, fillPaint)
+                    }
                 }
                 KritaBrushEngineKind.PENCIL_GRAPHITE, KritaBrushEngineKind.INK_ROUGH,
-                KritaBrushEngineKind.CHARCOAL_SOFT, KritaBrushEngineKind.CHALK_GRAINY -> {
+                KritaBrushEngineKind.CHARCOAL_SOFT -> {
                     fillPaint.alpha = (effectiveOrigAlpha * 0.58f).toInt().coerceIn(8, 255)
                     canvas.drawCircle(p.x, p.y, rad * 0.85f, fillPaint)
-                    val specks = if (engine == KritaBrushEngineKind.CHALK_GRAINY) 16 else 12
+                    val specks = 12
                     val buf = scratch.ensureCapacity(specks * 2)
                     for (s in 0 until specks) {
                         val lutIdx = (fastHashNoise(p.x, p.y, s) * LUT_SIZE).toInt() and LUT_MASK
@@ -1776,7 +1898,7 @@ object KodanimaGraphicsEngine {
                         buf[s * 2 + 1] = p.y + SIN_LUT[lutIdx] * dist
                     }
                     ptPaint.alpha = (effectiveOrigAlpha * 0.82f).toInt().coerceIn(10, 255)
-                    ptPaint.strokeWidth = if (engine == KritaBrushEngineKind.CHARCOAL_SOFT || engine == KritaBrushEngineKind.CHALK_GRAINY) 2.6f else 1.8f
+                    ptPaint.strokeWidth = if (engine == KritaBrushEngineKind.CHARCOAL_SOFT) 2.6f else 1.8f
                     canvas.drawPoints(buf, 0, specks * 2, ptPaint)
                 }
                 KritaBrushEngineKind.MARKER_CHISEL -> {
@@ -1784,29 +1906,49 @@ object KodanimaGraphicsEngine {
                     canvas.translate(p.x, p.y)
                     canvas.rotate(42f)
                     fillPaint.alpha = (effectiveOrigAlpha * 0.65f).toInt().coerceIn(10, 255)
-                    canvas.drawRect(-rad * 1.35f, -rad * 0.42f, rad * 1.35f, rad * 0.42f, fillPaint)
+                    canvas.drawRoundRect(-rad * 1.30f, -rad * 0.40f, rad * 1.30f, rad * 0.40f, rad * 0.18f, rad * 0.18f, fillPaint)
                     canvas.restore()
                 }
                 KritaBrushEngineKind.AIRBRUSH_SOFT -> {
-                    val sprayRad = rad * 1.65f
-                    val count = (26 * densityMultiplier).toInt().coerceIn(8, 28)
+                    val softMask = resolveSoftMaskBitmap(0.14f)
+                    val bmpPaint = scratch.layerAlphaPaint
+                    bmpPaint.alpha = (effectiveOrigAlpha * 0.52f).toInt().coerceIn(6, 255)
+                    bmpPaint.colorFilter = colorFilterOverride ?: resolveTintFilter(rgb)
+                    val sprayRad = rad * 1.75f
+                    scratch.rectF.set(p.x - sprayRad, p.y - sprayRad, p.x + sprayRad, p.y + sprayRad)
+                    canvas.drawBitmap(softMask, null, scratch.rectF, bmpPaint)
+                    bmpPaint.colorFilter = null
+                    val count = (14 * densityMultiplier).toInt().coerceIn(5, 16)
                     val buf = scratch.ensureCapacity(count * 2)
                     for (s in 0 until count) {
                         val lutIdx = (fastHashNoise(p.x, p.y, s) * LUT_SIZE).toInt() and LUT_MASK
-                        val dist = sprayRad * sqrt(fastHashNoise(p.x, p.y, s + 30))
+                        val dist = sprayRad * 0.88f * sqrt(fastHashNoise(p.x, p.y, s + 30))
                         buf[s * 2] = p.x + COS_LUT[lutIdx] * dist
                         buf[s * 2 + 1] = p.y + SIN_LUT[lutIdx] * dist
                     }
-                    ptPaint.alpha = (effectiveOrigAlpha * 0.42f).toInt().coerceIn(8, 255)
-                    ptPaint.strokeWidth = 2.4f
+                    ptPaint.alpha = (effectiveOrigAlpha * 0.20f).toInt().coerceIn(4, 90)
+                    ptPaint.strokeWidth = 1.5f
                     canvas.drawPoints(buf, 0, count * 2, ptPaint)
                 }
-                KritaBrushEngineKind.BRISTLE_DRY, KritaBrushEngineKind.BRISTLE_GLAZE -> {
-                    for (k in -2..2) {
-                        val offX = k * (rad * 0.34f)
-                        fillPaint.alpha = (effectiveOrigAlpha * (if (k % 2 == 0) 0.9f else 0.65f)).toInt().coerceIn(8, 255)
-                        canvas.drawCircle(p.x + offX, p.y, rad * 0.32f, fillPaint)
+                KritaBrushEngineKind.BRISTLE_DRY -> {
+                    val bCount = params.bristleCount.coerceIn(5, 9)
+                    val denom = max(1, bCount - 1).toFloat()
+                    for (k in 0 until bCount) {
+                        val frac = (k / denom) - 0.5f
+                        val offX = frac * rad * 1.45f
+                        val offY = (fastHashNoise(p.x, p.y, k * 7) - 0.5f) * rad * 0.45f
+                        val rScale = (1f - abs(frac) * 0.7f) * 0.24f
+                        fillPaint.alpha = (effectiveOrigAlpha * (0.90f - abs(frac) * 0.45f)).toInt().coerceIn(10, 255)
+                        canvas.drawCircle(p.x + offX, p.y + offY, max(0.9f, rad * rScale), fillPaint)
                     }
+                }
+                KritaBrushEngineKind.BRISTLE_GLAZE -> {
+                    fillPaint.alpha = (effectiveOrigAlpha * 0.78f).toInt().coerceIn(8, 255)
+                    canvas.save()
+                    canvas.translate(p.x, p.y)
+                    canvas.rotate(24f)
+                    canvas.drawRoundRect(-rad * 1.15f, -rad * 0.45f, rad * 1.15f, rad * 0.45f, rad * 0.22f, rad * 0.22f, fillPaint)
+                    canvas.restore()
                 }
             }
             return
@@ -2003,173 +2145,296 @@ object KodanimaGraphicsEngine {
                 }
             }
 
-            KritaBrushEngineKind.MARKER_CHISEL -> { // Krita Marker Chisel
-                fillPaint.alpha = (effectiveOrigAlpha * 0.62f).toInt().coerceIn(8, 255)
-                val quadPath = scratch.path
-                for (i in 1 until smCount) {
-                    val b0 = (i - 1) * 3; val b1 = i * 3
-                    val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.25f, 1.05f)
-                    val halfW = max(2.0f, baseWidth * 0.72f * avgPress)
-                    val offX = COS_45 * halfW
-                    val offY = SIN_45 * halfW
-                    quadPath.reset()
-                    quadPath.moveTo(sm[b0] - offX, sm[b0 + 1] - offY)
-                    quadPath.lineTo(sm[b0] + offX, sm[b0 + 1] + offY)
-                    quadPath.lineTo(sm[b1] + offX, sm[b1 + 1] + offY)
-                    quadPath.lineTo(sm[b1] - offX, sm[b1 + 1] - offY)
-                    quadPath.close()
-                    canvas.drawPath(quadPath, fillPaint)
+            KritaBrushEngineKind.MARKER_CHISEL -> { // Krita Marker Chisel (seam-free translucent saveLayer)
+                var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE
+                var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+                for (i in 0 until smCount) {
+                    val sx = sm[i * 3]; val sy = sm[i * 3 + 1]
+                    if (sx < minX) minX = sx; if (sx > maxX) maxX = sx
+                    if (sy < minY) minY = sy; if (sy > maxY) maxY = sy
+                }
+                val pad = baseWidth * 1.25f + 4f
+                val layerPaint = scratch.innerLayerSavePaint
+                layerPaint.alpha = (effectiveOrigAlpha * 0.65f).toInt().coerceIn(8, 255)
+                layerPaint.colorFilter = null
+                layerPaint.xfermode = null
+                val saveId = canvas.saveLayer(minX - pad, minY - pad, maxX + pad, maxY + pad, layerPaint)
+                try {
+                    fillPaint.color = (0xFF shl 24) or rgb
+                    fillPaint.alpha = 255
+                    val quadPath = scratch.path
+                    for (i in 1 until smCount) {
+                        val b0 = (i - 1) * 3; val b1 = i * 3
+                        val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.25f, 1.05f)
+                        val halfW = max(1.8f, baseWidth * 0.70f * avgPress)
+                        val offX = COS_45 * halfW
+                        val offY = SIN_45 * halfW
+                        quadPath.reset()
+                        quadPath.moveTo(sm[b0] - offX, sm[b0 + 1] - offY)
+                        quadPath.lineTo(sm[b0] + offX, sm[b0 + 1] + offY)
+                        quadPath.lineTo(sm[b1] + offX, sm[b1 + 1] + offY)
+                        quadPath.lineTo(sm[b1] - offX, sm[b1 + 1] - offY)
+                        quadPath.close()
+                        canvas.drawPath(quadPath, fillPaint)
+                        canvas.drawLine(sm[b0] - offX * 0.85f, sm[b0 + 1] - offY * 0.85f, sm[b0] + offX * 0.85f, sm[b0 + 1] + offY * 0.85f, paint.apply { alpha = 255; strokeWidth = max(1.5f, halfW * 0.32f) })
+                    }
+                } finally {
+                    canvas.restoreToCount(saveId)
                 }
             }
 
-            KritaBrushEngineKind.BRISTLE_DRY -> { // Krita Dry Bristles
-                val numBristles = params.bristleCount.coerceIn(3, 9)
+            KritaBrushEngineKind.BRISTLE_DRY -> { // Overhauled Organic Split Dry Bristles
+                val numBristles = params.bristleCount.coerceIn(5, 9)
                 val bristlePaints = scratch.bristlePaints
-                val dimAlpha = (effectiveOrigAlpha * (0.68f - params.grainAmount * 0.22f)).toInt().coerceIn(8, 255)
+                val denom = max(1, numBristles - 1).toFloat()
                 for (k in 0 until numBristles) {
-                    bristlePaints[k].color = if (k % 2 == 0) (effectiveOrigAlpha shl 24) or rgb else (dimAlpha shl 24) or rgb
+                    val frac = (k / denom) - 0.5f
+                    val centerBias = (1f - abs(frac) * 1.15f).coerceIn(0.32f, 1.0f)
+                    val bAlpha = (effectiveOrigAlpha * centerBias * (0.94f - params.grainAmount * 0.16f)).toInt().coerceIn(10, 255)
+                    bristlePaints[k].color = (bAlpha shl 24) or rgb
                     bristlePaints[k].colorFilter = colorFilterOverride
                 }
+                var distAccum = 0f
                 for (i in 1 until smCount) {
                     val b0 = (i - 1) * 3; val b1 = i * 3
                     val x0 = sm[b0]; val y0 = sm[b0 + 1]
                     val x1 = sm[b1]; val y1 = sm[b1 + 1]
-                    val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.25f, 1.05f)
+                    val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.22f, 1.05f)
                     val dx = x1 - x0; val dy = y1 - y0
                     val dist = sqrt(dx * dx + dy * dy)
                     val invDist = if (dist > 0.001f) 1f / dist else 0f
                     val normX = -dy * invDist; val normY = dx * invDist
-                    val totalSpread = baseWidth * (0.66f + params.spacing * 0.4f) * avgPress
-                    val bWidth = max(1.1f, (totalSpread / numBristles) * 1.15f)
-                    val denom = max(1, numBristles - 1).toFloat()
+                    val prog = i.toFloat() / max(1, smCount - 1)
+                    val endTaper = if (prog > 0.85f) (1f - ((prog - 0.85f) / 0.15f) * 0.65f * params.taperStrength) else 1f
+                    val totalSpread = baseWidth * (0.68f + params.spacing * 0.35f) * avgPress * endTaper
+                    val baseFilament = max(0.85f, (totalSpread / numBristles) * 0.92f)
                     for (b in 0 until numBristles) {
-                        val fraction = (b / denom) - 0.5f
-                        val offset = fraction * totalSpread
+                        val frac = (b / denom) - 0.5f
+                        val toothDrop = fastHashNoise((x0 + distAccum) * 0.45f, y0 * 0.45f, b * 19 + i)
+                        if (abs(frac) > 0.25f && toothDrop < params.grainAmount * 0.42f) continue
+                        val wave0 = (COS_LUT[((i * 19 + b * 73) and LUT_MASK)] - 0.5f) * totalSpread * 0.08f
+                        val wave1 = (COS_LUT[(((i + 1) * 19 + b * 73) and LUT_MASK)] - 0.5f) * totalSpread * 0.08f
+                        val off0 = frac * totalSpread + wave0
+                        val off1 = frac * totalSpread + wave1
+                        val thickBias = (1.18f - abs(frac) * 0.72f).coerceIn(0.45f, 1.25f)
                         val bp = bristlePaints[b]
-                        bp.strokeWidth = bWidth
+                        bp.strokeWidth = max(0.65f, baseFilament * thickBias)
                         canvas.drawLine(
-                            x0 + normX * offset, y0 + normY * offset,
-                            x1 + normX * offset, y1 + normY * offset, bp
+                            x0 + normX * off0, y0 + normY * off0,
+                            x1 + normX * off1, y1 + normY * off1, bp
                         )
                     }
+                    distAccum += dist
                 }
             }
 
-            KritaBrushEngineKind.BRISTLE_GLAZE -> { // Krita Bristles Glaze (Layered translucent flat)
-                fillPaint.alpha = (effectiveOrigAlpha * 0.78f).toInt().coerceIn(8, 255)
-                val flatQuad = scratch.path
-                for (i in 1 until smCount) {
-                    val b0 = (i - 1) * 3; val b1 = i * 3
-                    val x0 = sm[b0]; val y0 = sm[b0 + 1]
-                    val x1 = sm[b1]; val y1 = sm[b1 + 1]
-                    val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.25f, 1.05f)
-                    val dx = x1 - x0; val dy = y1 - y0
-                    val dist = sqrt(dx * dx + dy * dy)
-                    val invDist = if (dist > 0.001f) 1f / dist else 0f
-                    val normX = -dy * invDist; val normY = dx * invDist
-                    val halfW = max(1.8f, baseWidth * 0.58f * avgPress)
-                    val offX = normX * halfW; val offY = normY * halfW
-                    flatQuad.reset()
-                    flatQuad.moveTo(x0 - offX, y0 - offY)
-                    flatQuad.lineTo(x0 + offX, y0 + offY)
-                    flatQuad.lineTo(x1 + offX, y1 + offY)
-                    flatQuad.lineTo(x1 - offX, y1 - offY)
-                    flatQuad.close()
-                    canvas.drawPath(flatQuad, fillPaint)
+            KritaBrushEngineKind.BRISTLE_GLAZE -> { // Overhauled Painterly Flat Glaze (seam-free + bristle grooves)
+                var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE
+                var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+                for (i in 0 until smCount) {
+                    val sx = sm[i * 3]; val sy = sm[i * 3 + 1]
+                    if (sx < minX) minX = sx; if (sx > maxX) maxX = sx
+                    if (sy < minY) minY = sy; if (sy > maxY) maxY = sy
+                }
+                val pad = baseWidth * 1.1f + 4f
+                val layerPaint = scratch.innerLayerSavePaint
+                layerPaint.alpha = (effectiveOrigAlpha * 0.76f).toInt().coerceIn(10, 255)
+                layerPaint.colorFilter = null
+                layerPaint.xfermode = null
+                val saveId = canvas.saveLayer(minX - pad, minY - pad, maxX + pad, maxY + pad, layerPaint)
+                try {
+                    fillPaint.color = (0xFF shl 24) or rgb
+                    fillPaint.alpha = 255
+                    val groovePaint = scratch.corePaint.apply {
+                        color = (0xC0 shl 24) or rgb
+                        colorFilter = colorFilterOverride
+                    }
+                    val flatQuad = scratch.path
+                    for (i in 1 until smCount) {
+                        val b0 = (i - 1) * 3; val b1 = i * 3
+                        val x0 = sm[b0]; val y0 = sm[b0 + 1]
+                        val x1 = sm[b1]; val y1 = sm[b1 + 1]
+                        val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.22f, 1.05f)
+                        val dx = x1 - x0; val dy = y1 - y0
+                        val dist = sqrt(dx * dx + dy * dy)
+                        val invDist = if (dist > 0.001f) 1f / dist else 0f
+                        val normX = -dy * invDist; val normY = dx * invDist
+                        val halfW = max(1.6f, baseWidth * 0.54f * avgPress)
+                        val offX = normX * halfW; val offY = normY * halfW
+                        flatQuad.reset()
+                        flatQuad.moveTo(x0 - offX, y0 - offY)
+                        flatQuad.lineTo(x0 + offX, y0 + offY)
+                        flatQuad.lineTo(x1 + offX, y1 + offY)
+                        flatQuad.lineTo(x1 - offX, y1 - offY)
+                        flatQuad.close()
+                        canvas.drawPath(flatQuad, fillPaint)
+                        // Subtle painterly ridge filaments along outer brush edges
+                        groovePaint.strokeWidth = max(1.1f, halfW * 0.28f)
+                        canvas.drawLine(x0 - offX * 0.78f, y0 - offY * 0.78f, x1 - offX * 0.78f, y1 - offY * 0.78f, groovePaint)
+                        canvas.drawLine(x0 + offX * 0.78f, y0 + offY * 0.78f, x1 + offX * 0.78f, y1 + offY * 0.78f, groovePaint)
+                    }
+                } finally {
+                    canvas.restoreToCount(saveId)
                 }
             }
 
-            KritaBrushEngineKind.CHALK_GRAINY -> { // Krita Chalk Grainy
-                var ptCount = 0
-                val stepDiv = if (densityMultiplier < 0.75f) 3.4f else 2.4f
+            KritaBrushEngineKind.CHALK_GRAINY -> { // Overhauled Textured Pastel / Chalk Grainy
+                val chalkMask = resolveSoftMaskBitmap(0.58f)
+                val bmpPaint = scratch.layerAlphaPaint
+                bmpPaint.colorFilter = colorFilterOverride ?: resolveTintFilter(rgb)
+                bmpPaint.xfermode = null
+                val grainDensity = params.grainAmount.coerceIn(0.35f, 1.0f)
+                val stepDist = max(1.8f, baseWidth * 0.20f)
+                var accum = stepDist
                 for (i in 1 until smCount) {
                     val b0 = (i - 1) * 3; val b1 = i * 3
-                    val x0 = sm[b0]; val y0 = sm[b0 + 1]
-                    val x1 = sm[b1]; val y1 = sm[b1 + 1]
-                    val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.25f, 1.05f)
-                    val w = max(2.0f, baseWidth * 0.90f * avgPress)
+                    val x0 = sm[b0]; val y0 = sm[b0 + 1]; val p0 = sm[b0 + 2]
+                    val x1 = sm[b1]; val y1 = sm[b1 + 1]; val p1 = sm[b1 + 2]
                     val dx = x1 - x0; val dy = y1 - y0
                     val dist = sqrt(dx * dx + dy * dy)
-                    val steps = max(1, (dist / stepDiv).toInt()).coerceAtMost(12)
-                    val invDist = if (dist > 0.001f) 1f / dist else 0f
+                    if (dist < 0.01f) continue
+                    val invDist = 1f / dist
                     val normX = -dy * invDist; val normY = dx * invDist
-                    val numSpecks = ((w * 0.65f * densityMultiplier).toInt()).coerceIn(2, 11)
-                    val targetBuf = scratch.ensureCapacity((ptCount + (steps + 1) * numSpecks) * 2)
-                    val invSteps = 1f / steps
-                    for (s in 0..steps) {
-                        val t = s * invSteps
-                        val cx = x0 + dx * t; val cy = y0 + dy * t
-                        val seed = cx.toInt() * 11 + cy.toInt() * 17 + s
-                        for (k in 0 until numSpecks) {
-                            if (fastHashNoise(cx, cy, seed + k * 5) > 0.84f) continue
-                            val jitterNorm = (fastHashNoise(cx, cy, seed + k * 3) - 0.5f) * w * 1.32f
-                            targetBuf[ptCount * 2] = cx + normX * jitterNorm
-                            targetBuf[ptCount * 2 + 1] = cy + normY * jitterNorm
-                            ptCount++
+                    var walked = 0f
+                    while (walked < dist) {
+                        val needed = stepDist - accum
+                        if (walked + needed <= dist) {
+                            walked += needed
+                            val t = (walked * invDist).coerceIn(0f, 1f)
+                            val cx = x0 + dx * t; val cy = y0 + dy * t
+                            val press = (p0 + (p1 - p0) * t).coerceIn(0.20f, 1.05f)
+                            val halfW = max(1.6f, baseWidth * 0.56f * press)
+                            // Soft chalk undertone stamp
+                            val baseNoise = fastHashNoise(cx, cy, i * 13)
+                            if (baseNoise > 0.18f * grainDensity) {
+                                bmpPaint.alpha = (effectiveOrigAlpha * 0.24f * (0.6f + 0.4f * baseNoise)).toInt().coerceIn(5, 220)
+                                scratch.rectF.set(cx - halfW * 1.05f, cy - halfW * 1.05f, cx + halfW * 1.05f, cy + halfW * 1.05f)
+                                canvas.drawBitmap(chalkMask, null, scratch.rectF, bmpPaint)
+                            }
+                            // Paper-tooth chalk grains scattered across normal & tangent
+                            val crumbs = ((4 + baseWidth * 0.35f) * densityMultiplier).toInt().coerceIn(3, 12)
+                            for (k in 0 until crumbs) {
+                                val tooth = fastHashNoise(cx * 0.7f, cy * 0.7f, k * 23 + i * 7)
+                                if (tooth < grainDensity * 0.28f) continue
+                                val nOff = (fastHashNoise(cx, cy, k * 17 + 3) - 0.5f) * halfW * 2.1f
+                                val tOff = (fastHashNoise(cy, cx, k * 31 + 9) - 0.5f) * halfW * 1.1f
+                                val gx = cx + normX * nOff + (dx * invDist) * tOff
+                                val gy = cy + normY * nOff + (dy * invDist) * tOff
+                                val cr = max(0.7f, halfW * (0.12f + 0.16f * tooth))
+                                fillPaint.alpha = (effectiveOrigAlpha * (0.28f + 0.58f * tooth)).toInt().coerceIn(8, 255)
+                                canvas.drawCircle(gx, gy, cr, fillPaint)
+                            }
+                            accum = 0f
+                        } else {
+                            accum += (dist - walked)
+                            walked = dist
                         }
                     }
                 }
+                bmpPaint.colorFilter = null
+            }
+
+            KritaBrushEngineKind.AIRBRUSH_SOFT -> { // Overhauled Velvety Gaussian Studio Airbrush
+                val softMask = resolveSoftMaskBitmap(params.hardness.coerceAtMost(0.20f))
+                val bmpPaint = scratch.layerAlphaPaint
+                bmpPaint.colorFilter = colorFilterOverride ?: resolveTintFilter(rgb)
+                bmpPaint.xfermode = null
+                val dabAlpha = (effectiveOrigAlpha * params.flow * 0.22f).toInt().coerceIn(2, 95)
+                val mistAlpha = (effectiveOrigAlpha * params.flow * 0.12f).toInt().coerceIn(2, 48)
+                val stepDist = max(1.4f, baseWidth * 0.16f)
+                var accum = stepDist
+                var ptCount = 0
+                val mistPerStep = (4 * densityMultiplier).toInt().coerceIn(1, 5)
+                for (i in 1 until smCount) {
+                    val b0 = (i - 1) * 3; val b1 = i * 3
+                    val x0 = sm[b0]; val y0 = sm[b0 + 1]; val p0 = sm[b0 + 2]
+                    val x1 = sm[b1]; val y1 = sm[b1 + 1]; val p1 = sm[b1 + 2]
+                    val dx = x1 - x0; val dy = y1 - y0
+                    val dist = sqrt(dx * dx + dy * dy)
+                    if (dist < 0.01f) continue
+                    val invDist = 1f / dist
+                    var walked = 0f
+                    while (walked < dist) {
+                        val needed = stepDist - accum
+                        if (walked + needed <= dist) {
+                            walked += needed
+                            val t = (walked * invDist).coerceIn(0f, 1f)
+                            val cx = x0 + dx * t; val cy = y0 + dy * t
+                            val press = (p0 + (p1 - p0) * t).coerceIn(0.18f, 1.05f)
+                            val sprayRad = max(3.5f, baseWidth * 0.92f * press)
+                            bmpPaint.alpha = (dabAlpha * (0.45f + 0.55f * press)).toInt().coerceIn(2, 110)
+                            scratch.rectF.set(cx - sprayRad, cy - sprayRad, cx + sprayRad, cy + sprayRad)
+                            canvas.drawBitmap(softMask, null, scratch.rectF, bmpPaint)
+                            // Ultra-subtle outer mist specks
+                            val buf = scratch.ensureCapacity((ptCount + mistPerStep) * 2)
+                            for (d in 0 until mistPerStep) {
+                                val lutIdx = (fastHashNoise(cx, cy, i * 19 + d) * LUT_SIZE).toInt() and LUT_MASK
+                                val r = sprayRad * (0.45f + 0.65f * sqrt(fastHashNoise(cy, cx, i * 23 + d)))
+                                buf[ptCount * 2] = cx + COS_LUT[lutIdx] * r
+                                buf[ptCount * 2 + 1] = cy + SIN_LUT[lutIdx] * r
+                                ptCount++
+                            }
+                            accum = 0f
+                        } else {
+                            accum += (dist - walked)
+                            walked = dist
+                        }
+                    }
+                }
+                bmpPaint.colorFilter = null
                 if (ptCount > 0) {
-                    ptPaint.alpha = (effectiveOrigAlpha * 0.76f).toInt().coerceIn(10, 255)
-                    ptPaint.strokeWidth = 2.8f
+                    ptPaint.alpha = mistAlpha
+                    ptPaint.strokeWidth = max(1.0f, baseWidth * 0.06f)
                     canvas.drawPoints(scratch.ptsBuffer, 0, ptCount * 2, ptPaint)
                 }
             }
 
-            KritaBrushEngineKind.AIRBRUSH_SOFT -> { // Krita Airbrush Soft
-                val dropletsPerStep = (15 * densityMultiplier).toInt().coerceIn(5, 16)
-                val minStepDist = max(3f, baseWidth * 0.38f)
-                var ptCount = 0
+            KritaBrushEngineKind.BLENDER_WET_SOFT -> { // Overhauled Wet Watercolor / Soft Smudge Wash
+                val wetMask = resolveSoftMaskBitmap(0.26f)
+                val bmpPaint = scratch.layerAlphaPaint
+                bmpPaint.colorFilter = colorFilterOverride ?: resolveTintFilter(rgb)
+                bmpPaint.xfermode = null
+                val stepDist = max(1.5f, baseWidth * 0.20f)
+                val dabAlpha = (effectiveOrigAlpha * params.flow * 0.34f).toInt().coerceIn(3, 145)
+                var accum = stepDist
                 for (i in 1 until smCount) {
                     val b0 = (i - 1) * 3; val b1 = i * 3
-                    val x0 = sm[b0]; val y0 = sm[b0 + 1]
-                    val x1 = sm[b1]; val y1 = sm[b1 + 1]
-                    val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.2f, 1.05f)
-                    val sprayRad = max(4f, baseWidth * 1.45f * avgPress)
+                    val x0 = sm[b0]; val y0 = sm[b0 + 1]; val p0 = sm[b0 + 2]
+                    val x1 = sm[b1]; val y1 = sm[b1 + 1]; val p1 = sm[b1 + 2]
                     val dx = x1 - x0; val dy = y1 - y0
                     val dist = sqrt(dx * dx + dy * dy)
-                    val steps = max(1, (dist / minStepDist).toInt()).coerceAtMost(12)
-                    val invSteps = 1f / steps
-                    val targetBuf = scratch.ensureCapacity((ptCount + (steps + 1) * dropletsPerStep) * 2)
-                    for (s in 0..steps) {
-                        val t = s * invSteps
-                        val cx = x0 + dx * t; val cy = y0 + dy * t
-                        val baseSeed = cx.toInt() * 7 + cy.toInt() * 13 + s * 16
-                        for (d in 0 until dropletsPerStep) {
-                            val seed = baseSeed + d
-                            val lutIdx = (fastHashNoise(cx, cy, seed) * LUT_SIZE).toInt() and LUT_MASK
-                            val r = sprayRad * sqrt(fastHashNoise(cx, cy, seed + 10))
-                            targetBuf[ptCount * 2] = cx + COS_LUT[lutIdx] * r
-                            targetBuf[ptCount * 2 + 1] = cy + SIN_LUT[lutIdx] * r
-                            ptCount++
+                    if (dist < 0.01f) continue
+                    val invDist = 1f / dist
+                    var walked = 0f
+                    while (walked < dist) {
+                        val needed = stepDist - accum
+                        if (walked + needed <= dist) {
+                            walked += needed
+                            val t = (walked * invDist).coerceIn(0f, 1f)
+                            val cx = x0 + dx * t; val cy = y0 + dy * t
+                            val press = (p0 + (p1 - p0) * t).coerceIn(0.20f, 1.05f)
+                            val rad = max(2.0f, baseWidth * 0.72f * press)
+                            bmpPaint.alpha = (dabAlpha * (0.55f + 0.45f * press)).toInt().coerceIn(4, 175)
+                            scratch.rectF.set(cx - rad * 1.18f, cy - rad * 1.18f, cx + rad * 1.18f, cy + rad * 1.18f)
+                            canvas.drawBitmap(wetMask, null, scratch.rectF, bmpPaint)
+                            accum = 0f
+                        } else {
+                            accum += (dist - walked)
+                            walked = dist
                         }
                     }
                 }
-                if (ptCount > 0) {
-                    ptPaint.alpha = (effectiveOrigAlpha * 0.35f).toInt().coerceIn(8, 255)
-                    ptPaint.strokeWidth = 2.4f
-                    canvas.drawPoints(scratch.ptsBuffer, 0, ptCount * 2, ptPaint)
-                }
-            }
-
-            KritaBrushEngineKind.BLENDER_WET_SOFT -> { // Krita Blender / Wet Soft
+                bmpPaint.colorFilter = null
+                // Delicate translucent watercolor core glide
                 val corePaint = scratch.corePaint.apply {
                     color = effColor
-                    alpha = (effectiveOrigAlpha * 0.72f).toInt().coerceIn(8, 255)
-                    colorFilter = colorFilterOverride
-                }
-                val haloPaint = scratch.haloPaint.apply {
-                    color = effColor
-                    alpha = (effectiveOrigAlpha * 0.24f).toInt().coerceIn(6, 255)
+                    alpha = (effectiveOrigAlpha * 0.24f).toInt().coerceIn(4, 96)
                     colorFilter = colorFilterOverride
                 }
                 for (i in 1 until smCount) {
                     val b0 = (i - 1) * 3; val b1 = i * 3
                     val avgPress = ((sm[b0 + 2] + sm[b1 + 2]) * 0.5f).coerceIn(0.2f, 1.05f)
-                    val w = max(1.5f, baseWidth * avgPress)
-                    haloPaint.strokeWidth = w * 1.48f
-                    canvas.drawLine(sm[b0], sm[b0 + 1], sm[b1], sm[b1 + 1], haloPaint)
-                    corePaint.strokeWidth = w * 0.78f
+                    corePaint.strokeWidth = max(1.2f, baseWidth * 0.62f * avgPress)
                     canvas.drawLine(sm[b0], sm[b0 + 1], sm[b1], sm[b1 + 1], corePaint)
                 }
             }

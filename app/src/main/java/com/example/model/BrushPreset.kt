@@ -334,17 +334,18 @@ data class BrushPreset(
                 defaultSize = 20f,
                 defaultOpacity = 0.90f,
                 toolType = ToolType.BRUSH,
-                textureNamePt = "Krita Dry Bristles (Cerdas Secas)",
+                textureNamePt = "Pincel Cerdas Secas (Pintura)",
                 textureSymbol = "≣",
-                descriptionPt = "Pincel de cerdas secas do Krita para pinceladas texturizadas de pintura tradicional.",
+                descriptionPt = "Pincel de cerdas secas orgânicas com falha de pigmento para pintura tradicional.",
                 engineKind = KritaBrushEngineKind.BRISTLE_DRY,
                 dynamicParams = BrushDynamicParams(
                     engineKind = KritaBrushEngineKind.BRISTLE_DRY,
-                    hardness = 0.85f,
-                    spacing = 0.10f,
+                    hardness = 0.80f,
+                    spacing = 0.08f,
                     flow = 0.88f,
-                    bristleCount = 6,
-                    grainAmount = 0.25f
+                    bristleCount = 9,
+                    grainAmount = 0.35f,
+                    taperStrength = 0.35f
                 )
             ),
             BrushPreset(
@@ -354,16 +355,16 @@ data class BrushPreset(
                 defaultSize = 22f,
                 defaultOpacity = 0.72f,
                 toolType = ToolType.BRUSH,
-                textureNamePt = "Krita Bristles Glaze (Veladura Plana)",
+                textureNamePt = "Veladura Plana Suave",
                 textureSymbol = "▀",
-                descriptionPt = "Pincelada larga e translúcida de cerdas finas para fundos e pintura atmosférica.",
+                descriptionPt = "Pincelada larga, sedosa e translúcida sem emendas para fundos e pintura atmosférica.",
                 engineKind = KritaBrushEngineKind.BRISTLE_GLAZE,
                 dynamicParams = BrushDynamicParams(
                     engineKind = KritaBrushEngineKind.BRISTLE_GLAZE,
-                    hardness = 0.78f,
-                    spacing = 0.11f,
+                    hardness = 0.72f,
+                    spacing = 0.08f,
                     flow = 0.72f,
-                    bristleCount = 5
+                    bristleCount = 7
                 )
             ),
             BrushPreset(
@@ -371,36 +372,36 @@ data class BrushPreset(
                 namePt = "e) Chalk Grainy",
                 shortLabel = "Chalk",
                 defaultSize = 15f,
-                defaultOpacity = 0.82f,
+                defaultOpacity = 0.84f,
                 toolType = ToolType.BRUSH,
-                textureNamePt = "Krita Chalk Grainy (Giz Granulado)",
+                textureNamePt = "Giz Pastel Texturizado",
                 textureSymbol = "▒",
-                descriptionPt = "Giz pastel granulado de alto contraste de textura no papel.",
+                descriptionPt = "Giz pastel cremoso com granulação orgânica de papel para sombreamento rico.",
                 engineKind = KritaBrushEngineKind.CHALK_GRAINY,
                 dynamicParams = BrushDynamicParams(
                     engineKind = KritaBrushEngineKind.CHALK_GRAINY,
-                    hardness = 0.65f,
-                    spacing = 0.14f,
-                    flow = 0.80f,
-                    grainAmount = 0.85f
+                    hardness = 0.62f,
+                    spacing = 0.09f,
+                    flow = 0.82f,
+                    grainAmount = 0.78f
                 )
             ),
             BrushPreset(
                 id = 11,
                 namePt = "a) Airbrush Soft",
                 shortLabel = "Airbrush",
-                defaultSize = 30f,
-                defaultOpacity = 0.36f,
+                defaultSize = 32f,
+                defaultOpacity = 0.42f,
                 toolType = ToolType.BRUSH,
-                textureNamePt = "Krita Airbrush Soft (Aerógrafo Suave)",
+                textureNamePt = "Aerógrafo Suave Gaussiano",
                 textureSymbol = "∴",
-                descriptionPt = "Aerógrafo suave para gradientes, brilho luminoso, névoa e sombras aéreas.",
+                descriptionPt = "Aerógrafo aveludado contínuo para gradientes, brilho luminoso e sombras difusas.",
                 engineKind = KritaBrushEngineKind.AIRBRUSH_SOFT,
                 dynamicParams = BrushDynamicParams(
                     engineKind = KritaBrushEngineKind.AIRBRUSH_SOFT,
-                    hardness = 0.18f,
-                    spacing = 0.12f,
-                    flow = 0.42f
+                    hardness = 0.14f,
+                    spacing = 0.07f,
+                    flow = 0.45f
                 )
             ),
             BrushPreset(
@@ -408,18 +409,18 @@ data class BrushPreset(
                 namePt = "k) Wet Soft Aquarela",
                 shortLabel = "Wet Soft",
                 defaultSize = 24f,
-                defaultOpacity = 0.52f,
+                defaultOpacity = 0.56f,
                 toolType = ToolType.BRUSH,
-                textureNamePt = "Pincel Úmido Suave (Aquarelado)",
+                textureNamePt = "Pincel Úmido Aquarelado",
                 textureSymbol = "◈",
-                descriptionPt = "Pincel úmido suave para transição de tons, misturas macias e brilho difuso.",
+                descriptionPt = "Pincel úmido suave com borda orgânica aquarelada e transição cremosa de tons.",
                 engineKind = KritaBrushEngineKind.BLENDER_WET_SOFT,
                 dynamicParams = BrushDynamicParams(
                     engineKind = KritaBrushEngineKind.BLENDER_WET_SOFT,
-                    hardness = 0.30f,
-                    spacing = 0.10f,
-                    flow = 0.55f,
-                    opacityScale = 0.72f
+                    hardness = 0.24f,
+                    spacing = 0.07f,
+                    flow = 0.58f,
+                    opacityScale = 0.76f
                 )
             )
         )

@@ -13,6 +13,7 @@ import com.example.engine.SampleProjects
 import com.example.model.AnimationProject
 import com.example.model.AppPreferences
 import com.example.model.AppUiMode
+import com.example.model.Canvas3DBackgroundRenderMode
 import com.example.model.DrawingStroke
 import com.example.model.Frame
 import com.example.model.Layer
@@ -52,12 +53,15 @@ import com.example.engine.KodanimaDispatchers
 import com.example.engine.KritaBrushImporter
 import com.example.engine.LocalServerBridge
 import com.example.engine.LocalServerForegroundService
+import com.example.engine.BuiltIn3DPrimitive
 import com.example.engine.Camera3DEngine
+import com.example.engine.Mesh3DImporter
 import com.example.engine.MultiplayerStudioEngine
 import com.example.engine.PreferencesStorageManager
 import com.example.engine.ProjectCompressionManager
 import com.example.engine.SavedProjectEntry
 import com.example.engine.SelectionGeometryHelper
+import com.example.engine.TimelineTrackEngine
 import com.example.engine.WifiDirectP2pHelper
 import com.example.engine.WifiDirectPeerItem
 import com.example.model.BezierNode
@@ -74,6 +78,7 @@ import com.example.model.CameraMode
 import com.example.model.CameraPostEffectSettings
 import com.example.model.CameraPresetTemplate
 import com.example.model.CameraToolAction
+import com.example.model.CameraViewportNavTarget
 import com.example.model.CanvasBackgroundSettings
 import com.example.model.CanvasBackgroundStyle
 import com.example.model.ColorPaletteConfig
@@ -81,8 +86,14 @@ import com.example.model.FriendBrushOffer
 import com.example.model.GestureAction
 import com.example.model.GridRulerSettings
 import com.example.model.KeyboardShortcutBinding
+import com.example.model.LayerTransformTrack
 import com.example.model.MultiFingerGesture
 import com.example.model.NetworkTransportMode
+import com.example.model.ObjectTransformKeyframe
+import com.example.model.SceneObject3D
+import com.example.model.StageSelection
+import com.example.model.StageTargetType
+import kotlinx.coroutines.withContext
 import com.example.model.PerspectiveRulerSettings
 import com.example.model.RemoteLiveStroke
 import com.example.model.ShortcutAction
@@ -116,6 +127,8 @@ data class EditorUiState(
     val savedProjectEntries: List<SavedProjectEntry> = emptyList(),
     val project: AnimationProject = AnimationProject(name = "Novo Projeto"),
     val currentFrameIndex: Int = 0,
+    val currentTimelineTick: Int = 0,
+    val playbackTimeMs: Long? = null,
     val activeLayerIndex: Int = 1,
     val selectedTool: ToolType = ToolType.PEN,
     val activeBrushPreset: BrushPreset = BrushPreset.ALL_12_PRESETS[0],
@@ -192,7 +205,10 @@ data class EditorUiState(
     val isQuickPaletteLocked: Boolean = false,
     val pendingReturnToPaletteTray: Boolean = false,
     val toolBeforeEyedropper: ToolType = ToolType.PEN,
-    val exportCameraCropOnly: Boolean = true
+    val exportCameraCropOnly: Boolean = true,
+    val cameraViewportNavTarget: CameraViewportNavTarget = CameraViewportNavTarget.CAMERA,
+    val stageSelection: StageSelection = StageSelection(StageTargetType.CAMERA, "camera"),
+    val stageFocusRequestNonce: Int = 0
 )
 
 class KodanimaViewModel : ViewModel() {
@@ -1319,10 +1335,13 @@ class KodanimaViewModel : ViewModel() {
         perFrameRedoOps.clear()
         perFrameLocalTarget.clear()
         val initialFrame = project.lastActiveFrameIndex.coerceIn(0, (project.frames.size - 1).coerceAtLeast(0))
+        val initialTick = TimelineTrackEngine.computeCelStartTick(project, 0, initialFrame)
         _uiState.update {
             it.copy(
                 project = project,
                 currentFrameIndex = initialFrame,
+                currentTimelineTick = initialTick,
+                playbackTimeMs = null,
                 activeLayerIndex = 0,
                 activeLocalLayerIndex = 0,
                 activeTargetIsFrameLocalLayer = false,
@@ -1953,7 +1972,12 @@ class KodanimaViewModel : ViewModel() {
         val total = state.project.frames.size
         if (total == 0) return
         val clamped = index.coerceIn(0, total - 1)
-        if (clamped != state.currentFrameIndex || state.activeScrubTimeMs != null) {
+        val targetTick = TimelineTrackEngine.computeCelStartTick(state.project, state.activeLayerIndex, clamped)
+        if (clamped != state.currentFrameIndex ||
+            targetTick != state.currentTimelineTick ||
+            state.activeScrubTimeMs != null ||
+            state.playbackTimeMs != null
+        ) {
             _uiState.update { s ->
                 saveCurrentFrameTargetPreference(s)
                 val targetFrame = s.project.frames[clamped]
@@ -1962,9 +1986,12 @@ class KodanimaViewModel : ViewModel() {
                     fallbackActiveLocalIdx = s.activeLocalLayerIndex,
                     fallbackIsLocal = s.activeTargetIsFrameLocalLayer
                 )
+                val resolvedTick = TimelineTrackEngine.computeCelStartTick(s.project, s.activeLayerIndex, clamped)
                 s.copy(
                     currentFrameIndex = clamped,
+                    currentTimelineTick = resolvedTick,
                     activeScrubTimeMs = null,
+                    playbackTimeMs = null,
                     bezierNodes = emptyList(),
                     isBezierClosed = false,
                     activeSelection = SelectionRegion(isActive = false),
@@ -1974,7 +2001,7 @@ class KodanimaViewModel : ViewModel() {
                 )
             }
             if (state.isPlaying) {
-                val timeMs = MediaAssetManager.computeTimeMsForFrame(state.project.frames, clamped, state.project.fps)
+                val timeMs = TimelineTrackEngine.tickToTimeMs(targetTick, state.project.fps)
                 MediaAssetManager.seekAudio(timeMs.toInt())
             }
             updateUndoRedoAvailability()
@@ -1982,7 +2009,153 @@ class KodanimaViewModel : ViewModel() {
     }
 
     /**
-     * Interactive timeline Pinça (Playhead) scrubbing: seeks frames & triggers real-time audio scrubbing for lip-sync.
+     * Seeks the timeline Pinça to an arbitrary timeline [tick] cleanly, keeping every timeline layer's
+     * independent cel alignment intact while syncing [currentFrameIndex] to the active layer's cel.
+     */
+    fun goToTimelineTick(tick: Int) {
+        val state = _uiState.value
+        if (state.project.frames.isEmpty()) return
+        val safeTick = tick.coerceAtLeast(0)
+        val preferredFrame = TimelineTrackEngine.resolvePreferredFrameIndexAtTick(
+            project = state.project,
+            activeLayerIndex = state.activeLayerIndex,
+            tick = safeTick,
+            fallbackFrameIndex = state.currentFrameIndex
+        )
+        _uiState.update { s ->
+            val nextFrame = TimelineTrackEngine.resolvePreferredFrameIndexAtTick(
+                project = s.project,
+                activeLayerIndex = s.activeLayerIndex,
+                tick = safeTick,
+                fallbackFrameIndex = s.currentFrameIndex
+            )
+            if (nextFrame != s.currentFrameIndex) {
+                saveCurrentFrameTargetPreference(s)
+            }
+            val targetFrame = s.project.frames[nextFrame]
+            val (nextIsLocal, nextLocalIdx) = resolveTargetStateForFrame(
+                targetFrame = targetFrame,
+                fallbackActiveLocalIdx = s.activeLocalLayerIndex,
+                fallbackIsLocal = s.activeTargetIsFrameLocalLayer
+            )
+            s.copy(
+                currentTimelineTick = safeTick,
+                currentFrameIndex = nextFrame,
+                activeScrubTimeMs = null,
+                playbackTimeMs = null,
+                bezierNodes = if (nextFrame != s.currentFrameIndex) emptyList() else s.bezierNodes,
+                isBezierClosed = if (nextFrame != s.currentFrameIndex) false else s.isBezierClosed,
+                activeSelection = if (nextFrame != s.currentFrameIndex) SelectionRegion(isActive = false) else s.activeSelection,
+                activeLocalLayerIndex = nextLocalIdx,
+                activeTargetIsFrameLocalLayer = nextIsLocal,
+                project = s.project.copy(lastActiveFrameIndex = nextFrame, updatedAt = System.currentTimeMillis())
+            )
+        }
+        if (state.isPlaying) {
+            val timeMs = TimelineTrackEngine.tickToTimeMs(safeTick, state.project.fps)
+            MediaAssetManager.seekAudio(timeMs.toInt())
+        }
+        if (preferredFrame != state.currentFrameIndex) {
+            updateUndoRedoAvailability()
+        }
+    }
+
+    fun selectLayerCel(layerIndex: Int, frameIndex: Int, tick: Int? = null) {
+        val state = _uiState.value
+        val frames = state.project.frames
+        if (frames.isEmpty()) return
+        val safeFrame = frameIndex.coerceIn(0, frames.lastIndex)
+        val f = frames[safeFrame]
+        val safeLayer = layerIndex.coerceIn(0, (f.layers.size - 1).coerceAtLeast(0))
+        val targetTick = tick ?: TimelineTrackEngine.computeCelStartTick(state.project, safeLayer, safeFrame)
+        perFrameLocalTarget[f.id] = false to 0
+        _uiState.update { s ->
+            if (safeFrame != s.currentFrameIndex) {
+                saveCurrentFrameTargetPreference(s)
+            }
+            s.copy(
+                activeLayerIndex = safeLayer,
+                activeTargetIsFrameLocalLayer = false,
+                currentFrameIndex = safeFrame,
+                currentTimelineTick = targetTick.coerceAtLeast(0),
+                activeScrubTimeMs = null,
+                playbackTimeMs = null,
+                bezierNodes = if (safeFrame != s.currentFrameIndex) emptyList() else s.bezierNodes,
+                isBezierClosed = if (safeFrame != s.currentFrameIndex) false else s.isBezierClosed,
+                activeSelection = if (safeFrame != s.currentFrameIndex) SelectionRegion(isActive = false) else s.activeSelection,
+                project = s.project.copy(lastActiveFrameIndex = safeFrame, updatedAt = System.currentTimeMillis())
+            )
+        }
+        updateUndoRedoAvailability()
+    }
+
+    /**
+     * Stretches or shrinks ONLY the cel `(layerIndex, frameIndex)` to [holdTicks] without altering any
+     * other timeline layer row's timing (PC & Mobile decoupled layer timing).
+     */
+    fun setLayerCelDuration(layerIndex: Int, frameIndex: Int, holdTicks: Int) {
+        _uiState.update { state ->
+            val updatedProj = TimelineTrackEngine.setLayerCelDuration(
+                project = state.project,
+                layerIndex = layerIndex,
+                frameIndex = frameIndex,
+                newHoldTicks = holdTicks
+            )
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(project = updatedProj)
+        }
+    }
+
+    /**
+     * Moves a cel `(layerIndex, frameIndex)` horizontally along its own timeline layer track to [targetTick]
+     * without affecting other timeline layers.
+     */
+    fun moveLayerCelToTick(layerIndex: Int, frameIndex: Int, targetTick: Int) {
+        _uiState.update { state ->
+            val updatedProj = TimelineTrackEngine.moveLayerCelToTick(
+                project = state.project,
+                layerIndex = layerIndex,
+                frameIndex = frameIndex,
+                targetTick = targetTick
+            )
+            val nextTick = if (state.activeLayerIndex == layerIndex && state.currentFrameIndex == frameIndex) {
+                TimelineTrackEngine.computeCelStartTick(updatedProj, layerIndex, frameIndex)
+            } else {
+                state.currentTimelineTick
+            }
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(
+                project = updatedProj,
+                currentTimelineTick = nextTick,
+                statusMessage = "Quadro movido na camada para T${targetTick + 1}."
+            )
+        }
+    }
+
+    fun activateOrAddCelOnLayerAtTick(layerIndex: Int, tick: Int) {
+        _uiState.update { state ->
+            val (updatedProj, celFrameIdx) = TimelineTrackEngine.ensureCelAtTick(
+                project = state.project,
+                layerIndex = layerIndex,
+                tick = tick
+            )
+            val safeLayer = layerIndex.coerceIn(0, (updatedProj.frames[celFrameIdx].layers.size - 1).coerceAtLeast(0))
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(
+                project = updatedProj,
+                activeLayerIndex = safeLayer,
+                activeTargetIsFrameLocalLayer = false,
+                currentFrameIndex = celFrameIdx,
+                currentTimelineTick = tick.coerceAtLeast(0),
+                activeScrubTimeMs = null,
+                playbackTimeMs = null
+            )
+        }
+        updateUndoRedoAvailability()
+    }
+
+    /**
+     * Interactive timeline Pinça (Playhead) scrubbing: seeks continuous ticks/frames & triggers real-time audio scrubbing for lip-sync.
      */
     fun scrubToTimelineMs(timeMs: Long) {
         val state = _uiState.value
@@ -1990,11 +2163,22 @@ class KodanimaViewModel : ViewModel() {
             pausePlayback()
         }
         val proj = state.project
-        val totalDurationMs = MediaAssetManager.computeTotalDurationMs(proj.frames, proj.fps)
+        val totalTicks = TimelineTrackEngine.computeTotalTicks(
+            proj,
+            includeCameraRunway = state.isCameraTimelineOpen || proj.camera3D.isEnabled
+        )
+        val totalDurationMs = (totalTicks.toLong() * 1000L) / max(1, proj.fps)
         val audioAsset = proj.mediaAssets.firstOrNull { it.type == "audio" }
         val maxMs = max(totalDurationMs, (audioAsset?.durationSeconds?.times(1000.0)?.toLong() ?: 0L)).coerceAtLeast(100L)
         val clampedMs = timeMs.coerceIn(0L, maxMs)
-        val targetFrameIdx = MediaAssetManager.findFrameIndexAtTimeMs(proj.frames, clampedMs, proj.fps)
+        val tickFloat = TimelineTrackEngine.timeMsToTickFloat(clampedMs, proj.fps)
+        val targetTick = tickFloat.toInt().coerceIn(0, (totalTicks - 1).coerceAtLeast(0))
+        val targetFrameIdx = TimelineTrackEngine.resolvePreferredFrameIndexAtTick(
+            project = proj,
+            activeLayerIndex = state.activeLayerIndex,
+            tick = targetTick,
+            fallbackFrameIndex = state.currentFrameIndex
+        )
 
         val frameChanged = targetFrameIdx != state.currentFrameIndex
         _uiState.update { s ->
@@ -2009,7 +2193,9 @@ class KodanimaViewModel : ViewModel() {
             )
             s.copy(
                 currentFrameIndex = targetFrameIdx,
+                currentTimelineTick = targetTick,
                 activeScrubTimeMs = clampedMs,
+                playbackTimeMs = null,
                 activeLocalLayerIndex = nextLocalIdx,
                 activeTargetIsFrameLocalLayer = nextIsLocal,
                 project = if (frameChanged) s.project.copy(lastActiveFrameIndex = targetFrameIdx) else s.project
@@ -2038,7 +2224,11 @@ class KodanimaViewModel : ViewModel() {
         _uiState.update { state ->
             val updated = state.project.frames.toMutableList()
             if (frameIndex in updated.indices) {
-                updated[frameIndex] = updated[frameIndex].copy(holdFrames = clampedHold)
+                val orig = updated[frameIndex]
+                val mappedLayers = orig.layers.map { l ->
+                    if (l.celHoldTicks != null) l.copy(celHoldTicks = clampedHold) else l
+                }
+                updated[frameIndex] = orig.copy(holdFrames = clampedHold, layers = mappedLayers)
                 state.copy(
                     project = state.project.copy(frames = updated, updatedAt = System.currentTimeMillis())
                 )
@@ -2047,10 +2237,23 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun performBucketFill(x: Float, y: Float) {
+        val initial = _uiState.value
+        val useLocalInit = initial.activeTargetIsFrameLocalLayer &&
+            (initial.project.frames.getOrNull(initial.currentFrameIndex)?.localLayers?.isNotEmpty() == true)
+        if (!useLocalInit && TimelineTrackEngine.resolveCelAtTick(initial.project, initial.activeLayerIndex, initial.currentTimelineTick) == null) {
+            activateOrAddCelOnLayerAtTick(initial.activeLayerIndex, initial.currentTimelineTick)
+        }
         val state = _uiState.value
         val proj = state.project
         val frameIndex = state.currentFrameIndex
-        val currFrame = proj.frames.getOrNull(frameIndex) ?: return
+        val rawCurrFrame = proj.frames.getOrNull(frameIndex) ?: return
+        val composedRefFrame = TimelineTrackEngine.composeFrameAtTick(
+            project = proj,
+            tick = state.currentTimelineTick,
+            activeLayerIndex = state.activeLayerIndex,
+            fallbackFrameIndex = frameIndex
+        )
+        val currFrame = rawCurrFrame.copy(layers = composedRefFrame.layers)
         val fillColor = state.currentColor
         val fillOpacity = state.brushOpacity
         val cfg = state.bucketConfig
@@ -2776,17 +2979,29 @@ class KodanimaViewModel : ViewModel() {
         _uiState.update { state ->
             saveCurrentFrameTargetPreference(state)
             val templateLayers = state.project.frames.firstOrNull()?.layers ?: listOf(Layer(name = "Camada 1"))
-            val newFrameLayers = templateLayers.map { it.copy(id = UUID.randomUUID().toString(), strokes = emptyList()) }
+            val hasDecoupledTiming = state.project.frames.any { f ->
+                f.layers.any { it.celHoldTicks != null || it.celStartTick != null }
+            }
+            val newFrameLayers = templateLayers.mapIndexed { idx, layer ->
+                layer.copy(
+                    id = UUID.randomUUID().toString(),
+                    strokes = emptyList(),
+                    celHoldTicks = if (hasDecoupledTiming) (if (idx == state.activeLayerIndex) 1 else 0) else null,
+                    celStartTick = null
+                )
+            }
             val newFrame = Frame(layers = newFrameLayers)
             val insertAt = state.currentFrameIndex + 1
             insertedIdx = insertAt
             val updatedFrames = state.project.frames.toMutableList()
             updatedFrames.add(insertAt, newFrame)
             val updatedProject = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
+            val nextTick = TimelineTrackEngine.computeCelStartTick(updatedProject, state.activeLayerIndex, insertAt)
             multiplayerEngine.updateHostedProjectSnapshot(updatedProject)
             state.copy(
                 project = updatedProject,
                 currentFrameIndex = insertAt,
+                currentTimelineTick = nextTick,
                 activeLocalLayerIndex = 0,
                 activeTargetIsFrameLocalLayer = false
             )
@@ -2804,7 +3019,8 @@ class KodanimaViewModel : ViewModel() {
             val duplicatedLayers = curr.layers.map { layer ->
                 layer.copy(
                     id = java.util.UUID.randomUUID().toString(),
-                    strokes = layer.strokes.map { it.copy(id = java.util.UUID.randomUUID().toString()) }
+                    strokes = layer.strokes.map { it.copy(id = java.util.UUID.randomUUID().toString()) },
+                    celStartTick = null
                 )
             }
             val duplicatedLocalLayers = curr.localLayers.map { layer ->
@@ -2826,10 +3042,12 @@ class KodanimaViewModel : ViewModel() {
             val updatedFrames = state.project.frames.toMutableList()
             updatedFrames.add(insertAt, duplicatedFrame)
             val updatedProj = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
+            val nextTick = TimelineTrackEngine.computeCelStartTick(updatedProj, state.activeLayerIndex, insertAt)
             multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
             state.copy(
                 project = updatedProj,
-                currentFrameIndex = insertAt
+                currentFrameIndex = insertAt,
+                currentTimelineTick = nextTick
             )
         }
         updateUndoRedoAvailability()
@@ -2854,10 +3072,12 @@ class KodanimaViewModel : ViewModel() {
                 fallbackIsLocal = state.activeTargetIsFrameLocalLayer
             )
             val updatedProj = state.project.copy(frames = updatedFrames, updatedAt = System.currentTimeMillis())
+            val nextTick = TimelineTrackEngine.computeCelStartTick(updatedProj, state.activeLayerIndex, newIndex)
             multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
             state.copy(
                 project = updatedProj,
                 currentFrameIndex = newIndex,
+                currentTimelineTick = nextTick,
                 activeLocalLayerIndex = nextLocalIdx,
                 activeTargetIsFrameLocalLayer = nextIsLocal
             )
@@ -2898,6 +3118,12 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun addStrokeToCurrentLayer(stroke: DrawingStroke) {
+        val initial = _uiState.value
+        val initFrame = initial.project.frames.getOrNull(initial.currentFrameIndex) ?: return
+        val useLocalInit = isUsingLocalLayer(initial, initFrame)
+        if (!useLocalInit && TimelineTrackEngine.resolveCelAtTick(initial.project, initial.activeLayerIndex, initial.currentTimelineTick) == null) {
+            activateOrAddCelOnLayerAtTick(initial.activeLayerIndex, initial.currentTimelineTick)
+        }
         val stateBefore = _uiState.value
         val frameIndex = stateBefore.currentFrameIndex
         val currFrame = stateBefore.project.frames.getOrNull(frameIndex) ?: return
@@ -3669,8 +3895,20 @@ class KodanimaViewModel : ViewModel() {
         val state = _uiState.value
         val currFrame = state.project.frames.getOrNull(state.currentFrameIndex) ?: return
         val clamped = index.coerceIn(0, (currFrame.layers.size - 1).coerceAtLeast(0))
-        perFrameLocalTarget[currFrame.id] = false to 0
-        _uiState.update { it.copy(activeLayerIndex = clamped, activeTargetIsFrameLocalLayer = false) }
+        val matchedFrameIdx = TimelineTrackEngine.resolveCelAtTick(state.project, clamped, state.currentTimelineTick)?.frameIndex
+            ?: state.currentFrameIndex
+        val targetFrame = state.project.frames.getOrNull(matchedFrameIdx) ?: currFrame
+        perFrameLocalTarget[targetFrame.id] = false to 0
+        _uiState.update {
+            it.copy(
+                activeLayerIndex = clamped,
+                activeTargetIsFrameLocalLayer = false,
+                currentFrameIndex = matchedFrameIdx
+            )
+        }
+        if (matchedFrameIdx != state.currentFrameIndex) {
+            updateUndoRedoAvailability()
+        }
     }
 
     fun addLayer() {
@@ -4399,56 +4637,104 @@ class KodanimaViewModel : ViewModel() {
         playbackJob?.cancel()
         MediaAssetManager.endAudioScrub()
         val initialState = _uiState.value
-        val startMs = MediaAssetManager.computeTimeMsForFrame(
-            initialState.project.frames,
-            initialState.currentFrameIndex,
-            initialState.project.fps
-        ).toInt()
+        val initFps = max(1, initialState.project.fps)
+        val initTotalTicks = TimelineTrackEngine.computeTotalTicks(
+            initialState.project,
+            includeCameraRunway = initialState.project.camera3D.isEnabled || initialState.isCameraTimelineOpen
+        )
+        val totalDurationMs = ((initTotalTicks.toLong() * 1000L) / initFps).coerceAtLeast(1000L / initFps)
+        val rawStartMs = TimelineTrackEngine.tickToTimeMs(initialState.currentTimelineTick, initFps)
+        val startMs = if (rawStartMs >= totalDurationMs - (1000L / initFps) && !initialState.isLooping) 0L else rawStartMs
+
         val audioAsset = initialState.project.mediaAssets.firstOrNull { it.type == "audio" }
         if (audioAsset != null && audioAsset.uriString.isNotBlank()) {
             MediaAssetManager.playAudioTrack(
                 filePath = audioAsset.uriString,
-                startMs = startMs,
+                startMs = startMs.toInt(),
                 isLooping = initialState.isLooping,
                 volumePercent = audioAsset.audioVolumePercent,
                 muted = audioAsset.audioMuted
             )
         }
 
-        _uiState.update { it.copy(isPlaying = true, activeScrubTimeMs = null) }
+        _uiState.update {
+            it.copy(
+                isPlaying = true,
+                activeScrubTimeMs = null,
+                playbackTimeMs = startMs
+            )
+        }
         playbackJob = viewModelScope.launch {
+            var lastWallMs = System.currentTimeMillis()
+            var simTimeMs = startMs.coerceIn(0L, totalDurationMs)
             while (isActive && _uiState.value.isPlaying) {
                 val curState = _uiState.value
-                val frames = curState.project.frames
                 val fps = max(1, curState.project.fps)
-                val currIdx = curState.currentFrameIndex.coerceIn(0, max(0, frames.lastIndex))
-                val holdCount = max(1, frames.getOrNull(currIdx)?.holdFrames ?: 1)
-                val delayTime = ((1000L * holdCount) / fps).coerceAtLeast(16L)
-                delay(delayTime)
+                val smoothCamera = curState.project.camera3D.isEnabled && curState.project.camera3D.autoInterpolate
+                val stepDelayMs = if (smoothCamera) 20L else (1000L / fps).coerceAtLeast(16L)
+                delay(stepDelayMs)
 
                 if (!isActive || !_uiState.value.isPlaying) break
                 val latest = _uiState.value
-                val total = latest.project.frames.size
-                if (total <= 1) {
-                    if (!latest.isLooping) {
-                        pausePlayback()
-                        break
-                    }
-                    continue
-                }
-                val isAtEnd = latest.currentFrameIndex >= total - 1
-                if (isAtEnd && !latest.isLooping) {
+                val latestFps = max(1, latest.project.fps)
+                val curTotalTicks = TimelineTrackEngine.computeTotalTicks(
+                    latest.project,
+                    includeCameraRunway = latest.project.camera3D.isEnabled || latest.isCameraTimelineOpen
+                )
+                val curTotalDurationMs = ((curTotalTicks.toLong() * 1000L) / latestFps).coerceAtLeast(1000L / latestFps)
+                if (curTotalTicks <= 1 && !latest.isLooping) {
                     pausePlayback()
                     break
                 }
-                val next = if (isAtEnd) 0 else latest.currentFrameIndex + 1
-                if (isAtEnd && latest.isLooping) {
-                    val loopAudio = latest.project.mediaAssets.firstOrNull { it.type == "audio" }
-                    if (loopAudio != null && loopAudio.uriString.isNotBlank()) {
-                        MediaAssetManager.seekAudio(0)
+
+                val nowWall = System.currentTimeMillis()
+                val elapsed = (nowWall - lastWallMs).coerceIn(1L, 120L)
+                lastWallMs = nowWall
+                simTimeMs += elapsed
+
+                if (simTimeMs >= curTotalDurationMs) {
+                    if (!latest.isLooping) {
+                        val endTick = (curTotalTicks - 1).coerceAtLeast(0)
+                        val endFrame = TimelineTrackEngine.resolvePreferredFrameIndexAtTick(
+                            latest.project,
+                            latest.activeLayerIndex,
+                            endTick,
+                            latest.currentFrameIndex
+                        )
+                        _uiState.update { s ->
+                            s.copy(
+                                currentTimelineTick = endTick,
+                                currentFrameIndex = endFrame,
+                                playbackTimeMs = null
+                            )
+                        }
+                        pausePlayback()
+                        break
+                    } else {
+                        simTimeMs %= curTotalDurationMs
+                        val loopAudio = latest.project.mediaAssets.firstOrNull { it.type == "audio" }
+                        if (loopAudio != null && loopAudio.uriString.isNotBlank()) {
+                            MediaAssetManager.seekAudio(0)
+                        }
                     }
                 }
-                _uiState.update { s -> s.copy(currentFrameIndex = next) }
+
+                val nextTick = TimelineTrackEngine.timeMsToTickFloat(simTimeMs, latestFps)
+                    .toInt()
+                    .coerceIn(0, (curTotalTicks - 1).coerceAtLeast(0))
+                val nextFrame = TimelineTrackEngine.resolvePreferredFrameIndexAtTick(
+                    latest.project,
+                    latest.activeLayerIndex,
+                    nextTick,
+                    latest.currentFrameIndex
+                )
+                _uiState.update { s ->
+                    s.copy(
+                        currentTimelineTick = nextTick,
+                        currentFrameIndex = nextFrame,
+                        playbackTimeMs = simTimeMs
+                    )
+                }
             }
         }
     }
@@ -4457,7 +4743,7 @@ class KodanimaViewModel : ViewModel() {
         playbackJob?.cancel()
         MediaAssetManager.pauseAudio()
         MediaAssetManager.endAudioScrub()
-        _uiState.update { it.copy(isPlaying = false, activeScrubTimeMs = null) }
+        _uiState.update { it.copy(isPlaying = false, activeScrubTimeMs = null, playbackTimeMs = null) }
     }
 
     fun toggleLoop() {
@@ -4898,10 +5184,11 @@ class KodanimaViewModel : ViewModel() {
         frameIndex: Int,
         outW: Int,
         outH: Int,
-        cropToCamera: Boolean
+        cropToCamera: Boolean,
+        tickFloat: Float = frameIndex.toFloat()
     ): Bitmap {
         val useCam = cropToCamera && proj.camera3D.isEnabled
-        if (useCam || proj.camera3D.postEffects.hasAnyEffect()) {
+        if (useCam || proj.camera3D.postEffects.hasAnyEffect() || proj.canvasBackground.show3DInCanvas) {
             val bmp = KodanimaBitmapPool.acquire(outW, outH, Bitmap.Config.ARGB_8888, android.graphics.Color.TRANSPARENT)
             Camera3DEngine.renderFrameWithCameraAndEffects(
                 frame = frame,
@@ -4912,7 +5199,9 @@ class KodanimaViewModel : ViewModel() {
                 targetBitmap = bmp,
                 cropToCamera = useCam,
                 background = proj.canvasBackground,
-                renderTransparentAsSky = false
+                renderTransparentAsSky = false,
+                tickFloat = tickFloat,
+                fps = proj.fps
             )
             return bmp
         }
@@ -4926,7 +5215,7 @@ class KodanimaViewModel : ViewModel() {
 
     fun exportToGif(context: Context) {
         viewModelScope.launch {
-            _uiState.update { it.copy(exportState = ExportState.Progress("Renderizando quadros com motor Vulkan/OpenGL...", 0.2f)) }
+            _uiState.update { it.copy(exportState = ExportState.Progress("Renderizando quadros com motor gráfico...", 0.2f)) }
             try {
                 val stateNow = _uiState.value
                 val proj = stateNow.project
@@ -4935,17 +5224,30 @@ class KodanimaViewModel : ViewModel() {
                 val baseH = if (cropToCam) proj.camera3D.captureHeight else proj.resolution.height
                 val w = min(640, baseW).coerceAtLeast(64)
                 val h = ((w.toLong() * baseH) / baseW.coerceAtLeast(1)).toInt().coerceAtLeast(64)
+                val hasDecoupledTiming = proj.frames.any { f -> f.layers.any { it.celHoldTicks != null || it.celStartTick != null } }
 
                 val gifBytes = withContext(KodanimaDispatchers.backgroundRender) {
                     val framePairs = ArrayList<Pair<Bitmap, Int>>(proj.frames.size)
                     try {
-                        val total = max(1, proj.frames.size)
-                        for (i in proj.frames.indices) {
-                            val frame = proj.frames[i]
-                            val bmp = renderExportFrameBitmap(proj, frame, i, w, h, cropToCam)
-                            framePairs.add(bmp to max(1, frame.holdFrames))
-                            _uiState.update {
-                                it.copy(exportState = ExportState.Progress("Renderizando quadros: ${i + 1}/$total", 0.2f + 0.4f * (i / total.toFloat())))
+                        if (cropToCam || proj.camera3D.postEffects.hasAnyEffect() || proj.canvasBackground.show3DInCanvas || hasDecoupledTiming) {
+                            val totalTicks = TimelineTrackEngine.computeTotalTicks(proj, includeCameraRunway = cropToCam)
+                            for (tick in 0 until totalTicks) {
+                                val composed = TimelineTrackEngine.composeFrameAtTick(proj, tick, 0, 0)
+                                val bmp = renderExportFrameBitmap(proj, composed, tick, w, h, cropToCam, tick.toFloat())
+                                framePairs.add(bmp to 1)
+                                _uiState.update {
+                                    it.copy(exportState = ExportState.Progress("Renderizando quadros: ${tick + 1}/$totalTicks", 0.2f + 0.4f * (tick / totalTicks.toFloat())))
+                                }
+                            }
+                        } else {
+                            val total = max(1, proj.frames.size)
+                            for (i in proj.frames.indices) {
+                                val frame = proj.frames[i]
+                                val bmp = renderExportFrameBitmap(proj, frame, i, w, h, false, i.toFloat())
+                                framePairs.add(bmp to max(1, frame.holdFrames))
+                                _uiState.update {
+                                    it.copy(exportState = ExportState.Progress("Renderizando quadros: ${i + 1}/$total", 0.2f + 0.4f * (i / total.toFloat())))
+                                }
                             }
                         }
                         _uiState.update { it.copy(exportState = ExportState.Progress("Codificando arquivo GIF...", 0.7f)) }
@@ -4984,7 +5286,7 @@ class KodanimaViewModel : ViewModel() {
                 val pngBytes = withContext(KodanimaDispatchers.backgroundRender) {
                     var sheetBmp: Bitmap? = null
                     try {
-                        sheetBmp = if (!cropToCam) {
+                        sheetBmp = if (!cropToCam && !proj.canvasBackground.show3DInCanvas) {
                             KodanimaGraphicsEngine.generateSpriteSheet(
                                 proj.frames,
                                 cellW,
@@ -4997,13 +5299,13 @@ class KodanimaViewModel : ViewModel() {
                             val rows = ((proj.frames.size + cols - 1) / cols).coerceAtLeast(1)
                             val bmp = Bitmap.createBitmap(cellW * cols, cellH * rows, Bitmap.Config.ARGB_8888)
                             val c = android.graphics.Canvas(bmp)
-                            if (proj.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE) {
+                            if (proj.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE && !proj.canvasBackground.show3DInCanvas) {
                                 c.drawColor(android.graphics.Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
                             } else {
                                 c.drawColor(proj.canvasBackground.primaryColor.toInt())
                             }
                             for (i in proj.frames.indices) {
-                                val cellBmp = renderExportFrameBitmap(proj, proj.frames[i], i, cellW, cellH, true)
+                                val cellBmp = renderExportFrameBitmap(proj, proj.frames[i], i, cellW, cellH, cropToCam)
                                 val col = i % cols
                                 val row = i / cols
                                 c.drawBitmap(cellBmp, (col * cellW).toFloat(), (row * cellH).toFloat(), null)
@@ -5335,13 +5637,28 @@ class KodanimaViewModel : ViewModel() {
         _uiState.update { state ->
             saveCurrentFrameTargetPreference(state)
             val currFrame = state.project.frames[state.currentFrameIndex]
-            val newFrame = Frame(layers = currFrame.layers.map { it.copy(id = UUID.randomUUID().toString(), strokes = emptyList()) })
+            val hasDecoupledTiming = state.project.frames.any { f ->
+                f.layers.any { it.celHoldTicks != null || it.celStartTick != null }
+            }
+            val newFrame = Frame(
+                layers = currFrame.layers.mapIndexed { idx, l ->
+                    l.copy(
+                        id = UUID.randomUUID().toString(),
+                        strokes = emptyList(),
+                        celHoldTicks = if (hasDecoupledTiming) (if (idx == state.activeLayerIndex) 1 else 0) else null,
+                        celStartTick = null
+                    )
+                }
+            )
             val updated = state.project.frames.toMutableList()
             val insertIdx = (state.currentFrameIndex + 1).coerceAtMost(updated.size)
             updated.add(insertIdx, newFrame)
+            val updatedProj = state.project.copy(frames = updated, updatedAt = System.currentTimeMillis())
+            val nextTick = TimelineTrackEngine.computeCelStartTick(updatedProj, state.activeLayerIndex, insertIdx)
             state.copy(
-                project = state.project.copy(frames = updated, updatedAt = System.currentTimeMillis()),
+                project = updatedProj,
                 currentFrameIndex = insertIdx,
+                currentTimelineTick = nextTick,
                 activeLocalLayerIndex = 0,
                 activeTargetIsFrameLocalLayer = false
             )
@@ -5877,23 +6194,59 @@ class KodanimaViewModel : ViewModel() {
         }
     }
 
+    fun toggleShow3DInCanvas() {
+        _uiState.update { state ->
+            val curBg = state.project.canvasBackground
+            val nextEnabled = !curBg.show3DInCanvas
+            val modeLabel = curBg.canvas3DRenderMode.labelPt
+            state.copy(
+                project = state.project.copy(
+                    canvasBackground = curBg.copy(show3DInCanvas = nextEnabled),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = if (nextEnabled) {
+                    "Fundo 3D no Canvas ativado ($modeLabel)."
+                } else {
+                    "Fundo 3D no Canvas desativado."
+                }
+            )
+        }
+    }
+
+    fun setCanvas3DBackgroundRenderMode(mode: Canvas3DBackgroundRenderMode) {
+        _uiState.update { state ->
+            val curBg = state.project.canvasBackground
+            state.copy(
+                project = state.project.copy(
+                    canvasBackground = curBg.copy(
+                        show3DInCanvas = true,
+                        canvas3DRenderMode = mode
+                    ),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Modo 3D no Canvas: ${mode.labelPt} — ${mode.descPt}"
+            )
+        }
+    }
+
     fun updateCameraAtCurrentFrame(transform: (Camera3DKeyframe) -> Camera3DKeyframe) {
         _uiState.update { state ->
-            val frameIdx = state.currentFrameIndex
+            val tickIdx = state.currentTimelineTick.coerceAtLeast(0)
             val cam = state.project.camera3D
-            val baseKf = Camera3DEngine.evaluateCameraAtFrame(cam, frameIdx).copy(frameIndex = frameIdx)
+            val baseKf = Camera3DEngine.evaluateCameraAtFrame(cam, tickIdx).copy(frameIndex = tickIdx)
             val editedKf = transform(baseKf).let {
                 it.copy(
-                    frameIndex = frameIdx,
+                    frameIndex = tickIdx,
                     zoom = it.zoom.coerceIn(0.25f, 6.0f),
                     pitchX = it.pitchX.coerceIn(-45f, 45f),
                     yawY = it.yawY.coerceIn(-45f, 45f),
                     rotationZ = it.rotationZ.coerceIn(-180f, 180f),
                     depthSeparation = it.depthSeparation.coerceIn(0f, 140f),
-                    fovDegrees = it.fovDegrees.coerceIn(18f, 120f)
+                    fovDegrees = it.fovDegrees.coerceIn(18f, 120f),
+                    holdTicks = it.holdTicks.coerceIn(1, 240)
                 )
             }
-            val updatedList = (cam.keyframes.filterNot { it.frameIndex == frameIdx } + editedKf)
+            val updatedList = (cam.keyframes.filterNot { it.frameIndex == tickIdx } + editedKf)
                 .sortedBy { it.frameIndex }
             state.copy(
                 project = state.project.copy(
@@ -5908,8 +6261,8 @@ class KodanimaViewModel : ViewModel() {
         updateCameraAtCurrentFrame { kf ->
             if (easing != null) kf.copy(easing = easing) else kf
         }
-        val frameNum = _uiState.value.currentFrameIndex + 1
-        _uiState.update { it.copy(statusMessage = "Keyframe de câmera salvo no quadro $frameNum!") }
+        val tickNum = _uiState.value.currentTimelineTick + 1
+        _uiState.update { it.copy(statusMessage = "Keyframe de câmera salvo em T$tickNum!") }
     }
 
     fun setCameraFov(fovDegrees: Float) {
@@ -5958,18 +6311,15 @@ class KodanimaViewModel : ViewModel() {
                 fovDegrees = 50f
             )
         }
-        _uiState.update { it.copy(statusMessage = "Câmera zerada neste quadro.") }
+        _uiState.update { it.copy(statusMessage = "Câmera zerada neste ponto da linha do tempo.") }
     }
 
     fun connectTwoCameraKeyframes() {
         _uiState.update { state ->
             val proj = state.project
-            val total = proj.frames.size
-            if (total < 2) {
-                return@update state.copy(statusMessage = "Adicione pelo menos 2 quadros na linha do tempo para interpolar!")
-            }
+            val totalTicks = max(TimelineTrackEngine.computeTotalTicks(proj, includeCameraRunway = true), proj.frames.size).coerceAtLeast(2)
             val cam = proj.camera3D
-            val cur = state.currentFrameIndex.coerceIn(0, total - 1)
+            val cur = state.currentTimelineTick.coerceIn(0, totalTicks - 1)
             val sorted = cam.keyframes.sortedBy { it.frameIndex }.toMutableList()
             if (sorted.isEmpty()) {
                 sorted.add(Camera3DKeyframe(frameIndex = 0, depthSeparation = cam.layerDepthSpacing))
@@ -5979,7 +6329,7 @@ class KodanimaViewModel : ViewModel() {
                 sorted.add(evalCur)
             }
             if (sorted.size < 2) {
-                val targetEnd = if (cur == 0) total - 1 else 0
+                val targetEnd = if (cur == 0) totalTicks - 1 else 0
                 val baseFirst = sorted.first()
                 sorted.add(
                     baseFirst.copy(
@@ -5998,23 +6348,133 @@ class KodanimaViewModel : ViewModel() {
                     ),
                     updatedAt = System.currentTimeMillis()
                 ),
-                statusMessage = "${finalKfs.size} keyframes conectados com interpolação automática!"
+                statusMessage = "${finalKfs.size} keyframes conectados com interpolação suave!"
             )
         }
     }
 
+    /**
+     * Applies (or removes via [CameraEasingCurve.DEGRAU]) an interpolation curve directly between
+     * two timeline points [tickA] and [tickB] on the currently selected stage target (Camera, Layer, or 3D Object).
+     * Automatically ensures anchor keyframes exist at both endpoints without losing evaluated framing.
+     */
+    fun applyTweenBetweenTwoPoints(tickA: Int, tickB: Int, easing: CameraEasingCurve) {
+        val safeA = min(tickA, tickB).coerceAtLeast(0)
+        val safeB = max(tickA, tickB).coerceAtLeast(safeA)
+        if (safeA == safeB) {
+            goToTimelineTick(safeA)
+            addOrUpdateSelectedTargetKeyframe(easing)
+            return
+        }
+        _uiState.update { state ->
+            val proj = state.project
+            val cam = proj.camera3D
+            val sel = state.stageSelection
+            val nextCam = when (sel.type) {
+                StageTargetType.CAMERA -> {
+                    val startBase = cam.keyframes.firstOrNull { it.frameIndex == safeA }
+                        ?: Camera3DEngine.evaluateCameraAtTick(cam, safeA.toFloat()).copy(frameIndex = safeA)
+                    val endBase = cam.keyframes.firstOrNull { it.frameIndex == safeB }
+                        ?: Camera3DEngine.evaluateCameraAtTick(cam, safeB.toFloat()).copy(frameIndex = safeB)
+                    val startUpdated = startBase.copy(
+                        frameIndex = safeA,
+                        easing = easing,
+                        holdTicks = if (easing == CameraEasingCurve.DEGRAU) startBase.holdTicks else 1
+                    )
+                    val endUpdated = endBase.copy(frameIndex = safeB)
+                    val merged = (cam.keyframes.filterNot { it.frameIndex == safeA || it.frameIndex == safeB } +
+                        startUpdated + endUpdated).sortedBy { it.frameIndex }
+                    cam.copy(
+                        isEnabled = true,
+                        autoInterpolate = true,
+                        keyframes = merged
+                    )
+                }
+                StageTargetType.OBJECT_3D -> {
+                    val updatedObjs = cam.scene3DObjects.map { obj ->
+                        if (obj.id != sel.id) obj
+                        else {
+                            val startBase = obj.keyframes.firstOrNull { it.frameIndex == safeA }
+                                ?: Camera3DEngine.evaluateObjectTransformAtTick(obj.keyframes, safeA.toFloat(), cam.autoInterpolate)
+                                    .copy(frameIndex = safeA)
+                            val endBase = obj.keyframes.firstOrNull { it.frameIndex == safeB }
+                                ?: Camera3DEngine.evaluateObjectTransformAtTick(obj.keyframes, safeB.toFloat(), cam.autoInterpolate)
+                                    .copy(frameIndex = safeB)
+                            val startUpdated = startBase.copy(
+                                frameIndex = safeA,
+                                easing = easing,
+                                holdTicks = if (easing == CameraEasingCurve.DEGRAU) startBase.holdTicks else 1
+                            )
+                            val endUpdated = endBase.copy(frameIndex = safeB)
+                            val merged = (obj.keyframes.filterNot { it.frameIndex == safeA || it.frameIndex == safeB } +
+                                startUpdated + endUpdated).sortedBy { it.frameIndex }
+                            obj.copy(keyframes = merged)
+                        }
+                    }
+                    cam.copy(isEnabled = true, autoInterpolate = true, scene3DObjects = updatedObjs)
+                }
+                StageTargetType.LAYER -> {
+                    val curKfs = cam.layerTransformTracks.firstOrNull { it.layerId == sel.id }?.keyframes ?: emptyList()
+                    val startBase = curKfs.firstOrNull { it.frameIndex == safeA }
+                        ?: Camera3DEngine.evaluateObjectTransformAtTick(curKfs, safeA.toFloat(), cam.autoInterpolate)
+                            .copy(frameIndex = safeA)
+                    val endBase = curKfs.firstOrNull { it.frameIndex == safeB }
+                        ?: Camera3DEngine.evaluateObjectTransformAtTick(curKfs, safeB.toFloat(), cam.autoInterpolate)
+                            .copy(frameIndex = safeB)
+                    val startUpdated = startBase.copy(
+                        frameIndex = safeA,
+                        easing = easing,
+                        holdTicks = if (easing == CameraEasingCurve.DEGRAU) startBase.holdTicks else 1
+                    )
+                    val endUpdated = endBase.copy(frameIndex = safeB)
+                    val merged = (curKfs.filterNot { it.frameIndex == safeA || it.frameIndex == safeB } +
+                        startUpdated + endUpdated).sortedBy { it.frameIndex }
+                    val updatedTrack = LayerTransformTrack(layerId = sel.id, keyframes = merged)
+                    val updatedTracks = cam.layerTransformTracks.filterNot { it.layerId == sel.id } + updatedTrack
+                    cam.copy(isEnabled = true, autoInterpolate = true, layerTransformTracks = updatedTracks)
+                }
+            }
+            val msg = if (easing == CameraEasingCurve.DEGRAU) {
+                "Interpolação removida entre T${safeA + 1} e T${safeB + 1}."
+            } else {
+                "Interpolação '${easing.labelPt}' entre T${safeA + 1} e T${safeB + 1}!"
+            }
+            state.copy(
+                project = proj.copy(camera3D = nextCam, updatedAt = System.currentTimeMillis()),
+                statusMessage = msg
+            )
+        }
+    }
+
+    fun addSelectedTargetKeyframeAtTick(tick: Int, easing: CameraEasingCurve? = null) {
+        goToTimelineTick(tick.coerceAtLeast(0))
+        addOrUpdateSelectedTargetKeyframe(easing)
+    }
+
     fun jumpToPrevCameraKeyframe() {
         val state = _uiState.value
-        val cur = state.currentFrameIndex
-        val prev = state.project.camera3D.keyframes.map { it.frameIndex }.filter { it < cur }.maxOrNull()
-        if (prev != null) goToFrame(prev)
+        val cur = state.currentTimelineTick
+        val sel = state.stageSelection
+        val keys = when (sel.type) {
+            StageTargetType.CAMERA -> state.project.camera3D.keyframes.map { it.frameIndex }
+            StageTargetType.OBJECT_3D -> state.project.camera3D.scene3DObjects.firstOrNull { it.id == sel.id }?.keyframes?.map { it.frameIndex } ?: emptyList()
+            StageTargetType.LAYER -> state.project.camera3D.layerTransformTracks.firstOrNull { it.layerId == sel.id }?.keyframes?.map { it.frameIndex } ?: emptyList()
+        }
+        val prev = keys.filter { it < cur }.maxOrNull()
+        if (prev != null) goToTimelineTick(prev)
     }
 
     fun jumpToNextCameraKeyframe() {
         val state = _uiState.value
-        val cur = state.currentFrameIndex
-        val next = state.project.camera3D.keyframes.map { it.frameIndex }.filter { it > cur }.minOrNull()
-        if (next != null) goToFrame(next)
+        val cur = state.currentTimelineTick
+        val sel = state.stageSelection
+        val keys = when (sel.type) {
+            StageTargetType.CAMERA -> state.project.camera3D.keyframes.map { it.frameIndex }
+            StageTargetType.OBJECT_3D -> state.project.camera3D.scene3DObjects.firstOrNull { it.id == sel.id }?.keyframes?.map { it.frameIndex } ?: emptyList()
+            StageTargetType.LAYER -> state.project.camera3D.layerTransformTracks.firstOrNull { it.layerId == sel.id }?.keyframes?.map { it.frameIndex } ?: emptyList()
+        }
+        val next = keys.filter { it > cur }.minOrNull()
+        if (next != null) goToTimelineTick(next)
     }
 
     fun deleteCameraKeyframeAt(frameIndex: Int) {
@@ -6026,7 +6486,7 @@ class KodanimaViewModel : ViewModel() {
                     camera3D = cam.copy(keyframes = remaining),
                     updatedAt = System.currentTimeMillis()
                 ),
-                statusMessage = "Keyframe removido do quadro ${frameIndex + 1}."
+                statusMessage = "Keyframe removido de T${frameIndex + 1}."
             )
         }
     }
@@ -6035,9 +6495,10 @@ class KodanimaViewModel : ViewModel() {
         _uiState.update { state ->
             val proj = state.project
             val cam = proj.camera3D
+            val totalTicks = TimelineTrackEngine.computeTotalTicks(proj, includeCameraRunway = true).coerceAtLeast(2)
             val generated = Camera3DEngine.buildBuiltInEffectKeyframes(
                 effect = effect,
-                totalFrames = proj.frames.size,
+                totalFrames = totalTicks,
                 projectWidth = proj.resolution.width,
                 projectHeight = proj.resolution.height,
                 depthSpacing = cam.layerDepthSpacing
@@ -6141,7 +6602,7 @@ class KodanimaViewModel : ViewModel() {
     fun applyCameraTemplateFromFolder(template: CameraPresetTemplate) {
         _uiState.update { state ->
             val proj = state.project
-            val maxIdx = (proj.frames.size - 1).coerceAtLeast(0)
+            val maxIdx = max(proj.frames.lastIndex, TimelineTrackEngine.computeTotalTicks(proj, true) - 1).coerceAtLeast(1)
             val remappedKfs = if (template.keyframes.isEmpty()) {
                 listOf(Camera3DKeyframe(frameIndex = 0))
             } else {
@@ -6216,7 +6677,7 @@ class KodanimaViewModel : ViewModel() {
     ) {
         _uiState.update { state ->
             val proj = state.project
-            val maxIdx = (proj.frames.size - 1).coerceAtLeast(1)
+            val maxIdx = max(proj.frames.lastIndex, TimelineTrackEngine.computeTotalTicks(proj, true) - 1).coerceAtLeast(1)
             val sF = min(startFrame, endFrame).coerceIn(0, maxIdx)
             val eF = max(startFrame, endFrame).coerceIn(0, maxIdx).let {
                 if (it <= sF) (sF + 1).coerceAtMost(maxIdx) else it
@@ -6251,7 +6712,7 @@ class KodanimaViewModel : ViewModel() {
                     ),
                     updatedAt = System.currentTimeMillis()
                 ),
-                statusMessage = "Efeito '${effect.labelPt}' aplicado dos quadros ${sF + 1} até ${eF + 1}!"
+                statusMessage = "Efeito '${effect.labelPt}' aplicado de T${sF + 1} até T${eF + 1}!"
             )
         }
     }
@@ -6274,5 +6735,452 @@ class KodanimaViewModel : ViewModel() {
             prefs.copy(savedCameraTemplates = prefs.savedCameraTemplates.filterNot { it.id == templateId })
         }
         _uiState.update { it.copy(statusMessage = "Predefinição removida da Pasta Animada.") }
+    }
+
+    fun setCameraViewportNavTarget(target: CameraViewportNavTarget) {
+        _uiState.update {
+            it.copy(
+                cameraViewportNavTarget = target,
+                statusMessage = if (target == CameraViewportNavTarget.CAMERA) {
+                    "Modo 2D: movimentando Câmera"
+                } else {
+                    "Modo 2D: navegando livremente pelo Canvas"
+                }
+            )
+        }
+    }
+
+    fun toggleCameraViewportNavTarget() {
+        val next = if (_uiState.value.cameraViewportNavTarget == CameraViewportNavTarget.CAMERA) {
+            CameraViewportNavTarget.CANVAS
+        } else {
+            CameraViewportNavTarget.CAMERA
+        }
+        setCameraViewportNavTarget(next)
+    }
+
+    fun selectStageTarget(selection: StageSelection) {
+        _uiState.update { it.copy(stageSelection = selection) }
+    }
+
+    fun focusSelectedStageTarget() {
+        _uiState.update {
+            it.copy(
+                stageFocusRequestNonce = it.stageFocusRequestNonce + 1,
+                statusMessage = "Focando elemento selecionado no Palco 3D."
+            )
+        }
+    }
+
+    fun setCameraKeyframeHold(tickIndex: Int, holdTicks: Int) {
+        val safeHold = holdTicks.coerceIn(1, 240)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val existing = cam.keyframes.firstOrNull { it.frameIndex == tickIndex } ?: return@update state
+            val updated = (cam.keyframes.filterNot { it.frameIndex == tickIndex } + existing.copy(holdTicks = safeHold))
+                .sortedBy { it.frameIndex }
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(keyframes = updated),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun setSelectedTargetKeyframeHold(tickIndex: Int, holdTicks: Int) {
+        val sel = _uiState.value.stageSelection
+        if (sel.type == StageTargetType.CAMERA) {
+            setCameraKeyframeHold(tickIndex, holdTicks)
+            return
+        }
+        val safeHold = holdTicks.coerceIn(1, 240)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val nextCam = when (sel.type) {
+                StageTargetType.OBJECT_3D -> {
+                    val objs = cam.scene3DObjects.map { obj ->
+                        if (obj.id != sel.id) obj
+                        else {
+                            val src = obj.keyframes.firstOrNull { it.frameIndex == tickIndex } ?: return@map obj
+                            val nextKfs = (obj.keyframes.filterNot { it.frameIndex == tickIndex } + src.copy(holdTicks = safeHold))
+                                .sortedBy { it.frameIndex }
+                            obj.copy(keyframes = nextKfs)
+                        }
+                    }
+                    cam.copy(scene3DObjects = objs)
+                }
+                StageTargetType.LAYER -> {
+                    val tracks = cam.layerTransformTracks.map { tr ->
+                        if (tr.layerId != sel.id) tr
+                        else {
+                            val src = tr.keyframes.firstOrNull { it.frameIndex == tickIndex } ?: return@map tr
+                            val nextKfs = (tr.keyframes.filterNot { it.frameIndex == tickIndex } + src.copy(holdTicks = safeHold))
+                                .sortedBy { it.frameIndex }
+                            tr.copy(keyframes = nextKfs)
+                        }
+                    }
+                    cam.copy(layerTransformTracks = tracks)
+                }
+                StageTargetType.CAMERA -> cam
+            }
+            state.copy(project = state.project.copy(camera3D = nextCam, updatedAt = System.currentTimeMillis()))
+        }
+    }
+
+    fun moveCameraKeyframe(fromFrame: Int, toFrame: Int) {
+        if (fromFrame == toFrame) return
+        _uiState.update { state ->
+            val maxTick = maxOf(
+                state.project.frames.lastIndex,
+                TimelineTrackEngine.computeTotalTicks(state.project, includeCameraRunway = true) + 48,
+                toFrame
+            ).coerceAtLeast(0)
+            val safeTo = toFrame.coerceIn(0, maxTick)
+            if (safeTo == fromFrame) return@update state
+            val cam = state.project.camera3D
+            val source = cam.keyframes.firstOrNull { it.frameIndex == fromFrame } ?: return@update state
+            val moved = source.copy(frameIndex = safeTo)
+            val updated = (cam.keyframes.filterNot { it.frameIndex == fromFrame || it.frameIndex == safeTo } + moved)
+                .sortedBy { it.frameIndex }
+            val syncedFrame = TimelineTrackEngine.resolvePreferredFrameIndexAtTick(
+                state.project,
+                state.activeLayerIndex,
+                safeTo,
+                state.currentFrameIndex
+            )
+            state.copy(
+                currentTimelineTick = safeTo,
+                currentFrameIndex = syncedFrame,
+                project = state.project.copy(
+                    camera3D = cam.copy(keyframes = updated),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Chave movida de T${fromFrame + 1} para T${safeTo + 1}."
+            )
+        }
+    }
+
+    fun moveSelectedTargetKeyframe(fromFrame: Int, toFrame: Int) {
+        val sel = _uiState.value.stageSelection
+        if (sel.type == StageTargetType.CAMERA) {
+            moveCameraKeyframe(fromFrame, toFrame)
+            return
+        }
+        if (fromFrame == toFrame) return
+        _uiState.update { state ->
+            val maxTick = maxOf(
+                state.project.frames.lastIndex,
+                TimelineTrackEngine.computeTotalTicks(state.project, includeCameraRunway = true) + 48,
+                toFrame
+            ).coerceAtLeast(0)
+            val safeTo = toFrame.coerceIn(0, maxTick)
+            if (safeTo == fromFrame) return@update state
+            val cam = state.project.camera3D
+            val nextCam = when (sel.type) {
+                StageTargetType.OBJECT_3D -> {
+                    val objs = cam.scene3DObjects.map { obj ->
+                        if (obj.id != sel.id) obj
+                        else {
+                            val src = obj.keyframes.firstOrNull { it.frameIndex == fromFrame } ?: return@map obj
+                            val nextKfs = (obj.keyframes.filterNot { it.frameIndex == fromFrame || it.frameIndex == safeTo } + src.copy(frameIndex = safeTo))
+                                .sortedBy { it.frameIndex }
+                            obj.copy(keyframes = nextKfs)
+                        }
+                    }
+                    cam.copy(scene3DObjects = objs)
+                }
+                StageTargetType.LAYER -> {
+                    val tracks = cam.layerTransformTracks.map { tr ->
+                        if (tr.layerId != sel.id) tr
+                        else {
+                            val src = tr.keyframes.firstOrNull { it.frameIndex == fromFrame } ?: return@map tr
+                            val nextKfs = (tr.keyframes.filterNot { it.frameIndex == fromFrame || it.frameIndex == safeTo } + src.copy(frameIndex = safeTo))
+                                .sortedBy { it.frameIndex }
+                            tr.copy(keyframes = nextKfs)
+                        }
+                    }
+                    cam.copy(layerTransformTracks = tracks)
+                }
+                StageTargetType.CAMERA -> cam
+            }
+            val syncedFrame = TimelineTrackEngine.resolvePreferredFrameIndexAtTick(
+                state.project,
+                state.activeLayerIndex,
+                safeTo,
+                state.currentFrameIndex
+            )
+            state.copy(
+                currentTimelineTick = safeTo,
+                currentFrameIndex = syncedFrame,
+                project = state.project.copy(camera3D = nextCam, updatedAt = System.currentTimeMillis()),
+                statusMessage = "Chave do elemento movida de T${fromFrame + 1} para T${safeTo + 1}."
+            )
+        }
+    }
+
+    fun updateSelectedObjectTransform(transform: (ObjectTransformKeyframe) -> ObjectTransformKeyframe) {
+        val sel = _uiState.value.stageSelection
+        if (sel.type == StageTargetType.CAMERA) return
+        _uiState.update { state ->
+            val tickIdx = state.currentTimelineTick.coerceAtLeast(0)
+            val cam = state.project.camera3D
+            val nextCam = when (sel.type) {
+                StageTargetType.OBJECT_3D -> {
+                    val updatedObjs = cam.scene3DObjects.map { obj ->
+                        if (obj.id != sel.id) obj
+                        else {
+                            val base = Camera3DEngine.evaluateObjectTransformAtFrame(obj.keyframes, tickIdx, cam.autoInterpolate)
+                                .copy(frameIndex = tickIdx)
+                            val edited = transform(base).let {
+                                it.copy(
+                                    frameIndex = tickIdx,
+                                    scaleX = it.scaleX.coerceIn(0.05f, 20f),
+                                    scaleY = it.scaleY.coerceIn(0.05f, 20f),
+                                    scaleZ = it.scaleZ.coerceIn(0.05f, 20f),
+                                    opacity = it.opacity.coerceIn(0f, 1f),
+                                    holdTicks = it.holdTicks.coerceIn(1, 240)
+                                )
+                            }
+                            val kfs = (obj.keyframes.filterNot { it.frameIndex == tickIdx } + edited)
+                                .sortedBy { it.frameIndex }
+                            obj.copy(keyframes = kfs)
+                        }
+                    }
+                    cam.copy(isEnabled = true, scene3DObjects = updatedObjs)
+                }
+                StageTargetType.LAYER -> {
+                    val existingTrack = cam.layerTransformTracks.firstOrNull { it.layerId == sel.id }
+                    val curKfs = existingTrack?.keyframes ?: emptyList()
+                    val base = Camera3DEngine.evaluateObjectTransformAtFrame(curKfs, tickIdx, cam.autoInterpolate)
+                        .copy(frameIndex = tickIdx)
+                    val edited = transform(base).let {
+                        it.copy(
+                            frameIndex = tickIdx,
+                            scaleX = it.scaleX.coerceIn(0.05f, 20f),
+                            scaleY = it.scaleY.coerceIn(0.05f, 20f),
+                            scaleZ = it.scaleZ.coerceIn(0.05f, 20f),
+                            opacity = it.opacity.coerceIn(0f, 1f),
+                            holdTicks = it.holdTicks.coerceIn(1, 240)
+                        )
+                    }
+                    val nextKfs = (curKfs.filterNot { it.frameIndex == tickIdx } + edited)
+                        .sortedBy { it.frameIndex }
+                    val updatedTrack = LayerTransformTrack(layerId = sel.id, keyframes = nextKfs)
+                    val updatedTracks = (cam.layerTransformTracks.filterNot { it.layerId == sel.id } + updatedTrack)
+                    cam.copy(isEnabled = true, layerTransformTracks = updatedTracks)
+                }
+                StageTargetType.CAMERA -> cam
+            }
+            state.copy(
+                project = state.project.copy(
+                    camera3D = nextCam,
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun applySelectedStageObjectDelta(
+        dx: Float = 0f,
+        dy: Float = 0f,
+        dz: Float = 0f,
+        dRotX: Float = 0f,
+        dRotY: Float = 0f,
+        dRotZ: Float = 0f,
+        scaleFactor: Float = 1f
+    ) {
+        val sel = _uiState.value.stageSelection
+        if (sel.type == StageTargetType.CAMERA) return
+        updateSelectedObjectTransform { cur ->
+            val nextS = if (kotlin.math.abs(scaleFactor - 1f) > 0.0005f) {
+                (cur.scaleX * scaleFactor).coerceIn(0.1f, 12f)
+            } else cur.scaleX
+            val sRatio = if (cur.scaleX > 0.001f) nextS / cur.scaleX else 1f
+            cur.copy(
+                x = (cur.x + dx).coerceIn(-2400f, 2400f),
+                y = (cur.y + dy).coerceIn(-2400f, 2400f),
+                z = (cur.z + dz).coerceIn(-2400f, 2400f),
+                rotX = cur.rotX + dRotX,
+                rotY = cur.rotY + dRotY,
+                rotZ = cur.rotZ + dRotZ,
+                scaleX = (cur.scaleX * sRatio).coerceIn(0.1f, 12f),
+                scaleY = (cur.scaleY * sRatio).coerceIn(0.1f, 12f),
+                scaleZ = (cur.scaleZ * sRatio).coerceIn(0.1f, 12f)
+            )
+        }
+    }
+
+    fun addOrUpdateSelectedTargetKeyframe(easing: CameraEasingCurve? = null) {
+        val sel = _uiState.value.stageSelection
+        if (sel.type == StageTargetType.CAMERA) {
+            addOrUpdateCameraKeyframeAtCurrentFrame(easing)
+            return
+        }
+        updateSelectedObjectTransform { cur ->
+            if (easing != null) cur.copy(easing = easing) else cur
+        }
+        val tickNum = _uiState.value.currentTimelineTick + 1
+        _uiState.update { it.copy(statusMessage = "Chave de transformação salva em T$tickNum!") }
+    }
+
+    fun deleteSelectedTargetKeyframe(frameIndex: Int) {
+        val sel = _uiState.value.stageSelection
+        if (sel.type == StageTargetType.CAMERA) {
+            deleteCameraKeyframeAt(frameIndex)
+            return
+        }
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val nextCam = when (sel.type) {
+                StageTargetType.OBJECT_3D -> {
+                    val objs = cam.scene3DObjects.map { obj ->
+                        if (obj.id != sel.id) obj
+                        else obj.copy(keyframes = obj.keyframes.filterNot { it.frameIndex == frameIndex })
+                    }
+                    cam.copy(scene3DObjects = objs)
+                }
+                StageTargetType.LAYER -> {
+                    val tracks = cam.layerTransformTracks.map { tr ->
+                        if (tr.layerId != sel.id) tr
+                        else tr.copy(keyframes = tr.keyframes.filterNot { it.frameIndex == frameIndex })
+                    }
+                    cam.copy(layerTransformTracks = tracks)
+                }
+                StageTargetType.CAMERA -> cam
+            }
+            state.copy(
+                project = state.project.copy(camera3D = nextCam, updatedAt = System.currentTimeMillis()),
+                statusMessage = "Chave do elemento removida de T${frameIndex + 1}."
+            )
+        }
+    }
+
+    fun resetSelectedObjectTransformAtCurrentFrame() {
+        val sel = _uiState.value.stageSelection
+        if (sel.type == StageTargetType.CAMERA) {
+            resetCameraAtCurrentFrame()
+            return
+        }
+        updateSelectedObjectTransform { cur ->
+            ObjectTransformKeyframe(frameIndex = cur.frameIndex, easing = cur.easing)
+        }
+        _uiState.update { it.copy(statusMessage = "Transformação do elemento zerada neste ponto.") }
+    }
+
+    fun addBuiltIn3DPrimitive(primitive: BuiltIn3DPrimitive) {
+        val (assetPath, sceneData) = Mesh3DImporter.createBuiltInSceneAsset(primitive)
+        val obj = SceneObject3D(
+            name = sceneData.name,
+            meshAssetPath = assetPath,
+            formatTag = "3D",
+            keyframes = listOf(ObjectTransformKeyframe(frameIndex = 0, z = -40f))
+        )
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                stageSelection = StageSelection(StageTargetType.OBJECT_3D, obj.id),
+                stageFocusRequestNonce = state.stageFocusRequestNonce + 1,
+                project = state.project.copy(
+                    camera3D = cam.copy(
+                        isEnabled = true,
+                        cameraMode = CameraMode.MODE_3D,
+                        scene3DObjects = cam.scene3DObjects + obj
+                    ),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "${sceneData.name} adicionado à cena 3D!"
+            )
+        }
+    }
+
+    fun import3DSceneFromUri(context: Context, uri: Uri) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(statusMessage = "Importando cena 3D e texturas UV...") }
+            val imported = withContext(KodanimaDispatchers.networkIo) {
+                runCatching { Mesh3DImporter.importFromUri(context, uri) }.getOrNull()
+            }
+            if (imported == null) {
+                _uiState.update {
+                    it.copy(statusMessage = "Não foi possível ler a cena 3D. Use .glb, .gltf, .obj, .zip (com .mtl/.png), .stl ou .ply.")
+                }
+                return@launch
+            }
+            val (assetPath, sceneData) = imported
+            val fmt = assetPath.substringAfterLast('.', "3D").uppercase().take(6)
+            val newObj = SceneObject3D(
+                name = sceneData.name.ifBlank { "Objeto 3D" },
+                meshAssetPath = assetPath,
+                formatTag = fmt,
+                keyframes = listOf(ObjectTransformKeyframe(frameIndex = 0, z = -40f))
+            )
+            _uiState.update { state ->
+                val cam = state.project.camera3D
+                state.copy(
+                    isCameraSideView3D = true,
+                    stageSelection = StageSelection(StageTargetType.OBJECT_3D, newObj.id),
+                    stageFocusRequestNonce = state.stageFocusRequestNonce + 1,
+                    project = state.project.copy(
+                        camera3D = cam.copy(
+                            isEnabled = true,
+                            cameraMode = CameraMode.MODE_3D,
+                            scene3DObjects = cam.scene3DObjects + newObj
+                        ),
+                        updatedAt = System.currentTimeMillis()
+                    ),
+                    statusMessage = buildString {
+                        append("Cena 3D '${newObj.name}' (${sceneData.totalTriangles} triângulos")
+                        if (sceneData.hasAnimations) {
+                            append(" • ${sceneData.animData?.clips?.size ?: 1} animação(ões)")
+                        }
+                        append(") importada!")
+                    }
+                )
+            }
+        }
+    }
+
+    fun toggleSceneObject3DVisibility(objectId: String) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val objs = cam.scene3DObjects.map { if (it.id == objectId) it.copy(isVisible = !it.isVisible) else it }
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(scene3DObjects = objs),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun deleteSceneObject3D(objectId: String) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val objs = cam.scene3DObjects.filterNot { it.id == objectId }
+            val nextSel = if (state.stageSelection.type == StageTargetType.OBJECT_3D && state.stageSelection.id == objectId) {
+                StageSelection(StageTargetType.CAMERA, "camera")
+            } else state.stageSelection
+            state.copy(
+                stageSelection = nextSel,
+                project = state.project.copy(
+                    camera3D = cam.copy(scene3DObjects = objs),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Objeto 3D removido da cena."
+            )
+        }
+    }
+
+    fun setSceneObject3DTint(objectId: String, colorArgb: Long) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val objs = cam.scene3DObjects.map { if (it.id == objectId) it.copy(colorTint = colorArgb) else it }
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(scene3DObjects = objs),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
     }
 }

@@ -10,6 +10,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
@@ -129,6 +130,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.engine.MediaAssetManager
+import com.example.engine.TimelineTrackEngine
 import com.example.model.AppScreen
 import com.example.model.AppUiMode
 import com.example.model.CameraMode
@@ -260,6 +262,14 @@ fun PcEditorScreen(
         if (uri != null) {
             viewModel.importKritaBrushesFromUri(context, uri)
             Toast.makeText(context, "Importando brush do Krita...", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val scene3DPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.import3DSceneFromUri(context, uri)
         }
     }
 
@@ -423,6 +433,16 @@ fun PcEditorScreen(
                 if (abs(fovDelta) > 0.01f) viewModel.adjustCameraFov(fovDelta)
                 if (abs(dYaw) > 0.01f || abs(dPitch) > 0.01f) viewModel.tiltOrbitCameraBy(dYaw, dPitch)
             },
+            cameraViewportNavTarget = uiState.cameraViewportNavTarget,
+            stageSelection = uiState.stageSelection,
+            stageFocusNonce = uiState.stageFocusRequestNonce,
+            onStageTargetSelected = { viewModel.selectStageTarget(it) },
+            onSelectedStageObjectDelta = { dx, dy, dz, rx, ry, rz, sf ->
+                viewModel.applySelectedStageObjectDelta(dx, dy, dz, rx, ry, rz, sf)
+            },
+            currentTimelineTick = uiState.currentTimelineTick,
+            playbackTimeMs = uiState.playbackTimeMs,
+            isPlaying = uiState.isPlaying,
             theme = currentTheme,
             modifier = Modifier.fillMaxSize()
         )
@@ -436,8 +456,8 @@ fun PcEditorScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            // 2a. Horizontal Krita 12 Brushes + 3-Wheels Toggle to Imported Krita Brushes (original size preserved)
-            if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideBrushBar) {
+            // 2a. Horizontal Krita 12 Brushes + 3-Wheels Toggle to Imported Krita Brushes (hidden during Camera Mode)
+            if (!uiState.isCameraTimelineOpen && (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideBrushBar)) {
                 BrushPresetsBar(
                     activePreset = uiState.activeBrushPreset,
                     onSelectPreset = { viewModel.selectBrushPreset(it) },
@@ -481,7 +501,7 @@ fun PcEditorScreen(
             }
 
             // 2d. Minimalist Fine Eraser Bar (pequena, fina e minimalista)
-            if (uiState.selectedTool == ToolType.ERASER && (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideToolbar)) {
+            if (!uiState.isCameraTimelineOpen && uiState.selectedTool == ToolType.ERASER && (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideToolbar)) {
                 Surface(
                     modifier = Modifier
                         .height(24.dp)
@@ -591,7 +611,7 @@ fun PcEditorScreen(
             }
 
             // 2e. PC Mode Caneta Vetorial Bézier HUD Bar (Confirmar via botão ou Enter)
-            if (uiState.selectedTool == ToolType.BEZIER_PEN &&
+            if (!uiState.isCameraTimelineOpen && uiState.selectedTool == ToolType.BEZIER_PEN &&
                 (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideToolbar)
             ) {
                 Surface(
@@ -701,7 +721,7 @@ fun PcEditorScreen(
             }
 
             // Floating FlipaClip-style Selection Actions Toolbar (when Lasso/MagicWand selection is active)
-            if (uiState.activeSelection.isActive && !uiState.isZenModeActive) {
+            if (!uiState.isCameraTimelineOpen && uiState.activeSelection.isActive && !uiState.isZenModeActive) {
                 Surface(
                     modifier = Modifier
                         .shadow(12.dp, RoundedCornerShape(20.dp))
@@ -793,7 +813,7 @@ fun PcEditorScreen(
 
             // Floating Video Transform HUD (when Transformar Vídeo mode is active)
             val activeVideoAsset = uiState.project.mediaAssets.firstOrNull { it.type == "video" || it.type == "gif" }
-            if (uiState.isVideoTransformMode && activeVideoAsset != null && !uiState.isZenModeActive) {
+            if (!uiState.isCameraTimelineOpen && uiState.isVideoTransformMode && activeVideoAsset != null && !uiState.isZenModeActive) {
                 Surface(
                     modifier = Modifier
                         .shadow(10.dp, RoundedCornerShape(16.dp))
@@ -859,7 +879,7 @@ fun PcEditorScreen(
                 uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers?.getOrNull(uiState.activeLayerIndex)
             } else null
             val activeLayerImgAttachmentPc = activeLayerImageTargetPc?.imageAttachment
-            if (activeLayerImageTargetPc != null && activeLayerImgAttachmentPc != null && !uiState.isZenModeActive) {
+            if (!uiState.isCameraTimelineOpen && activeLayerImageTargetPc != null && activeLayerImgAttachmentPc != null && !uiState.isZenModeActive) {
                 TimelineLayerImageTransformHud(
                     layerName = activeLayerImageTargetPc.name,
                     attachment = activeLayerImgAttachmentPc,
@@ -917,6 +937,9 @@ fun PcEditorScreen(
                     onToggleSideView3D = { viewModel.toggleCameraSideView3D() },
                     onResetCurrentKeyframe = { viewModel.resetCameraAtCurrentFrame() },
                     onCloseCameraMode = { viewModel.closeCameraTimeline() },
+                    cameraViewportNavTarget = uiState.cameraViewportNavTarget,
+                    onToggleViewportNavTarget = { viewModel.toggleCameraViewportNavTarget() },
+                    onFocusSelected = { viewModel.focusSelectedStageTarget() },
                     modifier = Modifier
                         .align(Alignment.CenterStart)
                         .padding(start = 12.dp)
@@ -1073,7 +1096,7 @@ fun PcEditorScreen(
 
             // Floating Brush Studio Configurator Drawer (Nativos / Importados + Loupe Search + Sliders + Save/Reset)
             BrushStudioDrawer(
-                visible = uiState.isBrushStudioOpen && !showExtraToolsMenu && !uiState.isZenModeActive,
+                visible = uiState.isBrushStudioOpen && !showExtraToolsMenu && !uiState.isZenModeActive && !uiState.isCameraTimelineOpen,
                 activePreset = uiState.activeBrushPreset,
                 nativePresets = uiState.nativeBrushPresets,
                 importedPresets = uiState.importedKritaBrushes,
@@ -1143,13 +1166,17 @@ fun PcEditorScreen(
                 onToggleQuickPalette = { viewModel.toggleQuickPalette() },
                 onOpenCameraTimeline = { viewModel.toggleCameraTimeline() },
                 isCameraTimelineOpen = uiState.isCameraTimelineOpen,
+                show3DInCanvas = uiState.project.canvasBackground.show3DInCanvas,
+                canvas3DRenderMode = uiState.project.canvasBackground.canvas3DRenderMode,
+                onToggleShow3DInCanvas = { viewModel.toggleShow3DInCanvas() },
+                onSelectCanvas3DRenderMode = { viewModel.setCanvas3DBackgroundRenderMode(it) },
                 modifier = Modifier
                     .align(Alignment.CenterStart)
                     .padding(start = 62.dp)
             )
 
             // Popover Config. Balde (Expandir px + Pintar por baixo + Camadas Referência)
-            if (uiState.showBucketConfig && !uiState.isZenModeActive) {
+            if (!uiState.isCameraTimelineOpen && uiState.showBucketConfig && !uiState.isZenModeActive) {
                 val currFrameBucketPc = uiState.project.frames.getOrNull(uiState.currentFrameIndex)
                 BucketConfigPopover(
                     config = uiState.bucketConfig,
@@ -1211,7 +1238,8 @@ fun PcEditorScreen(
                 onShowDurationDialog = { showDurationDialog = true },
                 onShowFpsDialog = { showFpsDialog = true },
                 onLaunchAudioPicker = { audioPicker.launch("audio/*") },
-                onLaunchVideoPicker = { videoPicker.launch("video/*") }
+                onLaunchVideoPicker = { videoPicker.launch("video/*") },
+                onLaunchScene3DPicker = { scene3DPicker.launch(arrayOf("*/*")) }
             )
         }
 
@@ -1326,9 +1354,12 @@ private fun BoxScope.PcEditorBottomTimelineSection(
     onShowDurationDialog: () -> Unit,
     onShowFpsDialog: () -> Unit,
     onLaunchAudioPicker: () -> Unit,
-    onLaunchVideoPicker: () -> Unit
+    onLaunchVideoPicker: () -> Unit,
+    onLaunchScene3DPicker: () -> Unit
 ) {
-    var draggingFrameIdx by remember { mutableStateOf<Int?>(null) }
+    var draggingCel by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    var movingCel by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    var liveMoveTick by remember { mutableStateOf<Int?>(null) }
     var snapHoverTick by remember { mutableStateOf<Int?>(null) }
     var liveDraggingHold by remember { mutableStateOf<Int?>(null) }
 
@@ -1381,6 +1412,35 @@ private fun BoxScope.PcEditorBottomTimelineSection(
             onRotateCameraBy = { viewModel.rotateCameraBy(it) },
             onTiltOrbitCameraBy = { dYaw, dPitch -> viewModel.tiltOrbitCameraBy(dYaw, dPitch) },
             onAddFrame = { viewModel.addFrame() },
+            layers = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers ?: emptyList(),
+            stageSelection = uiState.stageSelection,
+            onSelectStageTarget = { viewModel.selectStageTarget(it) },
+            onFocusStageTarget = { viewModel.focusSelectedStageTarget() },
+            onMoveKeyframe = { fromFrame, toFrame -> viewModel.moveSelectedTargetKeyframe(fromFrame, toFrame) },
+            onUpdateSelectedObjectTransform = { viewModel.updateSelectedObjectTransform(it) },
+            onAddOrUpdateSelectedKeyframe = { viewModel.addOrUpdateSelectedTargetKeyframe(it) },
+            onDeleteSelectedKeyframeAt = { viewModel.deleteSelectedTargetKeyframe(it) },
+            onResetSelectedTarget = { viewModel.resetSelectedObjectTransformAtCurrentFrame() },
+            onImport3DSceneClick = onLaunchScene3DPicker,
+            onAddBuiltIn3DPrimitive = { viewModel.addBuiltIn3DPrimitive(it) },
+            onToggle3DObjectVisibility = { viewModel.toggleSceneObject3DVisibility(it) },
+            onDelete3DObject = { viewModel.deleteSceneObject3D(it) },
+            onSet3DObjectTint = { id, tint -> viewModel.setSceneObject3DTint(id, tint) },
+            projectFrames = uiState.project.frames,
+            fps = uiState.project.fps,
+            activeLayerIndex = uiState.activeLayerIndex,
+            currentTimelineTick = uiState.currentTimelineTick,
+            activeScrubTimeMs = uiState.activeScrubTimeMs,
+            playbackTimeMs = uiState.playbackTimeMs,
+            onSelectTick = { viewModel.goToTimelineTick(it) },
+            onScrubToMs = { viewModel.scrubToTimelineMs(it) },
+            onEndScrub = { viewModel.endAudioScrub() },
+            onSetLayerCelHold = { lIdx, fIdx, h -> viewModel.setLayerCelDuration(lIdx, fIdx, h) },
+            onMoveLayerCel = { lIdx, fIdx, tick -> viewModel.moveLayerCelToTick(lIdx, fIdx, tick) },
+            onAddCelAtTick = { lIdx, tick -> viewModel.activateOrAddCelOnLayerAtTick(lIdx, tick) },
+            onSetKeyframeHold = { tickIdx, hold -> viewModel.setSelectedTargetKeyframeHold(tickIdx, hold) },
+            onApplyTweenBetween = { tickA, tickB, curve -> viewModel.applyTweenBetweenTwoPoints(tickA, tickB, curve) },
+            onAddKeyframeAtTick = { tick -> viewModel.addSelectedTargetKeyframeAtTick(tick) },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .then(
@@ -1536,17 +1596,20 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                         }
                     }
 
-                    val activeHold = if (draggingFrameIdx != null && liveDraggingHold != null) {
+                    val activeCel = remember(uiState.project, uiState.activeLayerIndex, uiState.currentTimelineTick) {
+                        TimelineTrackEngine.resolveCelAtTick(uiState.project, uiState.activeLayerIndex, uiState.currentTimelineTick)
+                    }
+                    val activeHold = if (draggingCel?.first == uiState.activeLayerIndex && liveDraggingHold != null) {
                         liveDraggingHold!!
                     } else {
-                        uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.holdFrames ?: 1
+                        activeCel?.durationTicks ?: (uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.holdFrames ?: 1)
                     }
                     val frameDurSec = activeHold.toDouble() / fps
                     Text(
-                        text = "Dur. ${String.format(java.util.Locale.US, "%.3f", frameDurSec)}",
+                        text = "Dur. ${String.format(java.util.Locale.US, "%.3f", frameDurSec)} (${activeHold}q)",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = if (draggingFrameIdx != null) adaptiveCyan else themeText.copy(alpha = 0.88f),
+                        color = if (draggingCel != null) adaptiveCyan else themeText.copy(alpha = 0.88f),
                         modifier = Modifier
                             .clickable { onShowDurationDialog() }
                             .padding(horizontal = 4.dp)
@@ -1589,10 +1652,12 @@ private fun BoxScope.PcEditorBottomTimelineSection(
 
                     Spacer(modifier = Modifier.weight(1f))
 
-                    val totalTicks = uiState.project.frames.sumOf { it.holdFrames.coerceAtLeast(1) }
+                    val totalTicks = remember(uiState.project) {
+                        TimelineTrackEngine.computeTotalTicks(uiState.project, includeCameraRunway = uiState.project.camera3D.isEnabled)
+                    }
                     val totalSecs = totalTicks.toDouble() / fps
                     Text(
-                        text = "Total: ${uiState.project.frames.size} quadros | ${String.format(java.util.Locale.US, "%.3f", totalSecs)} s",
+                        text = "Total: ${uiState.project.frames.size} quadros | ${totalTicks}q (${String.format(java.util.Locale.US, "%.3f", totalSecs)}s)",
                         fontSize = 10.sp,
                         color = themeMuted,
                         modifier = Modifier.padding(horizontal = 4.dp)
@@ -1921,29 +1986,21 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                     }
 
                     val tickWidth = (24 * uiState.timelineZoom).dp
-                    val frameStartTicks = remember(uiState.project.frames) {
-                        val starts = mutableListOf<Int>()
-                        var acc = 0
-                        uiState.project.frames.forEach { f ->
-                            starts.add(acc)
-                            acc += f.holdFrames.coerceAtLeast(1)
-                        }
-                        starts
-                    }
-                    val totalProjectTicks = remember(uiState.project.frames) {
-                        uiState.project.frames.sumOf { it.holdFrames.coerceAtLeast(1) }
+                    val totalProjectTicks = remember(uiState.project) {
+                        TimelineTrackEngine.computeTotalTicks(
+                            uiState.project,
+                            includeCameraRunway = uiState.project.camera3D.isEnabled
+                        )
                     }
                     val numTicks = maxOf(totalProjectTicks + 24, fps * 3, 48)
                     val totalTrackWidth = (numTicks * 24 * uiState.timelineZoom).dp
                     val timelineScrollState = rememberScrollState()
 
                     val density = LocalDensity.current
-                    val playheadTickFloat = if (uiState.activeScrubTimeMs != null) {
-                        ((uiState.activeScrubTimeMs!!.toFloat() / 1000f) * fps).coerceIn(0f, (numTicks - 1).toFloat())
-                    } else {
-                        frameStartTicks.getOrElse(uiState.currentFrameIndex) { 0 }.toFloat()
-                    }
-                    val playheadTickRounded = playheadTickFloat.roundToInt()
+                    val playheadTickFloat = (uiState.activeScrubTimeMs ?: uiState.playbackTimeMs)?.let {
+                        TimelineTrackEngine.timeMsToTickFloat(it, fps).coerceIn(0f, (numTicks - 1).toFloat())
+                    } ?: uiState.currentTimelineTick.toFloat().coerceIn(0f, (numTicks - 1).toFloat())
+                    val playheadTickRounded = kotlin.math.round(playheadTickFloat).toInt()
 
                     Box(
                         modifier = Modifier
@@ -2014,8 +2071,7 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                                             .width(tickWidth)
                                             .fillMaxHeight()
                                             .clickable {
-                                                val targetFrame = frameStartTicks.indexOfLast { it <= t }.coerceAtLeast(0)
-                                                viewModel.selectFrame(targetFrame)
+                                                viewModel.goToTimelineTick(t)
                                             },
                                         horizontalAlignment = Alignment.CenterHorizontally,
                                         verticalArrangement = Arrangement.SpaceBetween
@@ -2076,6 +2132,7 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxWidth()
+                                    .verticalScroll(layersScrollState)
                                     .pointerInput(Unit) {
                                         awaitPointerEventScope {
                                             while (true) {
@@ -2099,36 +2156,50 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                                     }
                             ) {
                                 projectLayers.indices.reversed().forEach { lIdx ->
-                                    Row(
+                                    val isCurrentLayer = lIdx == uiState.activeLayerIndex
+                                    val layerCels = remember(uiState.project, lIdx) {
+                                        TimelineTrackEngine.computeLayerCels(uiState.project, lIdx)
+                                    }
+                                    Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .height(26.dp)
                                             .background(
-                                                if (lIdx == uiState.activeLayerIndex) Color(currentTheme.panel).copy(alpha = 0.5f)
+                                                if (isCurrentLayer) Color(currentTheme.panel).copy(alpha = 0.5f)
                                                 else Color(currentTheme.bg).copy(alpha = 0.25f)
                                             )
-                                            .border(0.5.dp, themeBorder),
-                                        verticalAlignment = Alignment.CenterVertically
+                                            .border(0.5.dp, themeBorder)
+                                            .pointerInput(lIdx, numTicks, uiState.timelineZoom) {
+                                                val tickPx = with(density) { tickWidth.toPx() }.coerceAtLeast(1f)
+                                                detectTapGestures { offset ->
+                                                    val tappedTick = (offset.x / tickPx).toInt().coerceIn(0, (numTicks - 1).coerceAtLeast(0))
+                                                    viewModel.activateOrAddCelOnLayerAtTick(lIdx, tappedTick)
+                                                }
+                                            }
                                     ) {
-                                        uiState.project.frames.indices.forEach { fIdx ->
-                                            val isCurrentFrame = fIdx == uiState.currentFrameIndex
-                                            val isCurrentLayer = lIdx == uiState.activeLayerIndex
-                                            val isCurrentCell = isCurrentFrame && isCurrentLayer
-                                            val frame = uiState.project.frames.getOrNull(fIdx)
-                                            val rawHold = frame?.holdFrames ?: 1
-                                            val hold = if (draggingFrameIdx == fIdx && liveDraggingHold != null) liveDraggingHold!! else rawHold
-                                            val cellWidth = (tickWidth * hold).coerceAtLeast(tickWidth)
-                                            val layerInFrame = frame?.layers?.getOrNull(lIdx)
-                                            val hasStrokes = layerInFrame?.strokes?.isNotEmpty() == true
+                                        layerCels.forEach { cel ->
+                                            val celKey = lIdx to cel.frameIndex
+                                            val displayStart = if (movingCel == celKey && liveMoveTick != null) {
+                                                liveMoveTick!!
+                                            } else cel.startTick
+                                            val displayHold = if (draggingCel == celKey && liveDraggingHold != null) {
+                                                liveDraggingHold!!
+                                            } else cel.durationTicks
+                                            val cellWidth = (tickWidth * displayHold).coerceAtLeast(tickWidth)
+                                            val isCurrentFrame = uiState.currentTimelineTick in displayStart until (displayStart + displayHold)
+                                            val isCurrentCell = isCurrentLayer && isCurrentFrame
+                                            val hasStrokes = cel.layer.strokes.isNotEmpty() || cel.layer.imageAttachment != null
 
                                             Box(
                                                 modifier = Modifier
+                                                    .offset(x = tickWidth * displayStart)
                                                     .width(cellWidth)
                                                     .fillMaxHeight()
                                                     .padding(horizontal = 0.5.dp, vertical = 2.dp)
                                                     .clip(RoundedCornerShape(3.dp))
                                                     .background(
                                                         when {
+                                                            movingCel == celKey -> adaptiveGreen.copy(alpha = 0.42f)
                                                             isCurrentCell -> Color(currentTheme.accent).copy(alpha = 0.5f)
                                                             isCurrentFrame -> Color(currentTheme.accent).copy(alpha = 0.2f)
                                                             isCurrentLayer -> Color(currentTheme.panel).copy(alpha = 0.8f)
@@ -2136,18 +2207,53 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                                                         }
                                                     )
                                                     .border(
-                                                        width = if (isCurrentCell) 1.5.dp else if (isCurrentFrame) 1.dp else 0.5.dp,
+                                                        width = if (movingCel == celKey || isCurrentCell) 1.5.dp else if (isCurrentFrame) 1.dp else 0.5.dp,
                                                         color = when {
+                                                            movingCel == celKey -> adaptiveGreen
                                                             isCurrentCell -> Color(currentTheme.accent)
                                                             isCurrentFrame -> Color(currentTheme.accent).copy(alpha = 0.6f)
                                                             else -> Color.Transparent
                                                         },
                                                         shape = RoundedCornerShape(3.dp)
                                                     )
+                                                    .pointerInput(celKey, cel.startTick, numTicks, uiState.timelineZoom) {
+                                                        var accum = 0f
+                                                        val unitPx = with(density) { tickWidth.toPx() }.coerceAtLeast(1f)
+                                                        detectDragGesturesAfterLongPress(
+                                                            onDragStart = {
+                                                                accum = 0f
+                                                                movingCel = celKey
+                                                                liveMoveTick = cel.startTick
+                                                            },
+                                                            onDrag = { change, dragAmount ->
+                                                                change.consume()
+                                                                accum += dragAmount.x
+                                                                val delta = (accum / unitPx).toInt()
+                                                                liveMoveTick = (cel.startTick + delta).coerceIn(0, (numTicks - 1).coerceAtLeast(0))
+                                                                if (uiState.preferences.timelineSnapAssistant) {
+                                                                    snapHoverTick = liveMoveTick
+                                                                }
+                                                            },
+                                                            onDragEnd = {
+                                                                val dst = liveMoveTick ?: cel.startTick
+                                                                movingCel = null
+                                                                liveMoveTick = null
+                                                                snapHoverTick = null
+                                                                if (dst != cel.startTick) {
+                                                                    viewModel.moveLayerCelToTick(lIdx, cel.frameIndex, dst)
+                                                                }
+                                                            },
+                                                            onDragCancel = {
+                                                                movingCel = null
+                                                                liveMoveTick = null
+                                                                snapHoverTick = null
+                                                            }
+                                                        )
+                                                    }
                                                     .clickable {
-                                                        viewModel.selectLayer(lIdx)
-                                                        viewModel.selectFrame(fIdx)
-                                                    },
+                                                        viewModel.selectLayerCel(lIdx, cel.frameIndex, cel.startTick)
+                                                    }
+                                                    .testTag("pc_cel_${lIdx}_${cel.frameIndex}"),
                                                 contentAlignment = Alignment.Center
                                             ) {
                                                 Row(
@@ -2155,7 +2261,7 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                                                     horizontalArrangement = Arrangement.Center,
                                                     modifier = Modifier.padding(horizontal = 4.dp)
                                                 ) {
-                                                    if (fIdx == 0) {
+                                                    if (cel.frameIndex == 0) {
                                                         Box(
                                                             modifier = Modifier
                                                                 .size(7.dp)
@@ -2164,14 +2270,14 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                                                         )
                                                     } else {
                                                         Text(
-                                                            text = "${fIdx + 1}",
+                                                            text = "${cel.frameIndex + 1}",
                                                             fontSize = 9.sp,
                                                             fontWeight = if (isCurrentCell) FontWeight.Bold else FontWeight.Normal,
                                                             color = if (isCurrentCell) themeText else themeMuted
                                                         )
                                                     }
 
-                                                    if (hasStrokes && fIdx != 0) {
+                                                    if (hasStrokes && cel.frameIndex != 0) {
                                                         Spacer(modifier = Modifier.width(2.dp))
                                                         Box(
                                                             modifier = Modifier
@@ -2181,10 +2287,10 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                                                         )
                                                     }
 
-                                                    if (hold > 1) {
+                                                    if (displayHold > 1) {
                                                         Spacer(modifier = Modifier.width(3.dp))
                                                         Text(
-                                                            text = "${hold}q",
+                                                            text = "${displayHold}q",
                                                             fontSize = 8.sp,
                                                             color = Color(currentTheme.accent).copy(alpha = 0.9f),
                                                             fontWeight = FontWeight.Bold
@@ -2192,55 +2298,57 @@ private fun BoxScope.PcEditorBottomTimelineSection(
                                                     }
                                                 }
 
-                                                if (isCurrentLayer) {
-                                                    Box(
-                                                        modifier = Modifier
-                                                            .align(Alignment.CenterEnd)
-                                                            .padding(end = 1.dp)
-                                                            .size(10.dp)
-                                                            .clip(CircleShape)
-                                                            .background(
-                                                                if (isCurrentCell) adaptiveCyan
-                                                                else themeText.copy(alpha = 0.55f)
-                                                            )
-                                                            .border(1.dp, Color(currentTheme.panel).copy(alpha = 0.9f), CircleShape)
-                                                            .pointerInput(fIdx) {
-                                                                var accum = 0f
-                                                                detectHorizontalDragGestures(
-                                                                    onDragStart = {
-                                                                        draggingFrameIdx = fIdx
-                                                                        accum = 0f
-                                                                        liveDraggingHold = frame?.holdFrames ?: 1
-                                                                    },
-                                                                    onDragEnd = {
-                                                                        val finalHold = liveDraggingHold ?: (frame?.holdFrames ?: 1)
-                                                                        viewModel.setFrameHoldDuration(fIdx, finalHold)
-                                                                        draggingFrameIdx = null
-                                                                        snapHoverTick = null
-                                                                        liveDraggingHold = null
-                                                                    },
-                                                                    onDragCancel = {
-                                                                        draggingFrameIdx = null
-                                                                        snapHoverTick = null
-                                                                        liveDraggingHold = null
-                                                                    }
-                                                                ) { change, dragAmount ->
-                                                                    change.consume()
-                                                                    accum += dragAmount
-                                                                    val unitPx = tickWidth.toPx()
-                                                                    val delta = (accum / unitPx).roundToInt()
-                                                                    val currH = frame?.holdFrames ?: 1
-                                                                    val candidateHold = (currH + delta).coerceIn(1, 120)
-                                                                    liveDraggingHold = candidateHold
+                                                // Independent per-layer right-edge stretch handle on EVERY layer
+                                                Box(
+                                                    modifier = Modifier
+                                                        .align(Alignment.CenterEnd)
+                                                        .padding(end = 1.dp)
+                                                        .size(10.dp)
+                                                        .clip(CircleShape)
+                                                        .background(
+                                                            when {
+                                                                draggingCel == celKey -> adaptiveCyan
+                                                                isCurrentCell -> adaptiveCyan
+                                                                isCurrentLayer -> themeText.copy(alpha = 0.55f)
+                                                                else -> themeText.copy(alpha = 0.30f)
+                                                            }
+                                                        )
+                                                        .border(1.dp, Color(currentTheme.panel).copy(alpha = 0.9f), CircleShape)
+                                                        .pointerInput(celKey, cel.durationTicks, cel.startTick, uiState.timelineZoom) {
+                                                            var accum = 0f
+                                                            detectHorizontalDragGestures(
+                                                                onDragStart = {
+                                                                    draggingCel = celKey
+                                                                    accum = 0f
+                                                                    liveDraggingHold = cel.durationTicks
+                                                                },
+                                                                onDragEnd = {
+                                                                    val finalHold = liveDraggingHold ?: cel.durationTicks
+                                                                    viewModel.setLayerCelDuration(lIdx, cel.frameIndex, finalHold)
+                                                                    draggingCel = null
+                                                                    snapHoverTick = null
+                                                                    liveDraggingHold = null
+                                                                },
+                                                                onDragCancel = {
+                                                                    draggingCel = null
+                                                                    snapHoverTick = null
+                                                                    liveDraggingHold = null
+                                                                }
+                                                            ) { change, dragAmount ->
+                                                                change.consume()
+                                                                accum += dragAmount
+                                                                val unitPx = tickWidth.toPx().coerceAtLeast(1f)
+                                                                val delta = kotlin.math.round(accum / unitPx).toInt()
+                                                                val candidateHold = (cel.durationTicks + delta).coerceIn(1, 240)
+                                                                liveDraggingHold = candidateHold
 
-                                                                    if (uiState.preferences.timelineSnapAssistant) {
-                                                                        val startTick = frameStartTicks.getOrElse(fIdx) { 0 }
-                                                                        snapHoverTick = startTick + candidateHold
-                                                                    }
+                                                                if (uiState.preferences.timelineSnapAssistant) {
+                                                                    snapHoverTick = cel.startTick + candidateHold
                                                                 }
                                                             }
-                                                    )
-                                                }
+                                                        }
+                                                        .testTag("pc_stretch_${lIdx}_${cel.frameIndex}")
+                                                )
                                             }
                                         }
                                     }
@@ -2638,7 +2746,11 @@ private fun PcEditorDialogsAndModals(
     }
 
     if (showDurationDialog) {
-        val currHold = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.holdFrames ?: 1
+        val activeLayer = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers?.getOrNull(uiState.activeLayerIndex)
+        val activeLayerLabel = activeLayer?.name ?: "Camada ${uiState.activeLayerIndex + 1}"
+        val currHold = TimelineTrackEngine.resolveCelAtTick(uiState.project, uiState.activeLayerIndex, uiState.currentTimelineTick)?.durationTicks
+            ?: activeLayer?.celHoldTicks
+            ?: (uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.holdFrames ?: 1)
         var inputHoldText by remember { mutableStateOf(currHold.toString()) }
         var applyToAll by remember { mutableStateOf(false) }
         val parsedHold = inputHoldText.toIntOrNull() ?: currHold
@@ -2646,11 +2758,11 @@ private fun PcEditorDialogsAndModals(
 
         AlertDialog(
             onDismissRequest = onDismissDurationDialog,
-            title = { Text("Duração do Quadro (Hold)") },
+            title = { Text("Duração da Célula ($activeLayerLabel)") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        text = "Defina a duração do quadro ${uiState.currentFrameIndex + 1} em número de ciclos de renderização (hold):",
+                        text = "Defina a duração independente do quadro ${uiState.currentFrameIndex + 1} na camada $activeLayerLabel (ou aplique a todos):",
                         fontSize = 12.sp,
                         color = Color(currentTheme.text).copy(alpha = 0.8f)
                     )
@@ -2731,8 +2843,8 @@ private fun PcEditorDialogsAndModals(
                             viewModel.setAllFramesHoldDuration(finalHold)
                             Toast.makeText(context, "Duração de ${finalHold}q aplicada a todos os quadros!", Toast.LENGTH_SHORT).show()
                         } else {
-                            viewModel.setFrameHoldDuration(uiState.currentFrameIndex, finalHold)
-                            Toast.makeText(context, "Quadro ${uiState.currentFrameIndex + 1}: ${finalHold}q (${String.format("%.3f", finalHold / uiState.project.fps.toFloat())}s)", Toast.LENGTH_SHORT).show()
+                            viewModel.setLayerCelDuration(uiState.activeLayerIndex, uiState.currentFrameIndex, finalHold)
+                            Toast.makeText(context, "$activeLayerLabel • Q${uiState.currentFrameIndex + 1}: ${finalHold}q (${String.format("%.3f", finalHold / uiState.project.fps.toFloat())}s)", Toast.LENGTH_SHORT).show()
                         }
                         onDismissDurationDialog()
                     }

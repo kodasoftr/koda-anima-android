@@ -32,6 +32,7 @@ object KritaBrushImporter {
 
     private const val TAG = "KritaBrushImporter"
     private const val VAULT_DIR = "krita_brushes"
+    private const val TIPS_DIR = "tips"
     private const val VAULT_FILE = "imported_brushes.json"
     private const val FACTORY_FILE = "imported_brushes_factory.json"
     private val PNG_SIGNATURE = byteArrayOf(
@@ -48,35 +49,75 @@ object KritaBrushImporter {
 
         val displayName = resolveDisplayName(context, uri)
         val nextId = ((existing.maxOfOrNull { it.id } ?: 1000).coerceAtLeast(1000)) + 1
+        val sharedTips = loadSharedTipMap(context)
+        val newlyCollectedTips = HashMap<String, ByteArray>()
 
         val imported = when {
-            isZipSignature(rawBytes) -> parseBundleBytes(rawBytes, nextId)
-            isPngSignature(rawBytes) -> listOfNotNull(
-                parseKppBytes(rawBytes, displayName, nextId)
-                    ?: parsePngTipPresetBytes(rawBytes, displayName, nextId)
+            isZipSignature(rawBytes) -> parseBundleBytes(
+                rawBytes = rawBytes,
+                startingId = nextId,
+                externalTipsIn = sharedTips,
+                collectedTipsOut = newlyCollectedTips
             )
-            isGimpBrushOrHoseSignature(rawBytes) -> listOfNotNull(
-                parseGbrBytes(rawBytes, displayName, nextId)
-                    ?: parseGihPresetBytes(rawBytes, displayName, nextId)
+            isPngSignature(rawBytes) -> {
+                val kpp = parseKppBytes(rawBytes, displayName, nextId, externalBrushTips = sharedTips)
+                if (kpp != null) {
+                    listOf(kpp)
+                } else {
+                    val pngTip = parsePngTipPresetBytes(rawBytes, displayName, nextId)
+                    if (pngTip != null) newlyCollectedTips[displayName] = rawBytes
+                    listOfNotNull(pngTip)
+                }
+            }
+            isGimpBrushOrHoseSignature(rawBytes) -> {
+                newlyCollectedTips[displayName] = rawBytes
+                listOfNotNull(
+                    parseGbrBytes(rawBytes, displayName, nextId)
+                        ?: parseGihPresetBytes(rawBytes, displayName, nextId)
+                )
+            }
+            isGimpPatternSignature(rawBytes) -> {
+                newlyCollectedTips[displayName] = rawBytes
+                listOfNotNull(parsePatPresetBytes(rawBytes, displayName, nextId))
+            }
+            isRawXmlPreset(rawBytes) -> listOfNotNull(
+                parseRawPresetXmlBytes(rawBytes, displayName, nextId, externalBrushTips = sharedTips)
             )
-            isRawXmlPreset(rawBytes) -> listOfNotNull(parseRawPresetXmlBytes(rawBytes, displayName, nextId))
             isJsonContent(rawBytes) -> parseJsonPresetBytes(rawBytes, nextId)
             displayName.endsWith(".bundle", ignoreCase = true) ||
-                displayName.endsWith(".zip", ignoreCase = true) -> parseBundleBytes(rawBytes, nextId)
-            displayName.endsWith(".gbr", ignoreCase = true) ->
+                displayName.endsWith(".zip", ignoreCase = true) -> parseBundleBytes(
+                rawBytes = rawBytes,
+                startingId = nextId,
+                externalTipsIn = sharedTips,
+                collectedTipsOut = newlyCollectedTips
+            )
+            displayName.endsWith(".gbr", ignoreCase = true) -> {
+                newlyCollectedTips[displayName] = rawBytes
                 listOfNotNull(parseGbrBytes(rawBytes, displayName, nextId))
-            displayName.endsWith(".gih", ignoreCase = true) ->
+            }
+            displayName.endsWith(".gih", ignoreCase = true) -> {
+                newlyCollectedTips[displayName] = rawBytes
                 listOfNotNull(parseGihPresetBytes(rawBytes, displayName, nextId))
+            }
+            displayName.endsWith(".pat", ignoreCase = true) -> {
+                newlyCollectedTips[displayName] = rawBytes
+                listOfNotNull(parsePatPresetBytes(rawBytes, displayName, nextId))
+            }
             displayName.endsWith(".json", ignoreCase = true) -> parseJsonPresetBytes(rawBytes, nextId)
             displayName.endsWith(".xml", ignoreCase = true) ->
-                listOfNotNull(parseRawPresetXmlBytes(rawBytes, displayName, nextId))
+                listOfNotNull(parseRawPresetXmlBytes(rawBytes, displayName, nextId, externalBrushTips = sharedTips))
             else -> listOfNotNull(
-                parseKppBytes(rawBytes, displayName, nextId)
-                    ?: parseRawPresetXmlBytes(rawBytes, displayName, nextId)
-                    ?: parseGbrBytes(rawBytes, displayName, nextId)
-                    ?: parseGihPresetBytes(rawBytes, displayName, nextId)
-                    ?: parsePngTipPresetBytes(rawBytes, displayName, nextId)
+                parseKppBytes(rawBytes, displayName, nextId, externalBrushTips = sharedTips)
+                    ?: parseRawPresetXmlBytes(rawBytes, displayName, nextId, externalBrushTips = sharedTips)
+                    ?: parseGbrBytes(rawBytes, displayName, nextId)?.also { newlyCollectedTips[displayName] = rawBytes }
+                    ?: parseGihPresetBytes(rawBytes, displayName, nextId)?.also { newlyCollectedTips[displayName] = rawBytes }
+                    ?: parsePatPresetBytes(rawBytes, displayName, nextId)?.also { newlyCollectedTips[displayName] = rawBytes }
+                    ?: parsePngTipPresetBytes(rawBytes, displayName, nextId)?.also { newlyCollectedTips[displayName] = rawBytes }
             )
+        }
+
+        if (newlyCollectedTips.isNotEmpty()) {
+            saveSharedTips(context, newlyCollectedTips)
         }
 
         val addedPresets = mutableListOf<BrushPreset>()
@@ -108,14 +149,19 @@ object KritaBrushImporter {
         return addedPresets
     }
 
-    fun parseBundleBytes(rawBytes: ByteArray, startingId: Int = 1001): List<BrushPreset> {
+    fun parseBundleBytes(
+        rawBytes: ByteArray,
+        startingId: Int = 1001,
+        externalTipsIn: Map<String, ByteArray> = emptyMap(),
+        collectedTipsOut: MutableMap<String, ByteArray>? = null
+    ): List<BrushPreset> {
         val results = mutableListOf<BrushPreset>()
         var currentId = startingId
         val kppEntries = mutableListOf<Pair<String, ByteArray>>()
         val xmlEntries = mutableListOf<Pair<String, ByteArray>>()
         val jsonEntries = mutableListOf<Pair<String, ByteArray>>()
         val tipEntries = mutableListOf<Pair<String, ByteArray>>()
-        val brushTipMap = HashMap<String, ByteArray>()
+        val brushTipMap = HashMap<String, ByteArray>(externalTipsIn)
 
         try {
             ZipInputStream(ByteArrayInputStream(rawBytes)).use { zis ->
@@ -144,9 +190,11 @@ object KritaBrushImporter {
                                     val bytes = zis.readBytes()
                                     if (!lower.contains("paintoppresets/")) {
                                         indexBrushTipBytes(brushTipMap, lower, bytes)
-                                        if (lower.endsWith(".gbr") || lower.endsWith(".gih") || lower.endsWith(".png")) {
-                                            tipEntries.add(name to bytes)
+                                        val tipBase = urlDecodeSafe(name.replace('\\', '/')).substringAfterLast('/')
+                                        if (tipBase.isNotEmpty()) {
+                                            collectedTipsOut?.put(tipBase, bytes)
                                         }
+                                        tipEntries.add(name to bytes)
                                     } else if (isPngSignature(bytes) && extractKritaPresetXmlFromPng(bytes) != null) {
                                         kppEntries.add(name to bytes)
                                     }
@@ -207,7 +255,7 @@ object KritaBrushImporter {
                 }
             }
 
-            // Fallback to standalone .gbr/.gih/.png tips only if no .kpp/.xml/.json presets were extracted
+            // Fallback to standalone .gbr/.gih/.pat/.png tips only if no .kpp/.xml/.json presets were extracted
             if (results.isEmpty()) {
                 tipEntries.forEach { (name, bytes) ->
                     try {
@@ -215,6 +263,7 @@ object KritaBrushImporter {
                         val lower = fileName.lowercase()
                         val parsed = when {
                             lower.endsWith(".gih") -> parseGihPresetBytes(bytes, fileName, currentId)
+                            lower.endsWith(".pat") -> parsePatPresetBytes(bytes, fileName, currentId)
                             lower.endsWith(".png") -> parsePngTipPresetBytes(bytes, fileName, currentId)
                             else -> parseGbrBytes(bytes, fileName, currentId)
                         }
@@ -350,6 +399,60 @@ object KritaBrushImporter {
             kritaPaintOpId = "gih_tip",
             iconBase64 = tipStamp.first
         )
+    }
+
+    fun parsePatPresetBytes(rawBytes: ByteArray, fileName: String, presetId: Int = 1001): BrushPreset? {
+        if (rawBytes.size < 24) return null
+        return try {
+            val header = ByteBuffer.wrap(rawBytes, 0, 24).order(ByteOrder.BIG_ENDIAN)
+            val headerSize = header.int
+            val version = header.int
+            val width = header.int
+            val height = header.int
+            val bytesPerPixel = header.int
+            val magicInt = header.int
+            val magic = String(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(magicInt).array(), Charsets.US_ASCII)
+            if (magic != "GPAT" || version != 1 || headerSize < 24 || width <= 0 || height <= 0) {
+                return null
+            }
+            val nameLen = (headerSize - 24).coerceAtMost(rawBytes.size - 24).coerceAtLeast(0)
+            val rawName = if (nameLen > 0) {
+                String(rawBytes, 24, nameLen, Charsets.UTF_8).trimEnd('\u0000').trim()
+            } else ""
+            val fallbackName = fileName.substringAfterLast('/').substringAfterLast('\\')
+                .removeSuffix(".pat").removeSuffix(".PAT")
+            val finalName = rawName.ifBlank { fallbackName }.ifBlank { "Padrão .pat #$presetId" }
+            val tipStamp = extractPatTipStamp(rawBytes) ?: return null
+            val engineKind = mapKritaMetaToEngine("pat_${bytesPerPixel}bpp", finalName)
+            val naturalRatio = (minOf(width, height).toFloat() / maxOf(width, height).toFloat()).coerceIn(0.12f, 1.0f)
+            BrushPreset(
+                id = presetId,
+                namePt = finalName,
+                shortLabel = finalName.take(12),
+                defaultSize = (maxOf(width, height).toFloat() * 0.45f).coerceIn(8f, 44f),
+                defaultOpacity = defaultOpacityFor(engineKind),
+                toolType = ToolType.BRUSH,
+                textureNamePt = "Padrão .pat (${width}x${height})",
+                textureSymbol = symbolForEngine(engineKind),
+                descriptionPt = "Padrão/textura raster importado (.pat ${width}x${height}px).",
+                engineKind = engineKind,
+                dynamicParams = BrushDynamicParams(
+                    engineKind = engineKind,
+                    hardness = defaultHardnessFor(engineKind),
+                    spacing = 0.14f,
+                    flow = 0.88f,
+                    grainAmount = 0.48f,
+                    aspectRatio = if (width != height) naturalRatio else 1.0f,
+                    shapeKind = "predefined",
+                    tipStampBase64 = tipStamp.first
+                ),
+                isImportedKrita = true,
+                kritaPaintOpId = "pat_tip",
+                iconBase64 = tipStamp.first
+            )
+        } catch (_: Exception) {
+            null
+        }
     }
 
     fun parsePngTipPresetBytes(rawBytes: ByteArray, fileName: String, presetId: Int = 1001): BrushPreset? {
@@ -502,10 +605,12 @@ object KritaBrushImporter {
                 ?: extractParamFloat(cleanOuterXml, "Size")
                 ?: brushAttrScale?.let { (it * 24f).coerceIn(4f, 64f) }
 
-            parsedOpacity = extractParamFloat(cleanOuterXml, "OpacityValue")
+            val rawOpacity = extractParamFloat(cleanOuterXml, "OpacityValue")
                 ?: extractParamFloat(cleanOuterXml, "opacity")
-            parsedFlow = extractParamFloat(cleanOuterXml, "FlowValue")
+            parsedOpacity = rawOpacity?.let { v -> if (v > 1.05f) (v / 100f).coerceIn(0.05f, 1.0f) else v.coerceIn(0.05f, 1.0f) }
+            val rawFlow = extractParamFloat(cleanOuterXml, "FlowValue")
                 ?: extractParamFloat(cleanOuterXml, "flow")
+            parsedFlow = rawFlow?.let { v -> if (v > 1.05f) (v / 100f).coerceIn(0.05f, 1.0f) else v.coerceIn(0.05f, 1.0f) }
             val explicitSpacing = extractParamFloat(cleanOuterXml, "Spacing")
                 ?: extractParamFloat(cleanOuterXml, "spacing")
                 ?: extractBrushTagAttrFloat(brushDefXml, "spacing")
@@ -520,10 +625,13 @@ object KritaBrushImporter {
                 explicitSpacing ?: autoSpacingCoeff?.let { (it * 0.14f).coerceIn(0.03f, 0.35f) }
             }
 
+            val rawFade = extractMaskGeneratorAttr(brushDefXml, "fade")
+                ?: extractMaskGeneratorAttr(cleanOuterXml, "fade")
             parsedSoftness = extractParamFloat(cleanOuterXml, "softness")
                 ?: extractParamFloat(cleanOuterXml, "Softness")
                 ?: extractMaskGeneratorAttr(brushDefXml, "softness")
                 ?: extractMaskGeneratorAttr(cleanOuterXml, "softness")
+                ?: rawFade?.let { fade -> (1f - fade.coerceIn(0f, 1f)) * 1.4f }
             parsedRatio = extractMaskGeneratorAttr(brushDefXml, "ratio")
                 ?: extractMaskGeneratorAttr(cleanOuterXml, "ratio")
             val maskSpikes = extractMaskGeneratorAttr(brushDefXml, "spikes")
@@ -561,9 +669,10 @@ object KritaBrushImporter {
                 parsedAngleDeg = deg
             }
 
-            // Link predefined raster brush tip from .bundle (`<Brush filename="..."/>`)
+            // Link predefined raster brush tip from .bundle or shared tip vault (`<Brush filename="..."/>`)
             val tipFilename = extractBrushTagAttrStr(brushDefXml, "filename")
                 ?: extractBrushTagAttrStr(cleanOuterXml, "filename")
+                ?: extractBrushTagAttrStr(fallbackSearchXml, "filename")
             if (!tipFilename.isNullOrBlank() && externalBrushTips.isNotEmpty()) {
                 val resolvedBytes = findBrushTipBytes(tipFilename, externalBrushTips)
                 if (resolvedBytes != null) {
@@ -818,14 +927,17 @@ object KritaBrushImporter {
         val lower = hintName.lowercase()
         return when {
             isPngSignature(bytes) || lower.endsWith(".png") -> extractPngTipStamp(bytes)
+            isGimpPatternSignature(bytes) || lower.endsWith(".pat") -> extractPatTipStamp(bytes)
             lower.endsWith(".gih") -> extractGihTipStamp(bytes)
-            else -> extractGbrTipStamp(bytes) ?: extractGihTipStamp(bytes)
+            else -> extractGbrTipStamp(bytes) ?: extractGihTipStamp(bytes) ?: extractPatTipStamp(bytes)
         }
     }
 
     private fun extractGihTipStamp(bytes: ByteArray): Pair<String, Float>? {
         // GIMP Image Hose starts with 2 text lines followed by concatenated .gbr blocks (GIMP magic at header + 20)
-        for (i in 20..bytes.size - 4) {
+        var fallbackTip: Pair<String, Float>? = null
+        var i = 20
+        while (i <= bytes.size - 4) {
             if (bytes[i] == 'G'.code.toByte() &&
                 bytes[i + 1] == 'I'.code.toByte() &&
                 bytes[i + 2] == 'M'.code.toByte() &&
@@ -833,14 +945,55 @@ object KritaBrushImporter {
             ) {
                 val start = i - 20
                 if (start >= 0 && start + 28 <= bytes.size) {
-                    return extractGbrTipStamp(bytes, startOffset = start)
+                    val header = ByteBuffer.wrap(bytes, start, 28).order(ByteOrder.BIG_ENDIAN)
+                    val headerSize = header.int
+                    val version = header.int
+                    val width = header.int
+                    val height = header.int
+                    val bpp = header.int
+                    val blockPayload = width.toLong() * height.toLong() * bpp.toLong()
+                    val decoded = extractGbrTipStampWithCoverage(bytes, startOffset = start)
+                    if (decoded != null) {
+                        val (tip, nonEmptyAlphaPixels) = decoded
+                        if (nonEmptyAlphaPixels > 0) return tip
+                        if (fallbackTip == null) fallbackTip = tip
+                    }
+                    if ((version == 1 || version == 2) && headerSize >= 28 && blockPayload > 0L && start + headerSize + blockPayload <= bytes.size) {
+                        i = (start + headerSize + blockPayload.toInt() + 20).coerceAtLeast(i + 4)
+                        continue
+                    }
                 }
             }
+            i++
         }
-        return null
+        return fallbackTip
+    }
+
+    private fun extractPatTipStamp(rawBytes: ByteArray): Pair<String, Float>? {
+        if (rawBytes.size < 24) return null
+        return try {
+            val header = ByteBuffer.wrap(rawBytes, 0, 24).order(ByteOrder.BIG_ENDIAN)
+            val headerSize = header.int
+            val version = header.int
+            val width = header.int
+            val height = header.int
+            val bpp = header.int
+            val magicInt = header.int
+            val magic = String(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(magicInt).array(), Charsets.US_ASCII)
+            if (magic != "GPAT" || version != 1 || headerSize < 24 || width <= 0 || height <= 0 || width > 2048 || height > 2048) {
+                return null
+            }
+            convertRawGimpMaskPixels(rawBytes, headerSize, width, height, bpp)?.first
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun extractGbrTipStamp(rawBytes: ByteArray, startOffset: Int = 0): Pair<String, Float>? {
+        return extractGbrTipStampWithCoverage(rawBytes, startOffset)?.first
+    }
+
+    private fun extractGbrTipStampWithCoverage(rawBytes: ByteArray, startOffset: Int = 0): Pair<Pair<String, Float>, Int>? {
         if (rawBytes.size - startOffset < 28) return null
         return try {
             val header = ByteBuffer.wrap(rawBytes, startOffset, 28).order(ByteOrder.BIG_ENDIAN)
@@ -854,61 +1007,75 @@ object KritaBrushImporter {
             if (magic != "GIMP" || (version != 1 && version != 2) || headerSize < 28 || width <= 0 || height <= 0 || width > 2048 || height > 2048) {
                 return null
             }
-            val pixelStart = startOffset + headerSize
-            val expectedBytes = width * height * bpp
-            if (pixelStart + expectedBytes > rawBytes.size) return null
-
-            val pixels = IntArray(width * height)
-            var pIdx = pixelStart
-            if (bpp == 1) {
-                for (i in 0 until width * height) {
-                    val alpha = rawBytes[pIdx++].toInt() and 0xFF
-                    pixels[i] = (alpha shl 24) or 0x00FFFFFF
-                }
-            } else if (bpp == 2) {
-                for (i in 0 until width * height) {
-                    val gray = rawBytes[pIdx++].toInt() and 0xFF
-                    val a = rawBytes[pIdx++].toInt() and 0xFF
-                    val maskAlpha = if (a > 0 && a < 250) a else (255 - gray)
-                    pixels[i] = (maskAlpha.coerceIn(0, 255) shl 24) or 0x00FFFFFF
-                }
-            } else if (bpp == 3) {
-                for (i in 0 until width * height) {
-                    val r = rawBytes[pIdx++].toInt() and 0xFF
-                    val g = rawBytes[pIdx++].toInt() and 0xFF
-                    val b = rawBytes[pIdx++].toInt() and 0xFF
-                    val lum = (r * 77 + g * 150 + b * 29) shr 8
-                    val maskAlpha = 255 - lum
-                    pixels[i] = (maskAlpha.coerceIn(0, 255) shl 24) or 0x00FFFFFF
-                }
-            } else if (bpp == 4) {
-                var minAlpha = 255
-                for (i in 0 until width * height) {
-                    val a = rawBytes[pIdx + i * 4 + 3].toInt() and 0xFF
-                    if (a < minAlpha) minAlpha = a
-                }
-                val hasTrueAlpha = minAlpha < 245
-                for (i in 0 until width * height) {
-                    val r = rawBytes[pIdx++].toInt() and 0xFF
-                    val g = rawBytes[pIdx++].toInt() and 0xFF
-                    val b = rawBytes[pIdx++].toInt() and 0xFF
-                    val a = rawBytes[pIdx++].toInt() and 0xFF
-                    val lum = (r * 77 + g * 150 + b * 29) shr 8
-                    val maskAlpha = if (hasTrueAlpha) a else (255 - lum)
-                    pixels[i] = (maskAlpha.coerceIn(0, 255) shl 24) or 0x00FFFFFF
-                }
-            } else {
-                return null
-            }
-
-            val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            bmp.setPixels(pixels, 0, width, 0, 0, width, height)
-            val encoded = encodeTipBitmapTo40pxBase64(bmp)
-            val aspect = (minOf(width, height).toFloat() / maxOf(width, height).toFloat()).coerceIn(0.08f, 1.0f)
-            encoded to aspect
+            convertRawGimpMaskPixels(rawBytes, startOffset + headerSize, width, height, bpp)
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun convertRawGimpMaskPixels(
+        rawBytes: ByteArray,
+        pixelStart: Int,
+        width: Int,
+        height: Int,
+        bpp: Int
+    ): Pair<Pair<String, Float>, Int>? {
+        val expectedBytes = width * height * bpp
+        if (pixelStart < 0 || pixelStart + expectedBytes > rawBytes.size) return null
+
+        val pixels = IntArray(width * height)
+        var pIdx = pixelStart
+        var nonEmptyCount = 0
+        if (bpp == 1) {
+            for (i in 0 until width * height) {
+                val alpha = rawBytes[pIdx++].toInt() and 0xFF
+                if (alpha > 8) nonEmptyCount++
+                pixels[i] = (alpha shl 24) or 0x00FFFFFF
+            }
+        } else if (bpp == 2) {
+            for (i in 0 until width * height) {
+                val gray = rawBytes[pIdx++].toInt() and 0xFF
+                val a = rawBytes[pIdx++].toInt() and 0xFF
+                val maskAlpha = (if (a > 0 && a < 250) a else (255 - gray)).coerceIn(0, 255)
+                if (maskAlpha > 8) nonEmptyCount++
+                pixels[i] = (maskAlpha shl 24) or 0x00FFFFFF
+            }
+        } else if (bpp == 3) {
+            for (i in 0 until width * height) {
+                val r = rawBytes[pIdx++].toInt() and 0xFF
+                val g = rawBytes[pIdx++].toInt() and 0xFF
+                val b = rawBytes[pIdx++].toInt() and 0xFF
+                val lum = (r * 77 + g * 150 + b * 29) shr 8
+                val maskAlpha = (255 - lum).coerceIn(0, 255)
+                if (maskAlpha > 8) nonEmptyCount++
+                pixels[i] = (maskAlpha shl 24) or 0x00FFFFFF
+            }
+        } else if (bpp == 4) {
+            var minAlpha = 255
+            for (i in 0 until width * height) {
+                val a = rawBytes[pIdx + i * 4 + 3].toInt() and 0xFF
+                if (a < minAlpha) minAlpha = a
+            }
+            val hasTrueAlpha = minAlpha < 245
+            for (i in 0 until width * height) {
+                val r = rawBytes[pIdx++].toInt() and 0xFF
+                val g = rawBytes[pIdx++].toInt() and 0xFF
+                val b = rawBytes[pIdx++].toInt() and 0xFF
+                val a = rawBytes[pIdx++].toInt() and 0xFF
+                val lum = (r * 77 + g * 150 + b * 29) shr 8
+                val maskAlpha = (if (hasTrueAlpha) a else (255 - lum)).coerceIn(0, 255)
+                if (maskAlpha > 8) nonEmptyCount++
+                pixels[i] = (maskAlpha shl 24) or 0x00FFFFFF
+            }
+        } else {
+            return null
+        }
+
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(pixels, 0, width, 0, 0, width, height)
+        val encoded = encodeTipBitmapTo40pxBase64(bmp)
+        val aspect = (minOf(width, height).toFloat() / maxOf(width, height).toFloat()).coerceIn(0.08f, 1.0f)
+        return (encoded to aspect) to nonEmptyCount
     }
 
     private fun decodeSampledBitmapFromBytes(bytes: ByteArray, maxDim: Int): Bitmap? {
@@ -1105,6 +1272,41 @@ object KritaBrushImporter {
         }
     }
 
+    fun loadSharedTipMap(context: Context): HashMap<String, ByteArray> {
+        val map = HashMap<String, ByteArray>()
+        try {
+            val tipsDir = File(File(context.filesDir, VAULT_DIR), TIPS_DIR)
+            if (!tipsDir.exists()) return map
+            tipsDir.listFiles()?.forEach { file ->
+                if (file.isFile && file.length() in 8..(8 * 1024 * 1024)) {
+                    val bytes = file.readBytes()
+                    indexBrushTipBytes(map, file.name.lowercase(), bytes)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed loading shared brush tips: ${e.message}")
+        }
+        return map
+    }
+
+    fun saveSharedTips(context: Context, tips: Map<String, ByteArray>) {
+        if (tips.isEmpty()) return
+        try {
+            val tipsDir = File(File(context.filesDir, VAULT_DIR), TIPS_DIR)
+            if (!tipsDir.exists()) tipsDir.mkdirs()
+            tips.forEach { (rawName, bytes) ->
+                val cleanName = rawName.replace('\\', '/').substringAfterLast('/')
+                    .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                    .trim('_')
+                if (cleanName.isNotEmpty() && bytes.size >= 8) {
+                    File(tipsDir, cleanName).writeBytes(bytes)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed saving shared brush tips: ${e.message}")
+        }
+    }
+
     fun deleteImportedBrush(context: Context, brushId: Int): List<BrushPreset> {
         val remaining = loadImportedBrushes(context).filterNot { it.id == brushId }
         saveImportedBrushes(context, remaining)
@@ -1265,8 +1467,16 @@ object KritaBrushImporter {
     }
 
     private fun mapKritaMetaToEngine(paintOpId: String, name: String): KritaBrushEngineKind {
-        val low = "$paintOpId $name".lowercase()
+        val idLow = paintOpId.lowercase()
+        val low = "$idLow $name".lowercase()
         return when {
+            "colorsmudge" in idLow || "deformbrush" in idLow -> KritaBrushEngineKind.BLENDER_WET_SOFT
+            "spraybrush" in idLow || "particle" in idLow -> KritaBrushEngineKind.AIRBRUSH_SOFT
+            "hatch" in idLow -> KritaBrushEngineKind.BRISTLE_DRY
+            "sketchbrush" in idLow || "curvebrush" in idLow -> {
+                if ("ink" in low || "rough" in low) KritaBrushEngineKind.INK_ROUGH else KritaBrushEngineKind.PENCIL_GRAPHITE
+            }
+            "gridbrush" in idLow -> KritaBrushEngineKind.PIXEL_ROUND_SIZE
             "gpen" in low || "g-pen" in low || "g_pen" in low || "pena" in low -> KritaBrushEngineKind.INK_GPEN
             "rough" in low && "ink" in low -> KritaBrushEngineKind.INK_ROUGH
             "ink" in low || "fineliner" in low || "nanquim" in low -> KritaBrushEngineKind.INK_GPEN
@@ -1476,6 +1686,14 @@ object KritaBrushImporter {
         val scanLen = minOf(bytes.size, 256)
         val head = String(bytes, 0, scanLen, Charsets.ISO_8859_1)
         return head.contains("GIMP") && head.contains('\n')
+    }
+
+    private fun isGimpPatternSignature(bytes: ByteArray): Boolean {
+        return bytes.size >= 24 &&
+            bytes[20] == 'G'.code.toByte() &&
+            bytes[21] == 'P'.code.toByte() &&
+            bytes[22] == 'A'.code.toByte() &&
+            bytes[23] == 'T'.code.toByte()
     }
 
     private fun isRawXmlPreset(bytes: ByteArray): Boolean {
