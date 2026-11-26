@@ -802,15 +802,24 @@ object KodanimaGraphicsEngine {
         baseLayerForFirstClipped: Layer? = null,
         baseExtraStrokes: List<DrawingStroke>? = null,
         densityMultiplier: Float = HardwareCapabilitiesEngine.currentProfile.particleDensityMultiplier,
-        renderScale: Float = 1.0f
+        renderScale: Float = 1.0f,
+        allowOutOfBounds: Boolean = false,
+        viewportMatrix: android.graphics.Matrix? = null,
+        viewportWidth: Int = 0,
+        viewportHeight: Int = 0
     ) {
         if (layers.isEmpty()) return
-        val effScale = renderScale.coerceAtLeast(0.05f)
+        val useVpMat = viewportMatrix != null && viewportWidth > 0 && viewportHeight > 0
+        val effScale = if (useVpMat) 1.0f else renderScale.coerceAtLeast(0.05f)
+        val effOutOfBounds = allowOutOfBounds || useVpMat
         val needsAdvancedCompositing = layers.any {
             it.isClippingMask || it.blendEffect != LayerBlendEffect.NORMAL
         }
         if (!needsAdvancedCompositing) {
-            if (effScale != 1.0f) {
+            if (useVpMat) {
+                canvas.save()
+                canvas.concat(viewportMatrix!!)
+            } else if (effScale != 1.0f) {
                 canvas.save()
                 canvas.scale(effScale, effScale)
             }
@@ -827,17 +836,18 @@ object KodanimaGraphicsEngine {
                     colorFilterOverride = colorFilterOverride,
                     visibleBounds = visibleBounds,
                     extraStrokes = extra,
-                    densityMultiplier = densityMultiplier
+                    densityMultiplier = densityMultiplier,
+                    allowOutOfBounds = effOutOfBounds
                 )
             }
-            if (effScale != 1.0f) {
+            if (useVpMat || effScale != 1.0f) {
                 canvas.restore()
             }
             return
         }
 
-        val w = max(1, if (effScale == 1.0f) targetWidth else (targetWidth * effScale + 0.5f).toInt())
-        val h = max(1, if (effScale == 1.0f) targetHeight else (targetHeight * effScale + 0.5f).toInt())
+        val w = if (useVpMat) viewportWidth else max(1, if (effScale == 1.0f) targetWidth else (targetWidth * effScale + 0.5f).toInt())
+        val h = if (useVpMat) viewportHeight else max(1, if (effScale == 1.0f) targetHeight else (targetHeight * effScale + 0.5f).toInt())
         var baseMaskBitmap: Bitmap? = null
         var workBitmap: Bitmap? = null
         var baseLayerRef: Layer? = baseLayerForFirstClipped?.takeIf { it.isVisible && it.opacity > 0f }
@@ -865,7 +875,10 @@ object KodanimaGraphicsEngine {
                     baseMaskReady = false
 
                     if (layer.blendEffect == LayerBlendEffect.NORMAL) {
-                        if (effScale != 1.0f) {
+                        if (useVpMat) {
+                            canvas.save()
+                            canvas.concat(viewportMatrix!!)
+                        } else if (effScale != 1.0f) {
                             canvas.save()
                             canvas.scale(effScale, effScale)
                         }
@@ -878,9 +891,10 @@ object KodanimaGraphicsEngine {
                             colorFilterOverride = colorFilterOverride,
                             visibleBounds = visibleBounds,
                             extraStrokes = extra,
-                            densityMultiplier = densityMultiplier
+                            densityMultiplier = densityMultiplier,
+                            allowOutOfBounds = effOutOfBounds
                         )
-                        if (effScale != 1.0f) {
+                        if (useVpMat || effScale != 1.0f) {
                             canvas.restore()
                         }
                     } else {
@@ -889,7 +903,10 @@ object KodanimaGraphicsEngine {
                         ).also { workBitmap = it }
                         val wc = Canvas(wb)
                         wc.drawColor(android.graphics.Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                        if (effScale != 1.0f) {
+                        if (useVpMat) {
+                            wc.save()
+                            wc.concat(viewportMatrix!!)
+                        } else if (effScale != 1.0f) {
                             wc.save()
                             wc.scale(effScale, effScale)
                         }
@@ -902,9 +919,10 @@ object KodanimaGraphicsEngine {
                             colorFilterOverride = colorFilterOverride,
                             visibleBounds = visibleBounds,
                             extraStrokes = extra,
-                            densityMultiplier = densityMultiplier
+                            densityMultiplier = densityMultiplier,
+                            allowOutOfBounds = effOutOfBounds
                         )
-                        if (effScale != 1.0f) {
+                        if (useVpMat || effScale != 1.0f) {
                             wc.restore()
                         }
                         blendPaint.alpha = 255
@@ -922,7 +940,10 @@ object KodanimaGraphicsEngine {
                         ).also { baseMaskBitmap = it }
                         val bc = Canvas(bmb)
                         bc.drawColor(android.graphics.Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                        if (effScale != 1.0f) {
+                        if (useVpMat) {
+                            bc.save()
+                            bc.concat(viewportMatrix!!)
+                        } else if (effScale != 1.0f) {
                             bc.save()
                             bc.scale(effScale, effScale)
                         }
@@ -935,9 +956,10 @@ object KodanimaGraphicsEngine {
                             colorFilterOverride = colorFilterOverride,
                             visibleBounds = visibleBounds,
                             extraStrokes = baseExtraRef,
-                            densityMultiplier = densityMultiplier
+                            densityMultiplier = densityMultiplier,
+                            allowOutOfBounds = effOutOfBounds
                         )
-                        if (effScale != 1.0f) {
+                        if (useVpMat || effScale != 1.0f) {
                             bc.restore()
                         }
                         baseMaskReady = true
@@ -948,7 +970,10 @@ object KodanimaGraphicsEngine {
                     ).also { workBitmap = it }
                     val wc = Canvas(wb)
                     wc.drawColor(android.graphics.Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    if (effScale != 1.0f) {
+                    if (useVpMat) {
+                        wc.save()
+                        wc.concat(viewportMatrix!!)
+                    } else if (effScale != 1.0f) {
                         wc.save()
                         wc.scale(effScale, effScale)
                     }
@@ -961,9 +986,10 @@ object KodanimaGraphicsEngine {
                         colorFilterOverride = colorFilterOverride,
                         visibleBounds = visibleBounds,
                         extraStrokes = extra,
-                        densityMultiplier = densityMultiplier
+                        densityMultiplier = densityMultiplier,
+                        allowOutOfBounds = effOutOfBounds
                     )
-                    if (effScale != 1.0f) {
+                    if (useVpMat || effScale != 1.0f) {
                         wc.restore()
                     }
                     // Clip strictly to the base layer's painted alpha pixels
@@ -994,7 +1020,8 @@ object KodanimaGraphicsEngine {
         colorFilterOverride: ColorFilter? = null,
         visibleBounds: RectF? = null,
         extraStrokes: List<DrawingStroke>? = null,
-        densityMultiplier: Float = HardwareCapabilitiesEngine.currentProfile.particleDensityMultiplier
+        densityMultiplier: Float = HardwareCapabilitiesEngine.currentProfile.particleDensityMultiplier,
+        allowOutOfBounds: Boolean = false
     ) {
         val layerAlpha = (layer.opacity * alphaMultiplier).coerceIn(0f, 1f)
         if (layerAlpha <= 0f) return
@@ -1015,28 +1042,30 @@ object KodanimaGraphicsEngine {
         for (i in baseStrokes.indices) {
             val s = baseStrokes[i]
             if (s.tool == ToolType.ERASER) hasEraser = true
-            if (s.points.isNotEmpty() && s.minX != Float.MAX_VALUE && s.maxX != Float.MIN_VALUE) {
+            if (s.points.isNotEmpty() && s.minX != Float.MAX_VALUE && s.maxX != -Float.MAX_VALUE) {
                 val pad = s.brushSize + 8f
                 if (s.minX - pad < minX) minX = s.minX - pad
                 if (s.minY - pad < minY) minY = s.minY - pad
                 if (s.maxX + pad > maxX) maxX = s.maxX + pad
                 if (s.maxY + pad > maxY) maxY = s.maxY + pad
             } else {
-                minX = 0f; minY = 0f; maxX = targetWidth.toFloat(); maxY = targetHeight.toFloat()
+                minX = min(minX, 0f); minY = min(minY, 0f)
+                maxX = max(maxX, targetWidth.toFloat()); maxY = max(maxY, targetHeight.toFloat())
             }
         }
         if (extraStrokes != null) {
             for (i in extraStrokes.indices) {
                 val s = extraStrokes[i]
                 if (s.tool == ToolType.ERASER) hasEraser = true
-                if (s.points.isNotEmpty() && s.minX != Float.MAX_VALUE && s.maxX != Float.MIN_VALUE) {
+                if (s.points.isNotEmpty() && s.minX != Float.MAX_VALUE && s.maxX != -Float.MAX_VALUE) {
                     val pad = s.brushSize + 8f
                     if (s.minX - pad < minX) minX = s.minX - pad
                     if (s.minY - pad < minY) minY = s.minY - pad
                     if (s.maxX + pad > maxX) maxX = s.maxX + pad
                     if (s.maxY + pad > maxY) maxY = s.maxY + pad
                 } else {
-                    minX = 0f; minY = 0f; maxX = targetWidth.toFloat(); maxY = targetHeight.toFloat()
+                    minX = min(minX, 0f); minY = min(minY, 0f)
+                    maxX = max(maxX, targetWidth.toFloat()); maxY = max(maxY, targetHeight.toFloat())
                 }
             }
         }
@@ -1046,10 +1075,21 @@ object KodanimaGraphicsEngine {
         val scratch = scratchThreadLocal.get()!!
         val needsLayerIsolation = hasEraser || layerAlpha < 0.999f
         val layerCount = if (needsLayerIsolation) {
-            val lLeft = max(0f, if (visibleBounds != null) max(minX, visibleBounds.left) else minX)
-            val lTop = max(0f, if (visibleBounds != null) max(minY, visibleBounds.top) else minY)
-            val lRight = min(targetWidth.toFloat(), if (visibleBounds != null) min(maxX, visibleBounds.right) else maxX)
-            val lBottom = min(targetHeight.toFloat(), if (visibleBounds != null) min(maxY, visibleBounds.bottom) else maxY)
+            val lLeft: Float
+            val lTop: Float
+            val lRight: Float
+            val lBottom: Float
+            if (allowOutOfBounds) {
+                lLeft = if (visibleBounds != null) max(minX, visibleBounds.left) else minX
+                lTop = if (visibleBounds != null) max(minY, visibleBounds.top) else minY
+                lRight = if (visibleBounds != null) min(maxX, visibleBounds.right) else maxX
+                lBottom = if (visibleBounds != null) min(maxY, visibleBounds.bottom) else maxY
+            } else {
+                lLeft = max(0f, if (visibleBounds != null) max(minX, visibleBounds.left) else minX)
+                lTop = max(0f, if (visibleBounds != null) max(minY, visibleBounds.top) else minY)
+                lRight = min(targetWidth.toFloat(), if (visibleBounds != null) min(maxX, visibleBounds.right) else maxX)
+                lBottom = min(targetHeight.toFloat(), if (visibleBounds != null) min(maxY, visibleBounds.bottom) else maxY)
+            }
             if (lRight <= lLeft || lBottom <= lTop) return
 
             val layerPaint = if (layerAlpha < 0.999f) {
@@ -1175,9 +1215,11 @@ object KodanimaGraphicsEngine {
             cp.reset()
             if (stroke.clipInverted) {
                 cp.fillType = android.graphics.Path.FillType.EVEN_ODD
-                val boundW = max(4096f, stroke.clipBoundsWidth + 1024f)
-                val boundH = max(4096f, stroke.clipBoundsHeight + 1024f)
-                cp.addRect(-1024f, -1024f, boundW, boundH, android.graphics.Path.Direction.CW)
+                val boundMinX = min(-8192f, stroke.minX - stroke.brushSize - 256f)
+                val boundMinY = min(-8192f, stroke.minY - stroke.brushSize - 256f)
+                val boundW = max(8192f, max(stroke.clipBoundsWidth, stroke.maxX) + stroke.brushSize + 2048f)
+                val boundH = max(8192f, max(stroke.clipBoundsHeight, stroke.maxY) + stroke.brushSize + 2048f)
+                cp.addRect(boundMinX, boundMinY, boundW, boundH, android.graphics.Path.Direction.CW)
             } else {
                 cp.fillType = android.graphics.Path.FillType.WINDING
             }
@@ -1195,7 +1237,7 @@ object KodanimaGraphicsEngine {
             var sMinY = stroke.minY
             var sMaxX = stroke.maxX
             var sMaxY = stroke.maxY
-            if (sMinX == Float.MAX_VALUE || sMaxX == Float.MIN_VALUE) {
+            if (sMinX == Float.MAX_VALUE || sMaxX == -Float.MAX_VALUE) {
                 sMinX = Float.MAX_VALUE; sMinY = Float.MAX_VALUE
                 sMaxX = -Float.MAX_VALUE; sMaxY = -Float.MAX_VALUE
                 for (pt in points) {

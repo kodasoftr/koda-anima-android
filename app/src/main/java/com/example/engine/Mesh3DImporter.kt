@@ -191,15 +191,19 @@ object Mesh3DImporter {
         val rawMeshes = when (ext) {
             "glb" -> parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
             "gltf" -> parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, siblingResolver)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
+            "fbx" -> FbxAndMax3DParser.parseFbx(bytes, siblingResolver)
+            "3ds" -> FbxAndMax3DParser.parse3ds(bytes, siblingResolver)
+            "max" -> FbxAndMax3DParser.parseMaxScene(bytes, siblingResolver)
             "obj" -> parseObj(bytes.toString(Charsets.UTF_8), siblingResolver)
             "stl" -> parseStl(bytes)
             "ply" -> parsePly(bytes.toString(Charsets.UTF_8))
-            else -> {
-                if (isGlbHeader(bytes)) {
-                    parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
-                } else {
-                    parseObj(bytes.toString(Charsets.UTF_8), siblingResolver)
-                }
+            else -> when {
+                isGlbHeader(bytes) -> parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
+                FbxAndMax3DParser.isFbxBinary(bytes) || FbxAndMax3DParser.isFbxAscii(bytes) ->
+                    FbxAndMax3DParser.parseFbx(bytes, siblingResolver)
+                FbxAndMax3DParser.is3dsBinary(bytes) -> FbxAndMax3DParser.parse3ds(bytes, siblingResolver)
+                FbxAndMax3DParser.isMaxCompoundFile(bytes) -> FbxAndMax3DParser.parseMaxScene(bytes, siblingResolver)
+                else -> parseObj(bytes.toString(Charsets.UTF_8), siblingResolver)
             }
         }
         if (rawMeshes.isEmpty()) return null
@@ -232,11 +236,18 @@ object Mesh3DImporter {
         val rawMeshes = when (ext) {
             "glb" -> parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
             "gltf" -> parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, resolver)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
+            "fbx" -> FbxAndMax3DParser.parseFbx(bytes, resolver)
+            "3ds" -> FbxAndMax3DParser.parse3ds(bytes, resolver)
+            "max" -> FbxAndMax3DParser.parseMaxScene(bytes, resolver)
             "obj" -> parseObj(bytes.toString(Charsets.UTF_8), resolver)
             "stl" -> parseStl(bytes)
             "ply" -> parsePly(bytes.toString(Charsets.UTF_8))
             else -> when {
                 isGlbHeader(bytes) -> parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
+                FbxAndMax3DParser.isFbxBinary(bytes) || FbxAndMax3DParser.isFbxAscii(bytes) ->
+                    FbxAndMax3DParser.parseFbx(bytes, resolver)
+                FbxAndMax3DParser.is3dsBinary(bytes) -> FbxAndMax3DParser.parse3ds(bytes, resolver)
+                FbxAndMax3DParser.isMaxCompoundFile(bytes) -> FbxAndMax3DParser.parseMaxScene(bytes, resolver)
                 bytes.decodeToString(0, min(bytes.size, 64)).trimStart().startsWith("{") ->
                     parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, resolver)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
                 else -> parseObj(bytes.toString(Charsets.UTF_8), resolver)
@@ -302,7 +313,7 @@ object Mesh3DImporter {
     }
 
     private fun findPrimarySceneFile(dir: File): File? {
-        val priority = listOf("glb", "gltf", "obj", "ply", "stl")
+        val priority = listOf("glb", "gltf", "fbx", "obj", "3ds", "max", "ply", "stl")
         val files = dir.walkTopDown().filter { it.isFile && !it.name.startsWith(".") }.toList()
         for (ext in priority) {
             val found = files.firstOrNull { it.extension.equals(ext, ignoreCase = true) }
@@ -1440,7 +1451,8 @@ object Mesh3DImporter {
             } else {
                 computeNormals(vOut, sm.indices)
             }
-            sm.copy(vertices = vOut, normals = nOut)
+            val safeUvs = ensureNonZeroUvs(vOut, sm.uvs)
+            sm.copy(vertices = vOut, normals = nOut, uvs = safeUvs)
         }
         val finalAnimData = animData?.copy(
             normCenterX = cx,
@@ -1455,6 +1467,21 @@ object Mesh3DImporter {
             boundingRadius = targetRadius,
             animData = finalAnimData
         )
+    }
+
+    private fun ensureNonZeroUvs(vertices: FloatArray, existingUvs: FloatArray): FloatArray {
+        val vCount = vertices.size / 3
+        if (existingUvs.size >= vCount * 2) {
+            var anyNonZero = false
+            for (k in 0 until vCount * 2) {
+                if (kotlin.math.abs(existingUvs[k]) > 1e-4f) {
+                    anyNonZero = true
+                    break
+                }
+            }
+            if (anyNonZero) return existingUvs
+        }
+        return FbxAndMax3DParser.generatePlanarFallbackUvs(vertices)
     }
 
     private fun computeNormals(vertices: FloatArray, indices: IntArray): FloatArray {
@@ -1583,6 +1610,9 @@ object Mesh3DImporter {
     private fun detectFormatByHeader(bytes: ByteArray, fileName: String): String {
         if (isGlbHeader(bytes)) return "glb"
         if (isZipHeader(bytes)) return "zip"
+        if (FbxAndMax3DParser.isFbxBinary(bytes) || FbxAndMax3DParser.isFbxAscii(bytes)) return "fbx"
+        if (FbxAndMax3DParser.is3dsBinary(bytes)) return "3ds"
+        if (FbxAndMax3DParser.isMaxCompoundFile(bytes)) return "max"
         val head = bytes.decodeToString(0, min(bytes.size, 64)).trimStart()
         if (head.startsWith("{")) return "gltf"
         if (head.lowercase(Locale.ROOT).startsWith("ply")) return "ply"

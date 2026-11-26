@@ -117,8 +117,8 @@ data class DrawingStroke(
     val clipBoundsHeight: Float = 0f,
     val minX: Float = Float.MAX_VALUE,
     val minY: Float = Float.MAX_VALUE,
-    val maxX: Float = Float.MIN_VALUE,
-    val maxY: Float = Float.MIN_VALUE
+    val maxX: Float = -Float.MAX_VALUE,
+    val maxY: Float = -Float.MAX_VALUE
 ) {
     /**
      * Fast AABB intersection check for viewport chunk culling.
@@ -128,8 +128,8 @@ data class DrawingStroke(
         val halfB = brushSize / 2f + 4f
         val bMinX = (if (minX != Float.MAX_VALUE) minX else points.minOf { it.x }) - halfB
         val bMinY = (if (minY != Float.MAX_VALUE) minY else points.minOf { it.y }) - halfB
-        val bMaxX = (if (maxX != Float.MIN_VALUE) maxX else points.maxOf { it.x }) + halfB
-        val bMaxY = (if (maxY != Float.MIN_VALUE) maxY else points.maxOf { it.y }) + halfB
+        val bMaxX = (if (maxX != -Float.MAX_VALUE) maxX else points.maxOf { it.x }) + halfB
+        val bMaxY = (if (maxY != -Float.MAX_VALUE) maxY else points.maxOf { it.y }) + halfB
         return bMaxX >= left && bMinX <= right && bMaxY >= top && bMinY <= bottom
     }
 }
@@ -480,6 +480,121 @@ data class LayerTransformTrack(
     val keyframes: List<ObjectTransformKeyframe> = emptyList()
 )
 
+enum class ObjectShaderMode(val labelPt: String) {
+    PADRAO("Padrão PBR"),
+    ANIME_CEL("Cel Anime"),
+    CARTOON_BRUSH("Cartoon Brush"),
+    SEM_LUZ("Sem Luz (Flat)"),
+    ARAMADO("Aramado (Wire)")
+}
+
+data class ObjectOutlineSettings(
+    val enabled: Boolean = false,
+    val width: Float = 2.0f,
+    val colorArgb: Long = 0xFF10131CL
+)
+
+data class ObjectLightSettings(
+    val azimuthDeg: Float = 40f,
+    val elevationDeg: Float = 52f,
+    val intensity: Float = 1.0f,
+    val ambient: Float = 0.28f,
+    val rimStrength: Float = 0.25f,
+    val emissiveGlow: Float = 0f,
+    val lightColorArgb: Long = 0xFFFFFFFFL
+)
+
+enum class UvUnwrapProjection(val labelPt: String) {
+    ORIGINAL("UV Original"),
+    PLANAR("Planar"),
+    BOX("Caixa (Box)"),
+    ESFERICO("Esférico"),
+    CILINDRICO("Cilíndrico")
+}
+
+data class ObjectUVMapSlot(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "UVMap Principal",
+    val projection: UvUnwrapProjection = UvUnwrapProjection.ORIGINAL,
+    val scaleU: Float = 1f,
+    val scaleV: Float = 1f,
+    val offsetU: Float = 0f,
+    val offsetV: Float = 0f,
+    val textureBase64: String? = null,
+    val textureUri: String? = null
+)
+
+enum class Estudio3DPaintTool(val labelPt: String) {
+    PINCEL("Pincel"),
+    BORRACHA("Borracha"),
+    MOLHADOR("Molhador")
+}
+
+data class ObjectTexturePaintLayer(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "Pintura 1",
+    val isVisible: Boolean = true,
+    val opacity: Float = 1f,
+    val blendEffect: LayerBlendEffect = LayerBlendEffect.NORMAL,
+    val pixelsBase64: String? = null,
+    val texWidth: Int = 256,
+    val texHeight: Int = 256
+)
+
+enum class ShaderNodeKind(val labelPt: String, val accentArgb: Long) {
+    UV_COORD("Coord. UV", 0xFF8E44ADL),
+    TEXTURA_UV("Textura UV", 0xFFD35400L),
+    LUZ_OBJETO("Luz Própria", 0xFFF39C12L),
+    CEL_RAMP("Rampa Cel/Anime", 0xFF00BCD4L),
+    BRUSH_GRAIN("Traço Cartoon", 0xFFE91E63L),
+    CONTORNO("Contorno", 0xFF2ECC71L),
+    SAIDA_MATERIAL("Saída Material", 0xFFC0392BL)
+}
+
+data class ShaderNode(
+    val id: String,
+    val kind: ShaderNodeKind,
+    val x: Float,
+    val y: Float,
+    val paramA: Float = 0.5f,
+    val paramB: Float = 0.5f,
+    val colorArgb: Long = 0xFFFFFFFFL
+)
+
+data class ShaderNodeLink(
+    val id: String = UUID.randomUUID().toString(),
+    val fromNodeId: String,
+    val toNodeId: String
+)
+
+data class ShaderNodeGraph(
+    val enabled: Boolean = false,
+    val presetName: String = "Cartoon Studio",
+    val nodes: List<ShaderNode> = defaultNodes(),
+    val links: List<ShaderNodeLink> = defaultLinks()
+) {
+    companion object {
+        fun defaultNodes(): List<ShaderNode> = listOf(
+            ShaderNode("uv", ShaderNodeKind.UV_COORD, 40f, 120f, paramA = 1f, paramB = 1f),
+            ShaderNode("tex", ShaderNodeKind.TEXTURA_UV, 210f, 60f, paramA = 1f, paramB = 0f),
+            ShaderNode("light", ShaderNodeKind.LUZ_OBJETO, 210f, 210f, paramA = 0.7f, paramB = 0.3f),
+            ShaderNode("ramp", ShaderNodeKind.CEL_RAMP, 390f, 110f, paramA = 3f, paramB = 0.25f),
+            ShaderNode("brush", ShaderNodeKind.BRUSH_GRAIN, 390f, 250f, paramA = 0.35f, paramB = 0.5f),
+            ShaderNode("outline", ShaderNodeKind.CONTORNO, 560f, 240f, paramA = 2.0f, paramB = 1f, colorArgb = 0xFF10131CL),
+            ShaderNode("out", ShaderNodeKind.SAIDA_MATERIAL, 570f, 100f, paramA = 1f, paramB = 0f)
+        )
+
+        fun defaultLinks(): List<ShaderNodeLink> = listOf(
+            ShaderNodeLink("l1", "uv", "tex"),
+            ShaderNodeLink("l2", "tex", "ramp"),
+            ShaderNodeLink("l3", "light", "ramp"),
+            ShaderNodeLink("l4", "ramp", "brush"),
+            ShaderNodeLink("l5", "brush", "out"),
+            ShaderNodeLink("l6", "outline", "out")
+        )
+    }
+}
+
 data class SceneObject3D(
     val id: String = UUID.randomUUID().toString(),
     val name: String = "Objeto 3D",
@@ -487,7 +602,16 @@ data class SceneObject3D(
     val formatTag: String = "obj",
     val isVisible: Boolean = true,
     val colorTint: Long = 0xFFFFFFFFL,
-    val keyframes: List<ObjectTransformKeyframe> = listOf(ObjectTransformKeyframe(frameIndex = 0))
+    val keyframes: List<ObjectTransformKeyframe> = listOf(ObjectTransformKeyframe(frameIndex = 0)),
+    val shaderMode: ObjectShaderMode = ObjectShaderMode.PADRAO,
+    val outline: ObjectOutlineSettings = ObjectOutlineSettings(),
+    val light: ObjectLightSettings = ObjectLightSettings(),
+    val uvSlots: List<ObjectUVMapSlot> = listOf(ObjectUVMapSlot()),
+    val activeUvSlotIndex: Int = 0,
+    val paintLayers: List<ObjectTexturePaintLayer> = emptyList(),
+    val activePaintLayerIndex: Int = 0,
+    val nodeGraph: ShaderNodeGraph = ShaderNodeGraph(),
+    val bakedTextureBase64: String? = null
 )
 
 data class CameraEffectSpan(

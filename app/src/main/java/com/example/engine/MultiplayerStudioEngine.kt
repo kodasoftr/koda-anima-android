@@ -71,6 +71,53 @@ class MultiplayerStudioEngine(
         const val DEFAULT_CONTROL_PORT = 8767
         const val NSD_SERVICE_TYPE = "_kodanima._tcp."
         private const val BEACON_MAGIC = "KODANIMA_ROOM_BEACON_V2"
+        private const val GZIP_LINE_PREFIX = "GZ1:"
+
+        private fun base64EncodeNoWrap(bytes: ByteArray): String {
+            return try {
+                android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+            } catch (_: Throwable) {
+                java.util.Base64.getEncoder().encodeToString(bytes)
+            }
+        }
+
+        private fun base64Decode(text: String): ByteArray {
+            return try {
+                android.util.Base64.decode(text, android.util.Base64.DEFAULT)
+            } catch (_: Throwable) {
+                java.util.Base64.getDecoder().decode(text)
+            }
+        }
+
+        /**
+         * Lossless line framing compression ("GZ1:<b64>") for heavy 3D, UV texture & off-canvas sync payloads.
+         * Keeps small low-latency packets (cursor/ping) uncompressed and is idempotent if already framed.
+         */
+        fun encodeFrameLine(rawLine: String): String {
+            if (rawLine.startsWith(GZIP_LINE_PREFIX) || rawLine.length <= 768) return rawLine
+            return try {
+                val baos = java.io.ByteArrayOutputStream(rawLine.length / 2)
+                java.util.zip.GZIPOutputStream(baos).use { gz ->
+                    gz.write(rawLine.toByteArray(Charsets.UTF_8))
+                }
+                val encoded = GZIP_LINE_PREFIX + base64EncodeNoWrap(baos.toByteArray())
+                if (encoded.length < rawLine.length) encoded else rawLine
+            } catch (_: Exception) {
+                rawLine
+            }
+        }
+
+        fun decodeFrameLine(line: String): String {
+            if (!line.startsWith(GZIP_LINE_PREFIX)) return line
+            return try {
+                val compressed = base64Decode(line.removePrefix(GZIP_LINE_PREFIX))
+                java.util.zip.GZIPInputStream(java.io.ByteArrayInputStream(compressed)).use { gz ->
+                    gz.readBytes().toString(Charsets.UTF_8)
+                }
+            } catch (_: Exception) {
+                line
+            }
+        }
 
         /**
          * Pure helper for generating candidate /24 host IPs for dual-band (2.4GHz <-> 5GHz) LAN discovery.
@@ -131,6 +178,17 @@ class MultiplayerStudioEngine(
     var onPeerCursorIconUpdated: ((peerId: String, customCursorBase64: String?) -> Unit)? = null
     var onBrushDefinitionReceived: ((senderId: String, senderName: String, preset: BrushPreset) -> Unit)? = null
     var onMoveLayerReceived: ((fromIndex: Int, toIndex: Int) -> Unit)? = null
+    var onCamera3DSyncReceived: ((senderId: String, camera3D: com.example.model.Camera3DSettings) -> Unit)? = null
+    var onObject3DTexSyncReceived: ((
+        senderId: String,
+        objectId: String,
+        uvSlots: List<com.example.model.ObjectUVMapSlot>,
+        activeUvSlotIndex: Int,
+        paintLayers: List<com.example.model.ObjectTexturePaintLayer>,
+        activePaintLayerIndex: Int,
+        bakedTextureBase64: String?
+    ) -> Unit)? = null
+    var onScene3DAssetReceived: ((senderId: String, objectId: String, fileName: String, assetBytesBase64: String) -> Unit)? = null
 
     private data class PendingClient(
         val reader: BufferedReader,
@@ -501,9 +559,9 @@ class MultiplayerStudioEngine(
         var reader: BufferedReader? = null
         var writer: BufferedWriter? = null
         try {
-            reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8), 16384)
-            writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), Charsets.UTF_8), 16384)
-            val line = reader.readLine() ?: return
+            reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8), 65536)
+            writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), Charsets.UTF_8), 65536)
+            val line = reader.readLine()?.let { decodeFrameLine(it) } ?: return
             val json = JSONObject(line)
             val remoteIp = sock.inetAddress?.hostAddress ?: ""
             processControlOrDiscoveryJson(json, remoteIp)
@@ -730,8 +788,8 @@ class MultiplayerStudioEngine(
             sock = Socket()
             tuneLowLatencySocket(sock)
             sock.connect(InetSocketAddress(ip, port), 2500)
-            writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), Charsets.UTF_8), 16384)
-            reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8), 16384)
+            writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), Charsets.UTF_8), 65536)
+            reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8), 65536)
 
             val u = localUser
             val room = activeRoomInfo
@@ -753,7 +811,7 @@ class MultiplayerStudioEngine(
             }.toString()
             writeLineThreadSafe(writer, hello)
 
-            val respLine = reader.readLine()
+            val respLine = reader.readLine()?.let { decodeFrameLine(it) }
             if (!respLine.isNullOrBlank()) {
                 processControlOrDiscoveryJson(JSONObject(respLine), ip)
             }
@@ -1313,10 +1371,10 @@ class MultiplayerStudioEngine(
     ) {
         scope.launch(KodanimaDispatchers.networkIo) {
             try {
-                val reader = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8), 16384)
-                val writer = BufferedWriter(OutputStreamWriter(outputStream, Charsets.UTF_8), 16384)
+                val reader = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8), 65536)
+                val writer = BufferedWriter(OutputStreamWriter(outputStream, Charsets.UTF_8), 65536)
 
-                val firstLine = reader.readLine() ?: run {
+                val firstLine = reader.readLine()?.let { decodeFrameLine(it) } ?: run {
                     closeHandle()
                     return@launch
                 }
@@ -1444,7 +1502,8 @@ class MultiplayerStudioEngine(
     ) {
         try {
             while (true) {
-                val line = reader.readLine() ?: break
+                val rawLine = reader.readLine() ?: break
+                val line = decodeFrameLine(rawLine)
                 val packet = JSONObject(line)
                 when (packet.optString("type")) {
                     "STROKE" -> {
@@ -1598,6 +1657,49 @@ class MultiplayerStudioEngine(
                     "CLIENT_LEAVE" -> {
                         break
                     }
+                    "CAMERA3D_SYNC" -> {
+                        val senderId = packet.optString("senderId", "")
+                        val camObj = packet.optJSONObject("camera3D")
+                        if (camObj != null) {
+                            val parsedCam = FileImportExportManager.jsonToCamera3D(camObj)
+                            withContext(Dispatchers.Main) {
+                                onCamera3DSyncReceived?.invoke(senderId, parsedCam)
+                            }
+                            broadcastToOtherPeers(connId, line)
+                        }
+                    }
+                    "OBJECT3D_TEX_SYNC" -> {
+                        val senderId = packet.optString("senderId", "")
+                        val objectId = packet.optString("objectId", "")
+                        val objJson = packet.optJSONObject("object")
+                        if (objectId.isNotBlank() && objJson != null) {
+                            val parsedObj = FileImportExportManager.jsonToSceneObject3D(objJson)
+                            withContext(Dispatchers.Main) {
+                                onObject3DTexSyncReceived?.invoke(
+                                    senderId,
+                                    objectId,
+                                    parsedObj.uvSlots,
+                                    parsedObj.activeUvSlotIndex,
+                                    parsedObj.paintLayers,
+                                    parsedObj.activePaintLayerIndex,
+                                    parsedObj.bakedTextureBase64
+                                )
+                            }
+                            broadcastToOtherPeers(connId, line)
+                        }
+                    }
+                    "SCENE3D_ASSET" -> {
+                        val senderId = packet.optString("senderId", "")
+                        val objectId = packet.optString("objectId", "")
+                        val fileName = packet.optString("fileName", "model.glb")
+                        val bytesB64 = packet.optString("bytesBase64", "")
+                        if (objectId.isNotBlank() && bytesB64.isNotBlank()) {
+                            withContext(Dispatchers.Main) {
+                                onScene3DAssetReceived?.invoke(senderId, objectId, fileName, bytesB64)
+                            }
+                            broadcastToOtherPeers(connId, line)
+                        }
+                    }
                     "PING" -> {
                         val ts = packet.getLong("timestamp")
                         val pong = JSONObject().apply {
@@ -1684,8 +1786,9 @@ class MultiplayerStudioEngine(
     }
 
     private fun writeLineThreadSafe(writer: BufferedWriter, line: String) {
+        val wireLine = encodeFrameLine(line)
         synchronized(writer) {
-            writer.write(line)
+            writer.write(wireLine)
             writer.newLine()
             writer.flush()
         }
@@ -1762,8 +1865,8 @@ class MultiplayerStudioEngine(
         var writer: BufferedWriter? = null
         var reader: BufferedReader? = null
         try {
-            writer = BufferedWriter(OutputStreamWriter(outputStream, Charsets.UTF_8), 16384)
-            reader = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8), 16384)
+            writer = BufferedWriter(OutputStreamWriter(outputStream, Charsets.UTF_8), 65536)
+            reader = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8), 65536)
             clientWriter = writer
 
             val connId = UUID.randomUUID().toString()
@@ -1779,7 +1882,7 @@ class MultiplayerStudioEngine(
             }.toString()
             writeLineThreadSafe(writer, knockPacket)
 
-            val respLine = reader.readLine() ?: throw IllegalStateException("Conexão fechada pelo anfitrião")
+            val respLine = reader.readLine()?.let { decodeFrameLine(it) } ?: throw IllegalStateException("Conexão fechada pelo anfitrião")
             val resp = JSONObject(respLine)
 
             if (resp.optBoolean("accepted", false)) {
@@ -1831,7 +1934,8 @@ class MultiplayerStudioEngine(
                 var shutdownHandled = false
                 try {
                     while (true) {
-                        val line = reader.readLine() ?: break
+                        val rawLine = reader.readLine() ?: break
+                        val line = decodeFrameLine(rawLine)
                         val packet = JSONObject(line)
                         when (packet.optString("type")) {
                             "STROKE" -> {
@@ -2010,6 +2114,46 @@ class MultiplayerStudioEngine(
                                 }
                                 break
                             }
+                            "CAMERA3D_SYNC" -> {
+                                val senderId = packet.optString("senderId", "")
+                                val camObj = packet.optJSONObject("camera3D")
+                                if (camObj != null) {
+                                    val parsedCam = FileImportExportManager.jsonToCamera3D(camObj)
+                                    withContext(Dispatchers.Main) {
+                                        onCamera3DSyncReceived?.invoke(senderId, parsedCam)
+                                    }
+                                }
+                            }
+                            "OBJECT3D_TEX_SYNC" -> {
+                                val senderId = packet.optString("senderId", "")
+                                val objectId = packet.optString("objectId", "")
+                                val objJson = packet.optJSONObject("object")
+                                if (objectId.isNotBlank() && objJson != null) {
+                                    val parsedObj = FileImportExportManager.jsonToSceneObject3D(objJson)
+                                    withContext(Dispatchers.Main) {
+                                        onObject3DTexSyncReceived?.invoke(
+                                            senderId,
+                                            objectId,
+                                            parsedObj.uvSlots,
+                                            parsedObj.activeUvSlotIndex,
+                                            parsedObj.paintLayers,
+                                            parsedObj.activePaintLayerIndex,
+                                            parsedObj.bakedTextureBase64
+                                        )
+                                    }
+                                }
+                            }
+                            "SCENE3D_ASSET" -> {
+                                val senderId = packet.optString("senderId", "")
+                                val objectId = packet.optString("objectId", "")
+                                val fileName = packet.optString("fileName", "model.glb")
+                                val bytesB64 = packet.optString("bytesBase64", "")
+                                if (objectId.isNotBlank() && bytesB64.isNotBlank()) {
+                                    withContext(Dispatchers.Main) {
+                                        onScene3DAssetReceived?.invoke(senderId, objectId, fileName, bytesB64)
+                                    }
+                                }
+                            }
                             "PING" -> {
                                 val ts = packet.getLong("timestamp")
                                 val pong = JSONObject().apply {
@@ -2063,8 +2207,8 @@ class MultiplayerStudioEngine(
         sessionSenderJob = scope.launch(KodanimaDispatchers.networkIo) {
             for ((type, packet) in sessionSendChannel) {
                 val remaining = outboundQueueDepth.decrementAndGet().coerceAtLeast(0)
-                // Coalesce stale cursor updates under congested Wi-Fi while preserving all stroke/undo/brush packets in strict FIFO order
-                if (type == "CURSOR" && remaining > 12) continue
+                // Coalesce stale cursor / rapid 3D camera updates under congested Wi-Fi while preserving strokes/undo/assets
+                if ((type == "CURSOR" && remaining > 12) || (type == "CAMERA3D_SYNC" && remaining > 6)) continue
                 clientWriter?.let { w ->
                     try { writeLineThreadSafe(w, packet) } catch (_: Exception) {}
                 }
@@ -2252,6 +2396,52 @@ class MultiplayerStudioEngine(
         broadcastSessionPacket(packet)
     }
 
+    fun sendCamera3DSync(
+        senderId: String,
+        camera3D: com.example.model.Camera3DSettings,
+        includeTextures: Boolean = false
+    ) {
+        if (clientWriter == null && hostClientWriters.isEmpty()) return
+        val packet = JSONObject().apply {
+            put("type", "CAMERA3D_SYNC")
+            put("senderId", senderId)
+            put("camera3D", FileImportExportManager.camera3DToJson(camera3D, includeTextures = includeTextures))
+        }.toString()
+        broadcastSessionPacket(packet, "CAMERA3D_SYNC")
+    }
+
+    fun sendObject3DTextureSync(
+        senderId: String,
+        obj: com.example.model.SceneObject3D
+    ) {
+        if (clientWriter == null && hostClientWriters.isEmpty()) return
+        val packet = JSONObject().apply {
+            put("type", "OBJECT3D_TEX_SYNC")
+            put("senderId", senderId)
+            put("objectId", obj.id)
+            put("object", FileImportExportManager.sceneObject3DToJson(obj, includeTextures = true))
+        }.toString()
+        broadcastSessionPacket(packet, "OBJECT3D_TEX_SYNC")
+    }
+
+    fun sendScene3DAsset(
+        senderId: String,
+        objectId: String,
+        fileName: String,
+        rawBytes: ByteArray
+    ) {
+        if (clientWriter == null && hostClientWriters.isEmpty()) return
+        if (rawBytes.isEmpty() || rawBytes.size > 6 * 1024 * 1024) return
+        val packet = JSONObject().apply {
+            put("type", "SCENE3D_ASSET")
+            put("senderId", senderId)
+            put("objectId", objectId)
+            put("fileName", fileName)
+            put("bytesBase64", base64EncodeNoWrap(rawBytes))
+        }.toString()
+        broadcastSessionPacket(packet, "SCENE3D_ASSET")
+    }
+
     fun sendClientLeave(userId: String) {
         val w = clientWriter ?: return
         val packet = JSONObject().apply {
@@ -2375,8 +2565,8 @@ class MultiplayerStudioEngine(
         val points = mutableListOf<StrokePoint>()
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
-        var maxX = Float.MIN_VALUE
-        var maxY = Float.MIN_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
 
         val compactArr = obj.optJSONArray("pts")
         if (compactArr != null) {

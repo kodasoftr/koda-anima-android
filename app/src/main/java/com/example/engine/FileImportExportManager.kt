@@ -101,79 +101,7 @@ object FileImportExportManager {
         root.put("onionSkin", os)
 
         // 3D Camera & Post Effects
-        val cam = project.camera3D
-        val camObj = JSONObject().apply {
-            put("isEnabled", cam.isEnabled)
-            put("showCaptureFrame", cam.showCaptureFrame)
-            put("autoInterpolate", cam.autoInterpolate)
-            put("captureWidth", cam.captureWidth)
-            put("captureHeight", cam.captureHeight)
-            put("layerDepthSpacing", cam.layerDepthSpacing.toDouble())
-            put("cameraMode", cam.cameraMode.name)
-            val kArr = JSONArray()
-            cam.keyframes.forEach { kf ->
-                kArr.put(JSONObject().apply {
-                    put("frameIndex", kf.frameIndex)
-                    put("x", kf.x.toDouble())
-                    put("y", kf.y.toDouble())
-                    put("zoom", kf.zoom.toDouble())
-                    put("rotationZ", kf.rotationZ.toDouble())
-                    put("pitchX", kf.pitchX.toDouble())
-                    put("yawY", kf.yawY.toDouble())
-                    put("depthSeparation", kf.depthSeparation.toDouble())
-                    put("fovDegrees", kf.fovDegrees.toDouble())
-                    put("easing", kf.easing.name)
-                    put("bezierP1X", kf.bezierP1X.toDouble())
-                    put("bezierP1Y", kf.bezierP1Y.toDouble())
-                    put("bezierP2X", kf.bezierP2X.toDouble())
-                    put("bezierP2Y", kf.bezierP2Y.toDouble())
-                    put("holdTicks", kf.holdTicks)
-                })
-            }
-            put("keyframes", kArr)
-            val spanArr = JSONArray()
-            cam.effectSpans.forEach { sp ->
-                spanArr.put(JSONObject().apply {
-                    put("id", sp.id)
-                    put("effect", sp.effect.name)
-                    put("startFrame", sp.startFrame)
-                    put("endFrame", sp.endFrame)
-                    put("intensity", sp.intensity.toDouble())
-                })
-            }
-            put("effectSpans", spanArr)
-            put("postEffects", JSONObject().apply {
-                put("vignette", cam.postEffects.vignette.toDouble())
-                put("bloom", cam.postEffects.bloom.toDouble())
-                put("chromaticAberration", cam.postEffects.chromaticAberration.toDouble())
-                put("filmGrain", cam.postEffects.filmGrain.toDouble())
-                put("sepia", cam.postEffects.sepia.toDouble())
-                put("radialBlur", cam.postEffects.radialBlur.toDouble())
-                put("contrastBoost", cam.postEffects.contrastBoost.toDouble())
-            })
-            val layerTrackArr = JSONArray()
-            cam.layerTransformTracks.forEach { track ->
-                layerTrackArr.put(JSONObject().apply {
-                    put("layerId", track.layerId)
-                    put("keyframes", objectKeyframesToJsonArray(track.keyframes))
-                })
-            }
-            put("layerTransformTracks", layerTrackArr)
-            val objArr = JSONArray()
-            cam.scene3DObjects.forEach { obj ->
-                objArr.put(JSONObject().apply {
-                    put("id", obj.id)
-                    put("name", obj.name)
-                    put("meshAssetPath", obj.meshAssetPath)
-                    put("formatTag", obj.formatTag)
-                    put("isVisible", obj.isVisible)
-                    put("colorTint", obj.colorTint)
-                    put("keyframes", objectKeyframesToJsonArray(obj.keyframes))
-                })
-            }
-            put("scene3DObjects", objArr)
-        }
-        root.put("camera3D", camObj)
+        root.put("camera3D", camera3DToJson(project.camera3D, includeTextures = true))
 
         val bg = project.canvasBackground
         root.put("canvasBackground", JSONObject().apply {
@@ -362,120 +290,7 @@ object FileImportExportManager {
 
         val camObjParsed = root.optJSONObject("camera3D")
         val camera3D = if (camObjParsed != null) {
-            val kArr = camObjParsed.optJSONArray("keyframes")
-            val kfList = ArrayList<Camera3DKeyframe>()
-            if (kArr != null) {
-                for (k in 0 until kArr.length()) {
-                    val ko = kArr.optJSONObject(k) ?: continue
-                    val easing = try {
-                        CameraEasingCurve.valueOf(ko.optString("easing", CameraEasingCurve.BEZIER_SUAVE.name))
-                    } catch (_: Exception) {
-                        CameraEasingCurve.BEZIER_SUAVE
-                    }
-                    kfList.add(
-                        Camera3DKeyframe(
-                            frameIndex = ko.optInt("frameIndex", 0),
-                            x = ko.optDouble("x", 0.0).toFloat(),
-                            y = ko.optDouble("y", 0.0).toFloat(),
-                            zoom = ko.optDouble("zoom", 1.0).toFloat(),
-                            rotationZ = ko.optDouble("rotationZ", 0.0).toFloat(),
-                            pitchX = ko.optDouble("pitchX", 0.0).toFloat(),
-                            yawY = ko.optDouble("yawY", 0.0).toFloat(),
-                            depthSeparation = ko.optDouble("depthSeparation", 38.0).toFloat(),
-                            fovDegrees = ko.optDouble("fovDegrees", 50.0).toFloat().coerceIn(18f, 120f),
-                            easing = easing,
-                            bezierP1X = ko.optDouble("bezierP1X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
-                            bezierP1Y = ko.optDouble("bezierP1Y", 0.1).toFloat().coerceIn(-0.4f, 1.4f),
-                            bezierP2X = ko.optDouble("bezierP2X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
-                            bezierP2Y = ko.optDouble("bezierP2Y", 1.0).toFloat().coerceIn(-0.4f, 1.4f),
-                            holdTicks = ko.optInt("holdTicks", 1).coerceIn(1, 240)
-                        )
-                    )
-                }
-            }
-            val sArr = camObjParsed.optJSONArray("effectSpans")
-            val spansList = ArrayList<com.example.model.CameraEffectSpan>()
-            if (sArr != null) {
-                for (si in 0 until sArr.length()) {
-                    val so = sArr.optJSONObject(si) ?: continue
-                    val ef = try {
-                        com.example.model.CameraBuiltInEffect.valueOf(so.optString("effect", ""))
-                    } catch (_: Exception) { continue }
-                    spansList.add(
-                        com.example.model.CameraEffectSpan(
-                            id = so.optString("id", java.util.UUID.randomUUID().toString()),
-                            effect = ef,
-                            startFrame = so.optInt("startFrame", 0).coerceAtLeast(0),
-                            endFrame = so.optInt("endFrame", 6).coerceAtLeast(0),
-                            intensity = so.optDouble("intensity", 1.0).toFloat()
-                        )
-                    )
-                }
-            }
-            val camMode = try {
-                com.example.model.CameraMode.valueOf(camObjParsed.optString("cameraMode", com.example.model.CameraMode.MODE_3D.name))
-            } catch (_: Exception) { com.example.model.CameraMode.MODE_3D }
-            val po = camObjParsed.optJSONObject("postEffects")
-            val postEffects = if (po != null) {
-                CameraPostEffectSettings(
-                    vignette = po.optDouble("vignette", 0.0).toFloat(),
-                    bloom = po.optDouble("bloom", 0.0).toFloat(),
-                    chromaticAberration = po.optDouble("chromaticAberration", 0.0).toFloat(),
-                    filmGrain = po.optDouble("filmGrain", 0.0).toFloat(),
-                    sepia = po.optDouble("sepia", 0.0).toFloat(),
-                    radialBlur = po.optDouble("radialBlur", 0.0).toFloat(),
-                    contrastBoost = po.optDouble("contrastBoost", 0.0).toFloat()
-                )
-            } else CameraPostEffectSettings()
-            val layerTracksParsed = mutableListOf<com.example.model.LayerTransformTrack>()
-            val ltArr = camObjParsed.optJSONArray("layerTransformTracks")
-            if (ltArr != null) {
-                for (i in 0 until ltArr.length()) {
-                    val to = ltArr.optJSONObject(i) ?: continue
-                    val lid = to.optString("layerId", "")
-                    if (lid.isNotBlank()) {
-                        layerTracksParsed.add(
-                            com.example.model.LayerTransformTrack(
-                                layerId = lid,
-                                keyframes = parseObjectKeyframes(to.optJSONArray("keyframes"))
-                            )
-                        )
-                    }
-                }
-            }
-            val sceneObjsParsed = mutableListOf<com.example.model.SceneObject3D>()
-            val soArr = camObjParsed.optJSONArray("scene3DObjects")
-            if (soArr != null) {
-                for (i in 0 until soArr.length()) {
-                    val oo = soArr.optJSONObject(i) ?: continue
-                    val kfs = parseObjectKeyframes(oo.optJSONArray("keyframes"))
-                    sceneObjsParsed.add(
-                        com.example.model.SceneObject3D(
-                            id = oo.optString("id", java.util.UUID.randomUUID().toString()),
-                            name = oo.optString("name", "Objeto 3D"),
-                            meshAssetPath = oo.optString("meshAssetPath", ""),
-                            formatTag = oo.optString("formatTag", "obj"),
-                            isVisible = oo.optBoolean("isVisible", true),
-                            colorTint = oo.optLong("colorTint", 0xFFFFFFFFL),
-                            keyframes = if (kfs.isEmpty()) listOf(com.example.model.ObjectTransformKeyframe(0)) else kfs
-                        )
-                    )
-                }
-            }
-            Camera3DSettings(
-                isEnabled = camObjParsed.optBoolean("isEnabled", false),
-                showCaptureFrame = camObjParsed.optBoolean("showCaptureFrame", true),
-                autoInterpolate = camObjParsed.optBoolean("autoInterpolate", true),
-                captureWidth = camObjParsed.optInt("captureWidth", finalResolution.width).coerceIn(160, 4096),
-                captureHeight = camObjParsed.optInt("captureHeight", finalResolution.height).coerceIn(160, 4096),
-                layerDepthSpacing = camObjParsed.optDouble("layerDepthSpacing", 38.0).toFloat(),
-                keyframes = if (kfList.isEmpty()) listOf(Camera3DKeyframe(frameIndex = 0)) else kfList,
-                postEffects = postEffects,
-                cameraMode = camMode,
-                effectSpans = spansList,
-                layerTransformTracks = layerTracksParsed,
-                scene3DObjects = sceneObjsParsed
-            )
+            jsonToCamera3D(camObjParsed, finalResolution.width, finalResolution.height)
         } else {
             Camera3DSettings(
                 captureWidth = finalResolution.width,
@@ -699,8 +514,8 @@ object FileImportExportManager {
                 val pointsArray = sObj.optJSONArray("points")
                 var sMinX = Float.MAX_VALUE
                 var sMinY = Float.MAX_VALUE
-                var sMaxX = Float.MIN_VALUE
-                var sMaxY = Float.MIN_VALUE
+                var sMaxX = -Float.MAX_VALUE
+                var sMaxY = -Float.MAX_VALUE
                 if (pointsArray != null) {
                     for (pIdx in 0 until pointsArray.length()) {
                         val pObj = pointsArray.optJSONObject(pIdx) ?: continue
@@ -843,5 +658,418 @@ object FileImportExportManager {
             )
         }
         return out
+    }
+
+    fun camera3DToJson(cam: Camera3DSettings, includeTextures: Boolean = true): JSONObject {
+        return JSONObject().apply {
+            put("isEnabled", cam.isEnabled)
+            put("showCaptureFrame", cam.showCaptureFrame)
+            put("autoInterpolate", cam.autoInterpolate)
+            put("captureWidth", cam.captureWidth)
+            put("captureHeight", cam.captureHeight)
+            put("layerDepthSpacing", cam.layerDepthSpacing.toDouble())
+            put("cameraMode", cam.cameraMode.name)
+            val kArr = JSONArray()
+            cam.keyframes.forEach { kf ->
+                kArr.put(JSONObject().apply {
+                    put("frameIndex", kf.frameIndex)
+                    put("x", kf.x.toDouble())
+                    put("y", kf.y.toDouble())
+                    put("zoom", kf.zoom.toDouble())
+                    put("rotationZ", kf.rotationZ.toDouble())
+                    put("pitchX", kf.pitchX.toDouble())
+                    put("yawY", kf.yawY.toDouble())
+                    put("depthSeparation", kf.depthSeparation.toDouble())
+                    put("fovDegrees", kf.fovDegrees.toDouble())
+                    put("easing", kf.easing.name)
+                    put("bezierP1X", kf.bezierP1X.toDouble())
+                    put("bezierP1Y", kf.bezierP1Y.toDouble())
+                    put("bezierP2X", kf.bezierP2X.toDouble())
+                    put("bezierP2Y", kf.bezierP2Y.toDouble())
+                    put("holdTicks", kf.holdTicks)
+                })
+            }
+            put("keyframes", kArr)
+            val spanArr = JSONArray()
+            cam.effectSpans.forEach { sp ->
+                spanArr.put(JSONObject().apply {
+                    put("id", sp.id)
+                    put("effect", sp.effect.name)
+                    put("startFrame", sp.startFrame)
+                    put("endFrame", sp.endFrame)
+                    put("intensity", sp.intensity.toDouble())
+                })
+            }
+            put("effectSpans", spanArr)
+            put("postEffects", JSONObject().apply {
+                put("vignette", cam.postEffects.vignette.toDouble())
+                put("bloom", cam.postEffects.bloom.toDouble())
+                put("chromaticAberration", cam.postEffects.chromaticAberration.toDouble())
+                put("filmGrain", cam.postEffects.filmGrain.toDouble())
+                put("sepia", cam.postEffects.sepia.toDouble())
+                put("radialBlur", cam.postEffects.radialBlur.toDouble())
+                put("contrastBoost", cam.postEffects.contrastBoost.toDouble())
+            })
+            val layerTrackArr = JSONArray()
+            cam.layerTransformTracks.forEach { track ->
+                layerTrackArr.put(JSONObject().apply {
+                    put("layerId", track.layerId)
+                    put("keyframes", objectKeyframesToJsonArray(track.keyframes))
+                })
+            }
+            put("layerTransformTracks", layerTrackArr)
+            val objArr = JSONArray()
+            cam.scene3DObjects.forEach { obj ->
+                objArr.put(sceneObject3DToJson(obj, includeTextures = includeTextures))
+            }
+            put("scene3DObjects", objArr)
+        }
+    }
+
+    fun jsonToCamera3D(camObjParsed: JSONObject, defaultWidth: Int = 1280, defaultHeight: Int = 720): Camera3DSettings {
+        val kArr = camObjParsed.optJSONArray("keyframes")
+        val kfList = ArrayList<Camera3DKeyframe>()
+        if (kArr != null) {
+            for (k in 0 until kArr.length()) {
+                val ko = kArr.optJSONObject(k) ?: continue
+                val easing = try {
+                    CameraEasingCurve.valueOf(ko.optString("easing", CameraEasingCurve.BEZIER_SUAVE.name))
+                } catch (_: Exception) {
+                    CameraEasingCurve.BEZIER_SUAVE
+                }
+                kfList.add(
+                    Camera3DKeyframe(
+                        frameIndex = ko.optInt("frameIndex", 0),
+                        x = ko.optDouble("x", 0.0).toFloat(),
+                        y = ko.optDouble("y", 0.0).toFloat(),
+                        zoom = ko.optDouble("zoom", 1.0).toFloat(),
+                        rotationZ = ko.optDouble("rotationZ", 0.0).toFloat(),
+                        pitchX = ko.optDouble("pitchX", 0.0).toFloat(),
+                        yawY = ko.optDouble("yawY", 0.0).toFloat(),
+                        depthSeparation = ko.optDouble("depthSeparation", 38.0).toFloat(),
+                        fovDegrees = ko.optDouble("fovDegrees", 50.0).toFloat().coerceIn(18f, 120f),
+                        easing = easing,
+                        bezierP1X = ko.optDouble("bezierP1X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
+                        bezierP1Y = ko.optDouble("bezierP1Y", 0.1).toFloat().coerceIn(-0.4f, 1.4f),
+                        bezierP2X = ko.optDouble("bezierP2X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
+                        bezierP2Y = ko.optDouble("bezierP2Y", 1.0).toFloat().coerceIn(-0.4f, 1.4f),
+                        holdTicks = ko.optInt("holdTicks", 1).coerceIn(1, 240)
+                    )
+                )
+            }
+        }
+        val sArr = camObjParsed.optJSONArray("effectSpans")
+        val spansList = ArrayList<com.example.model.CameraEffectSpan>()
+        if (sArr != null) {
+            for (si in 0 until sArr.length()) {
+                val so = sArr.optJSONObject(si) ?: continue
+                val ef = try {
+                    com.example.model.CameraBuiltInEffect.valueOf(so.optString("effect", ""))
+                } catch (_: Exception) { continue }
+                spansList.add(
+                    com.example.model.CameraEffectSpan(
+                        id = so.optString("id", java.util.UUID.randomUUID().toString()),
+                        effect = ef,
+                        startFrame = so.optInt("startFrame", 0).coerceAtLeast(0),
+                        endFrame = so.optInt("endFrame", 6).coerceAtLeast(0),
+                        intensity = so.optDouble("intensity", 1.0).toFloat()
+                    )
+                )
+            }
+        }
+        val camMode = try {
+            com.example.model.CameraMode.valueOf(camObjParsed.optString("cameraMode", com.example.model.CameraMode.MODE_3D.name))
+        } catch (_: Exception) { com.example.model.CameraMode.MODE_3D }
+        val po = camObjParsed.optJSONObject("postEffects")
+        val postEffects = if (po != null) {
+            CameraPostEffectSettings(
+                vignette = po.optDouble("vignette", 0.0).toFloat(),
+                bloom = po.optDouble("bloom", 0.0).toFloat(),
+                chromaticAberration = po.optDouble("chromaticAberration", 0.0).toFloat(),
+                filmGrain = po.optDouble("filmGrain", 0.0).toFloat(),
+                sepia = po.optDouble("sepia", 0.0).toFloat(),
+                radialBlur = po.optDouble("radialBlur", 0.0).toFloat(),
+                contrastBoost = po.optDouble("contrastBoost", 0.0).toFloat()
+            )
+        } else CameraPostEffectSettings()
+        val layerTracksParsed = mutableListOf<com.example.model.LayerTransformTrack>()
+        val ltArr = camObjParsed.optJSONArray("layerTransformTracks")
+        if (ltArr != null) {
+            for (i in 0 until ltArr.length()) {
+                val to = ltArr.optJSONObject(i) ?: continue
+                val lid = to.optString("layerId", "")
+                if (lid.isNotBlank()) {
+                    layerTracksParsed.add(
+                        com.example.model.LayerTransformTrack(
+                            layerId = lid,
+                            keyframes = parseObjectKeyframes(to.optJSONArray("keyframes"))
+                        )
+                    )
+                }
+            }
+        }
+        val sceneObjsParsed = mutableListOf<com.example.model.SceneObject3D>()
+        val soArr = camObjParsed.optJSONArray("scene3DObjects")
+        if (soArr != null) {
+            for (i in 0 until soArr.length()) {
+                val oo = soArr.optJSONObject(i) ?: continue
+                sceneObjsParsed.add(jsonToSceneObject3D(oo))
+            }
+        }
+        return Camera3DSettings(
+            isEnabled = camObjParsed.optBoolean("isEnabled", false),
+            showCaptureFrame = camObjParsed.optBoolean("showCaptureFrame", true),
+            autoInterpolate = camObjParsed.optBoolean("autoInterpolate", true),
+            captureWidth = camObjParsed.optInt("captureWidth", defaultWidth).coerceIn(160, 4096),
+            captureHeight = camObjParsed.optInt("captureHeight", defaultHeight).coerceIn(160, 4096),
+            layerDepthSpacing = camObjParsed.optDouble("layerDepthSpacing", 38.0).toFloat(),
+            keyframes = if (kfList.isEmpty()) listOf(Camera3DKeyframe(frameIndex = 0)) else kfList,
+            postEffects = postEffects,
+            cameraMode = camMode,
+            effectSpans = spansList,
+            layerTransformTracks = layerTracksParsed,
+            scene3DObjects = sceneObjsParsed
+        )
+    }
+
+    fun sceneObject3DToJson(obj: com.example.model.SceneObject3D, includeTextures: Boolean = true): JSONObject {
+        return JSONObject().apply {
+            put("id", obj.id)
+            put("name", obj.name)
+            put("meshAssetPath", obj.meshAssetPath)
+            put("formatTag", obj.formatTag)
+            put("isVisible", obj.isVisible)
+            put("colorTint", obj.colorTint)
+            put("keyframes", objectKeyframesToJsonArray(obj.keyframes))
+            put("shaderMode", obj.shaderMode.name)
+            put("outline", JSONObject().apply {
+                put("enabled", obj.outline.enabled)
+                put("width", obj.outline.width.toDouble())
+                put("colorArgb", obj.outline.colorArgb)
+            })
+            put("light", JSONObject().apply {
+                put("azimuthDeg", obj.light.azimuthDeg.toDouble())
+                put("elevationDeg", obj.light.elevationDeg.toDouble())
+                put("intensity", obj.light.intensity.toDouble())
+                put("ambient", obj.light.ambient.toDouble())
+                put("rimStrength", obj.light.rimStrength.toDouble())
+                put("emissiveGlow", obj.light.emissiveGlow.toDouble())
+                put("lightColorArgb", obj.light.lightColorArgb)
+            })
+            val uvArr = JSONArray()
+            obj.uvSlots.forEach { slot ->
+                uvArr.put(JSONObject().apply {
+                    put("id", slot.id)
+                    put("name", slot.name)
+                    put("projection", slot.projection.name)
+                    put("scaleU", slot.scaleU.toDouble())
+                    put("scaleV", slot.scaleV.toDouble())
+                    put("offsetU", slot.offsetU.toDouble())
+                    put("offsetV", slot.offsetV.toDouble())
+                    if (includeTextures) {
+                        slot.textureBase64?.let { put("textureBase64", it) }
+                    }
+                    slot.textureUri?.let { put("textureUri", it) }
+                })
+            }
+            put("uvSlots", uvArr)
+            put("activeUvSlotIndex", obj.activeUvSlotIndex)
+            val plArr = JSONArray()
+            obj.paintLayers.forEach { pl ->
+                plArr.put(JSONObject().apply {
+                    put("id", pl.id)
+                    put("name", pl.name)
+                    put("isVisible", pl.isVisible)
+                    put("opacity", pl.opacity.toDouble())
+                    put("blendEffect", pl.blendEffect.name)
+                    if (includeTextures) {
+                        pl.pixelsBase64?.let { put("pixelsBase64", it) }
+                    }
+                    put("texWidth", pl.texWidth)
+                    put("texHeight", pl.texHeight)
+                })
+            }
+            put("paintLayers", plArr)
+            put("activePaintLayerIndex", obj.activePaintLayerIndex)
+            put("nodeGraph", JSONObject().apply {
+                put("enabled", obj.nodeGraph.enabled)
+                put("presetName", obj.nodeGraph.presetName)
+                val nArr = JSONArray()
+                obj.nodeGraph.nodes.forEach { nd ->
+                    nArr.put(JSONObject().apply {
+                        put("id", nd.id)
+                        put("kind", nd.kind.name)
+                        put("x", nd.x.toDouble())
+                        put("y", nd.y.toDouble())
+                        put("paramA", nd.paramA.toDouble())
+                        put("paramB", nd.paramB.toDouble())
+                        put("colorArgb", nd.colorArgb)
+                    })
+                }
+                put("nodes", nArr)
+                val lArr = JSONArray()
+                obj.nodeGraph.links.forEach { lk ->
+                    lArr.put(JSONObject().apply {
+                        put("id", lk.id)
+                        put("fromNodeId", lk.fromNodeId)
+                        put("toNodeId", lk.toNodeId)
+                    })
+                }
+                put("links", lArr)
+            })
+            if (includeTextures) {
+                obj.bakedTextureBase64?.let { put("bakedTextureBase64", it) }
+            }
+        }
+    }
+
+    fun jsonToSceneObject3D(oo: JSONObject): com.example.model.SceneObject3D {
+        val kfs = parseObjectKeyframes(oo.optJSONArray("keyframes"))
+        val shaderMode = try {
+            com.example.model.ObjectShaderMode.valueOf(
+                oo.optString("shaderMode", com.example.model.ObjectShaderMode.PADRAO.name)
+            )
+        } catch (_: Exception) {
+            com.example.model.ObjectShaderMode.PADRAO
+        }
+        val outObj = oo.optJSONObject("outline")
+        val outline = if (outObj != null) {
+            com.example.model.ObjectOutlineSettings(
+                enabled = outObj.optBoolean("enabled", false),
+                width = outObj.optDouble("width", 2.0).toFloat().coerceIn(0.5f, 8f),
+                colorArgb = outObj.optLong("colorArgb", 0xFF10131CL)
+            )
+        } else com.example.model.ObjectOutlineSettings()
+
+        val lObj = oo.optJSONObject("light")
+        val light = if (lObj != null) {
+            com.example.model.ObjectLightSettings(
+                azimuthDeg = lObj.optDouble("azimuthDeg", 40.0).toFloat(),
+                elevationDeg = lObj.optDouble("elevationDeg", 52.0).toFloat(),
+                intensity = lObj.optDouble("intensity", 1.0).toFloat().coerceIn(0f, 3f),
+                ambient = lObj.optDouble("ambient", 0.28).toFloat().coerceIn(0f, 1f),
+                rimStrength = lObj.optDouble("rimStrength", 0.25).toFloat().coerceIn(0f, 1.5f),
+                emissiveGlow = lObj.optDouble("emissiveGlow", 0.0).toFloat().coerceIn(0f, 2f),
+                lightColorArgb = lObj.optLong("lightColorArgb", 0xFFFFFFFFL)
+            )
+        } else com.example.model.ObjectLightSettings()
+
+        val uvSlots = mutableListOf<com.example.model.ObjectUVMapSlot>()
+        val uvArr = oo.optJSONArray("uvSlots")
+        if (uvArr != null) {
+            for (u in 0 until uvArr.length()) {
+                val uo = uvArr.optJSONObject(u) ?: continue
+                val proj = try {
+                    com.example.model.UvUnwrapProjection.valueOf(
+                        uo.optString("projection", com.example.model.UvUnwrapProjection.ORIGINAL.name)
+                    )
+                } catch (_: Exception) {
+                    com.example.model.UvUnwrapProjection.ORIGINAL
+                }
+                uvSlots.add(
+                    com.example.model.ObjectUVMapSlot(
+                        id = uo.optString("id", java.util.UUID.randomUUID().toString()),
+                        name = uo.optString("name", "UVMap ${u + 1}"),
+                        projection = proj,
+                        scaleU = uo.optDouble("scaleU", 1.0).toFloat(),
+                        scaleV = uo.optDouble("scaleV", 1.0).toFloat(),
+                        offsetU = uo.optDouble("offsetU", 0.0).toFloat(),
+                        offsetV = uo.optDouble("offsetV", 0.0).toFloat(),
+                        textureBase64 = if (uo.has("textureBase64") && !uo.isNull("textureBase64")) uo.optString("textureBase64", "").ifBlank { null } else null,
+                        textureUri = if (uo.has("textureUri") && !uo.isNull("textureUri")) uo.optString("textureUri", "").ifBlank { null } else null
+                    )
+                )
+            }
+        }
+        if (uvSlots.isEmpty()) uvSlots.add(com.example.model.ObjectUVMapSlot())
+
+        val paintLayers = mutableListOf<com.example.model.ObjectTexturePaintLayer>()
+        val plArr = oo.optJSONArray("paintLayers")
+        if (plArr != null) {
+            for (p in 0 until plArr.length()) {
+                val po = plArr.optJSONObject(p) ?: continue
+                val blend = try {
+                    LayerBlendEffect.valueOf(po.optString("blendEffect", LayerBlendEffect.NORMAL.name))
+                } catch (_: Exception) {
+                    LayerBlendEffect.NORMAL
+                }
+                paintLayers.add(
+                    com.example.model.ObjectTexturePaintLayer(
+                        id = po.optString("id", java.util.UUID.randomUUID().toString()),
+                        name = po.optString("name", "Pintura ${p + 1}"),
+                        isVisible = po.optBoolean("isVisible", true),
+                        opacity = po.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f),
+                        blendEffect = blend,
+                        pixelsBase64 = if (po.has("pixelsBase64") && !po.isNull("pixelsBase64")) po.optString("pixelsBase64", "").ifBlank { null } else null,
+                        texWidth = po.optInt("texWidth", 256).coerceIn(32, 1024),
+                        texHeight = po.optInt("texHeight", 256).coerceIn(32, 1024)
+                    )
+                )
+            }
+        }
+
+        val ngObj = oo.optJSONObject("nodeGraph")
+        val nodeGraph = if (ngObj != null) {
+            val nodesList = mutableListOf<com.example.model.ShaderNode>()
+            val nArr = ngObj.optJSONArray("nodes")
+            if (nArr != null) {
+                for (n in 0 until nArr.length()) {
+                    val no = nArr.optJSONObject(n) ?: continue
+                    val kind = try {
+                        com.example.model.ShaderNodeKind.valueOf(no.optString("kind", ""))
+                    } catch (_: Exception) { continue }
+                    nodesList.add(
+                        com.example.model.ShaderNode(
+                            id = no.optString("id", java.util.UUID.randomUUID().toString()),
+                            kind = kind,
+                            x = no.optDouble("x", 60.0).toFloat(),
+                            y = no.optDouble("y", 60.0).toFloat(),
+                            paramA = no.optDouble("paramA", 0.5).toFloat(),
+                            paramB = no.optDouble("paramB", 0.5).toFloat(),
+                            colorArgb = no.optLong("colorArgb", 0xFFFFFFFFL)
+                        )
+                    )
+                }
+            }
+            val linksList = mutableListOf<com.example.model.ShaderNodeLink>()
+            val lArr = ngObj.optJSONArray("links")
+            if (lArr != null) {
+                for (l in 0 until lArr.length()) {
+                    val lo = lArr.optJSONObject(l) ?: continue
+                    linksList.add(
+                        com.example.model.ShaderNodeLink(
+                            id = lo.optString("id", java.util.UUID.randomUUID().toString()),
+                            fromNodeId = lo.optString("fromNodeId", ""),
+                            toNodeId = lo.optString("toNodeId", "")
+                        )
+                    )
+                }
+            }
+            com.example.model.ShaderNodeGraph(
+                enabled = ngObj.optBoolean("enabled", false),
+                presetName = ngObj.optString("presetName", "Cartoon Studio"),
+                nodes = if (nodesList.isEmpty()) com.example.model.ShaderNodeGraph.defaultNodes() else nodesList,
+                links = if (nodesList.isEmpty()) com.example.model.ShaderNodeGraph.defaultLinks() else linksList
+            )
+        } else com.example.model.ShaderNodeGraph()
+
+        return com.example.model.SceneObject3D(
+            id = oo.optString("id", java.util.UUID.randomUUID().toString()),
+            name = oo.optString("name", "Objeto 3D"),
+            meshAssetPath = oo.optString("meshAssetPath", ""),
+            formatTag = oo.optString("formatTag", "obj"),
+            isVisible = oo.optBoolean("isVisible", true),
+            colorTint = oo.optLong("colorTint", 0xFFFFFFFFL),
+            keyframes = if (kfs.isEmpty()) listOf(com.example.model.ObjectTransformKeyframe(0)) else kfs,
+            shaderMode = shaderMode,
+            outline = outline,
+            light = light,
+            uvSlots = uvSlots,
+            activeUvSlotIndex = oo.optInt("activeUvSlotIndex", 0).coerceIn(0, uvSlots.lastIndex),
+            paintLayers = paintLayers,
+            activePaintLayerIndex = oo.optInt("activePaintLayerIndex", 0).coerceIn(0, (paintLayers.size - 1).coerceAtLeast(0)),
+            nodeGraph = nodeGraph,
+            bakedTextureBase64 = if (oo.has("bakedTextureBase64") && !oo.isNull("bakedTextureBase64")) oo.optString("bakedTextureBase64", "").ifBlank { null } else null
+        )
     }
 }

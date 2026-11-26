@@ -20,6 +20,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Redo
+import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CenterFocusWeak
 import androidx.compose.material.icons.filled.CropFree
@@ -57,10 +60,9 @@ import com.example.ui.theme.NeonPink
 import com.example.ui.theme.OrangeAccent
 
 /**
- * Barra lateral dedicada ao Modo Câmera (2D Plano e 3D Espacial).
- * Substitui a barra de desenho quando o painel de câmera está aberto, oferecendo
- * modos de manipulação direta por toque/mouse (Mover, Zoom, Girar, Lente FOV, Órbita 3D),
- * alternância entre mover Câmera vs mover Canvas em 2D, atalhos de keyframe e Estúdio 3D.
+ * Barra lateral dedicada ao Modo Câmera (2D Plano e Estúdio 3D Espacial).
+ * Oferece manipulação direta por toque/mouse (Mover, Zoom, Girar, Lente FOV, Órbita 3D),
+ * Desfazer/Refazer, acesso às 3 Rodas 3D (UV/Shader/Luz/Pintura 3D) e Editor de Nodes em tela dividida.
  */
 @Composable
 fun CameraSideToolbar(
@@ -79,6 +81,14 @@ fun CameraSideToolbar(
     cameraViewportNavTarget: CameraViewportNavTarget = CameraViewportNavTarget.CAMERA,
     onToggleViewportNavTarget: () -> Unit = {},
     onFocusSelected: () -> Unit = {},
+    canUndo: Boolean = false,
+    canRedo: Boolean = false,
+    onUndo: () -> Unit = {},
+    onRedo: () -> Unit = {},
+    isThreeWheels3DOpen: Boolean = false,
+    onToggleThreeWheels3D: () -> Unit = {},
+    isSplitNodesOpen: Boolean = false,
+    onToggleSplitNodes: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val panelColor = Color(theme.panel)
@@ -114,10 +124,34 @@ fun CameraSideToolbar(
                 verticalArrangement = Arrangement.spacedBy(if (isCompactHeight) 3.dp else 4.dp)
             ) {
                 Text(
-                    text = if (is3DMode) "CÂM 3D" else "CÂM 2D",
+                    text = if (isSideView3D) "EST. 3D" else if (is3DMode) "CÂM 3D" else "CÂM 2D",
                     fontSize = 7.5.sp,
                     fontWeight = FontWeight.ExtraBold,
                     color = if (is3DMode) OrangeAccent else CyanAccent
+                )
+
+                CameraActionBtn(
+                    icon = Icons.AutoMirrored.Filled.Undo,
+                    label = "Desfazer",
+                    isSelected = false,
+                    accent = accentColor,
+                    textColor = if (canUndo) textColor else textColor.copy(alpha = 0.35f),
+                    bgColor = bgColor,
+                    size = btnSize,
+                    testTag = "cam_undo_btn",
+                    onClick = { if (canUndo) onUndo() }
+                )
+
+                CameraActionBtn(
+                    icon = Icons.AutoMirrored.Filled.Redo,
+                    label = "Refazer",
+                    isSelected = false,
+                    accent = accentColor,
+                    textColor = if (canRedo) textColor else textColor.copy(alpha = 0.35f),
+                    bgColor = bgColor,
+                    size = btnSize,
+                    testTag = "cam_redo_btn",
+                    onClick = { if (canRedo) onRedo() }
                 )
 
                 if (!isSideView3D) {
@@ -264,6 +298,49 @@ fun CameraSideToolbar(
                         testTag = "cam_tool_stage_3d",
                         onClick = onToggleSideView3D
                     )
+
+                    // 3 Rodas do Estúdio 3D (UV Desdobrado, Shader/Contorno, Luz, Pintura 3D)
+                    Column(
+                        modifier = Modifier
+                            .width(48.dp)
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(if (isThreeWheels3DOpen) accentColor.copy(alpha = 0.28f) else bgColor.copy(alpha = 0.35f))
+                            .border(
+                                width = if (isThreeWheels3DOpen) 1.3.dp else 0.7.dp,
+                                color = if (isThreeWheels3DOpen) accentColor else OrangeAccent.copy(alpha = 0.45f),
+                                shape = RoundedCornerShape(9.dp)
+                            )
+                            .clickable { onToggleThreeWheels3D() }
+                            .padding(vertical = 4.dp, horizontal = 2.dp)
+                            .testTag("cam_three_wheels_btn"),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        ThreeWheelsIcon(
+                            tint = textColor,
+                            accentColor = if (isThreeWheels3DOpen) accentColor else OrangeAccent,
+                            size = 18.dp
+                        )
+                        Text(
+                            text = "3 Rodas",
+                            fontSize = 7.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isThreeWheels3DOpen) accentColor else textColor.copy(alpha = 0.85f),
+                            maxLines = 1
+                        )
+                    }
+
+                    CameraActionBtn(
+                        icon = Icons.Default.AccountTree,
+                        label = "Nodes",
+                        isSelected = isSplitNodesOpen,
+                        accent = CyanAccent,
+                        textColor = textColor,
+                        bgColor = bgColor,
+                        size = btnSize,
+                        testTag = "studio3d_split_nodes_btn",
+                        onClick = onToggleSplitNodes
+                    )
                 }
 
                 CameraActionBtn(
@@ -282,7 +359,7 @@ fun CameraSideToolbar(
 
                 Surface(
                     modifier = Modifier
-                        .width(42.dp)
+                        .width(48.dp)
                         .clip(RoundedCornerShape(9.dp))
                         .clickable { onCloseCameraMode() }
                         .testTag("cam_tool_exit_draw"),
@@ -291,7 +368,7 @@ fun CameraSideToolbar(
                     shape = RoundedCornerShape(9.dp)
                 ) {
                     Column(
-                        modifier = Modifier.padding(vertical = 5.dp, horizontal = 2.dp),
+                        modifier = Modifier.padding(vertical = 6.dp, horizontal = 2.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(2.dp)
                     ) {
@@ -329,7 +406,8 @@ private fun CameraActionBtn(
 ) {
     Column(
         modifier = Modifier
-            .width(42.dp)
+            .width(48.dp)
+            .heightIn(min = 42.dp)
             .clip(RoundedCornerShape(9.dp))
             .background(if (isSelected) accent.copy(alpha = 0.24f) else bgColor.copy(alpha = 0.35f))
             .border(
@@ -338,7 +416,7 @@ private fun CameraActionBtn(
                 shape = RoundedCornerShape(9.dp)
             )
             .clickable { onClick() }
-            .padding(vertical = 3.dp, horizontal = 2.dp)
+            .padding(vertical = 4.dp, horizontal = 2.dp)
             .testTag(testTag),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center

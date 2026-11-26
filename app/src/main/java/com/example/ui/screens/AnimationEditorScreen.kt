@@ -4,6 +4,7 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,6 +25,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Redo
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.CompareArrows
@@ -54,6 +57,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -75,6 +79,8 @@ import com.example.model.AppUiMode
 import com.example.model.BrushPreset
 import com.example.model.CameraMode
 import com.example.model.MultiplayerRole
+import com.example.model.StageSelection
+import com.example.model.StageTargetType
 import com.example.model.ToolType
 import com.example.ui.components.BrushStudioDrawer
 import com.example.ui.components.BucketConfigPopover
@@ -99,10 +105,13 @@ import com.example.ui.components.ProjectsListDialog
 import com.example.ui.components.QuickCopyPasteGestureMenu
 import com.example.ui.components.QuickPaletteFloatingWindow
 import com.example.ui.components.ReferenceImageChoiceDialog
+import com.example.ui.components.Studio3DSplitNodesOverlay
+import com.example.ui.components.Studio3DThreeWheelsSheet
 import com.example.ui.components.ThreeWheelsIcon
 import com.example.ui.components.TimelineBar
 import com.example.ui.components.TimelineLayerImageTransformHud
 import com.example.ui.components.ToolboxPalette
+import com.example.ui.components.UvUnfoldWindowOverlay
 import com.example.ui.theme.NeonGreen
 import com.example.ui.theme.NeonPink
 import com.example.ui.theme.OrangeAccent
@@ -158,6 +167,17 @@ fun AnimationEditorScreen(
     ) { uri: Uri? ->
         if (uri != null) {
             viewModel.import3DSceneFromUri(context, uri)
+        }
+    }
+
+    var pendingTexObjId by remember { mutableStateOf<String?>(null) }
+    var pendingTexSlotIdx by remember { mutableIntStateOf(0) }
+    val studio3DTexturePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        val objId = pendingTexObjId
+        if (uri != null && objId != null) {
+            viewModel.applySceneObjectSlotTextureUri(context, objId, pendingTexSlotIdx, uri)
         }
     }
 
@@ -478,6 +498,10 @@ fun AnimationEditorScreen(
                 onStageTargetSelected = { viewModel.selectStageTarget(it) },
                 onSelectedStageObjectDelta = { dx, dy, dz, rx, ry, rz, sf ->
                     viewModel.applySelectedStageObjectDelta(dx, dy, dz, rx, ry, rz, sf)
+                },
+                studio3DPaintEnabled = uiState.studio3DPaintEnabled && uiState.isCameraTimelineOpen,
+                onPaintSceneObjectUV = { objId, u0, v0, u1, v1 ->
+                    viewModel.paintSceneObjectSurfaceSegment(objId, u0, v0, u1, v1)
                 },
                 currentTimelineTick = uiState.currentTimelineTick,
                 playbackTimeMs = uiState.playbackTimeMs,
@@ -961,6 +985,14 @@ fun AnimationEditorScreen(
                         cameraViewportNavTarget = uiState.cameraViewportNavTarget,
                         onToggleViewportNavTarget = { viewModel.toggleCameraViewportNavTarget() },
                         onFocusSelected = { viewModel.focusSelectedStageTarget() },
+                        canUndo = uiState.canUndo,
+                        canRedo = uiState.canRedo,
+                        onUndo = { viewModel.undo() },
+                        onRedo = { viewModel.redo() },
+                        isThreeWheels3DOpen = uiState.isStudio3DThreeWheelsOpen,
+                        onToggleThreeWheels3D = { viewModel.toggleStudio3DThreeWheels() },
+                        isSplitNodesOpen = uiState.isStudio3DSplitNodesOpen,
+                        onToggleSplitNodes = { viewModel.toggleStudio3DSplitNodes() },
                         modifier = Modifier
                             .align(Alignment.CenterStart)
                             .padding(start = 8.dp)
@@ -1155,6 +1187,57 @@ fun AnimationEditorScreen(
                     .padding(end = 10.dp)
             )
 
+            // Dedicated Top-End Undo / Redo Floating Pill (always reachable in Canvas & Estúdio 3D)
+            if (!uiState.isZenModeActive) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .statusBarsPadding()
+                        .padding(top = 8.dp, end = 10.dp)
+                        .shadow(6.dp, RoundedCornerShape(999.dp))
+                        .clip(RoundedCornerShape(999.dp))
+                        .border(1.dp, borderCol, RoundedCornerShape(999.dp)),
+                    color = panelColor.copy(alpha = 0.94f)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        IconButton(
+                            onClick = { if (uiState.canUndo) viewModel.undo() },
+                            enabled = uiState.canUndo,
+                            modifier = Modifier
+                                .size(34.dp)
+                                .minimumInteractiveComponentSize()
+                                .testTag("undo_action_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Undo,
+                                contentDescription = "Desfazer (Ctrl+Z)",
+                                tint = if (uiState.canUndo) textColor else textColor.copy(alpha = 0.32f),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        IconButton(
+                            onClick = { if (uiState.canRedo) viewModel.redo() },
+                            enabled = uiState.canRedo,
+                            modifier = Modifier
+                                .size(34.dp)
+                                .minimumInteractiveComponentSize()
+                                .testTag("redo_action_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Redo,
+                                contentDescription = "Refazer (Ctrl+Y)",
+                                tint = if (uiState.canRedo) textColor else textColor.copy(alpha = 0.32f),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
             // Floating Mobile Zen / Focus Mode Exit Pill
             if (uiState.isZenModeActive) {
                 Surface(
@@ -1188,6 +1271,97 @@ fun AnimationEditorScreen(
                             color = accentColor
                         )
                     }
+                }
+            }
+            // Estúdio 3D: 3 Rodas (Textura & UV, Shader & Luz, Pintura 3D), Janela UV Desdobrado & Nodes Split-Screen
+            if (uiState.isCameraTimelineOpen && !uiState.isZenModeActive) {
+                val studio3DObjs = uiState.project.camera3D.scene3DObjects
+                val selectedStudio3DObj = if (uiState.stageSelection.type == StageTargetType.OBJECT_3D) {
+                    studio3DObjs.firstOrNull { it.id == uiState.stageSelection.id } ?: studio3DObjs.firstOrNull()
+                } else {
+                    studio3DObjs.firstOrNull()
+                }
+
+                if (uiState.isStudio3DThreeWheelsOpen) {
+                    Studio3DThreeWheelsSheet(
+                        sceneObjects = studio3DObjs,
+                        selectedObjectId = selectedStudio3DObj?.id,
+                        onSelectObject = { viewModel.selectStageTarget(StageSelection(StageTargetType.OBJECT_3D, it)) },
+                        onUpdateObject = { id, bump, tf -> viewModel.updateSceneObject3D(id, bump, tf) },
+                        onPickTextureImage = { objId, slotIdx ->
+                            pendingTexObjId = objId
+                            pendingTexSlotIdx = slotIdx
+                            studio3DTexturePicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        isUvUnfoldOpen = uiState.isStudio3DUVUnfoldOpen,
+                        onToggleUvUnfold = { viewModel.toggleStudio3DUVUnfold() },
+                        onOpenSplitNodes = {
+                            viewModel.closeStudio3DThreeWheels()
+                            viewModel.toggleStudio3DSplitNodes()
+                        },
+                        studio3DPaintEnabled = uiState.studio3DPaintEnabled,
+                        onToggleStudio3DPaint = { viewModel.setStudio3DPaintEnabled(it) },
+                        paintTool = uiState.studio3DPaintTool,
+                        onSelectPaintTool = { viewModel.setStudio3DPaintTool(it) },
+                        paintSize = uiState.studio3DPaintSize,
+                        onChangePaintSize = { viewModel.setStudio3DPaintSize(it) },
+                        paintOpacity = uiState.studio3DPaintOpacity,
+                        onChangePaintOpacity = { viewModel.setStudio3DPaintOpacity(it) },
+                        activeBrushId = uiState.activeBrushPreset.id,
+                        importedBrushes = uiState.importedKritaBrushes,
+                        onSelectBrushPreset = { viewModel.selectBrushPreset(it) },
+                        currentColorArgb = uiState.currentColor,
+                        onMergePaintLayers = { viewModel.mergeSceneObjectPaintLayers(it) },
+                        onClose = { viewModel.closeStudio3DThreeWheels() },
+                        bgColor = panelColor,
+                        textColor = textColor,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(start = 56.dp, end = 10.dp, bottom = 8.dp)
+                    )
+                }
+
+                if (uiState.isStudio3DUVUnfoldOpen && selectedStudio3DObj != null) {
+                    UvUnfoldWindowOverlay(
+                        selectedObject = selectedStudio3DObj,
+                        paintTool = uiState.studio3DPaintTool,
+                        paintSize = uiState.studio3DPaintSize,
+                        paintOpacity = uiState.studio3DPaintOpacity,
+                        activeBrushId = uiState.activeBrushPreset.id,
+                        activeBrushParamsJson = activeBrushParamsJson,
+                        currentColorArgb = uiState.currentColor,
+                        onPaintUVSegment = { objId, u0, v0, u1, v1 ->
+                            viewModel.paintSceneObjectSurfaceSegment(objId, u0, v0, u1, v1)
+                        },
+                        onClose = { viewModel.toggleStudio3DUVUnfold() },
+                        bgColor = panelColor,
+                        textColor = textColor,
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .statusBarsPadding()
+                            .padding(top = 50.dp, end = 10.dp)
+                    )
+                }
+
+                if (uiState.isStudio3DSplitNodesOpen) {
+                    BackHandler {
+                        viewModel.closeStudio3DSplitNodes()
+                    }
+                    Studio3DSplitNodesOverlay(
+                        selectedObject = selectedStudio3DObj,
+                        studio3DPaintEnabled = uiState.studio3DPaintEnabled,
+                        onToggleStudio3DPaint = { viewModel.setStudio3DPaintEnabled(it) },
+                        onPaintObjectUV = { objId, u0, v0, u1, v1 ->
+                            viewModel.paintSceneObjectSurfaceSegment(objId, u0, v0, u1, v1)
+                        },
+                        onUpdateObject = { id, bump, tf -> viewModel.updateSceneObject3D(id, bump, tf) },
+                        onClose = { viewModel.closeStudio3DSplitNodes() },
+                        bgColor = panelColor,
+                        textColor = textColor,
+                        modifier = Modifier.fillMaxSize()
+                    )
                 }
             }
         }

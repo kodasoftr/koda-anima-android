@@ -65,11 +65,11 @@ object SelectionGeometryHelper {
     }
 
     private fun computeBounds(points: List<StrokePoint>): FloatArray {
-        if (points.isEmpty()) return floatArrayOf(Float.MAX_VALUE, Float.MAX_VALUE, Float.MIN_VALUE, Float.MIN_VALUE)
+        if (points.isEmpty()) return floatArrayOf(Float.MAX_VALUE, Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE)
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
-        var maxX = Float.MIN_VALUE
-        var maxY = Float.MIN_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
         for (p in points) {
             if (p.x < minX) minX = p.x
             if (p.x > maxX) maxX = p.x

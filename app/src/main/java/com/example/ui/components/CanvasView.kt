@@ -88,6 +88,7 @@ import com.example.engine.HardwareCapabilitiesEngine
 import com.example.engine.KodanimaBitmapPool
 import com.example.engine.KodanimaGraphicsEngine
 import com.example.engine.MediaAssetManager
+import com.example.engine.Studio3DPaintEngine
 import com.example.engine.ProjectedObjectBounds
 import com.example.engine.SelectionGeometryHelper
 import com.example.engine.TimelineTrackEngine
@@ -155,6 +156,15 @@ private class CanvasBitmapCache {
     var cacheW: Int = 0
     var cacheH: Int = 0
 
+    // Full-viewport screen-resolution off-canvas caches (allow unbounded off-canvas drawing)
+    var vpW: Int = 0
+    var vpH: Int = 0
+    var vpScale: Float = 1f
+    val cachedProjToScreenMatrix: AndroidMatrix = AndroidMatrix()
+    var hasCachedMatrix: Boolean = false
+    val activeSessionMatrix: AndroidMatrix = AndroidMatrix()
+    var activeSessionVpScale: Float = 1f
+
     var onionBitmap: Bitmap? = null
     var onionKey: Any? = null
 
@@ -204,37 +214,67 @@ private class CanvasBitmapCache {
 
     fun ensureSize(w: Int, h: Int) {
         if (w == cacheW && h == cacheH) return
-        releaseAll()
+        releaseStage3D()
+        releaseCanvas3DBg()
         cacheW = w
         cacheH = h
     }
 
-    fun acquireOrReuse(current: Bitmap?, clearColor: Int): Bitmap {
-        if (current != null && !current.isRecycled && current.width == cacheW && current.height == cacheH) {
+    fun ensureViewportSize(w: Int, h: Int, scale: Float) {
+        vpScale = scale
+        if (w == vpW && h == vpH) return
+        releaseViewportLayers()
+        vpW = w
+        vpH = h
+    }
+
+    fun acquireOrReuseViewport(current: Bitmap?, clearColor: Int): Bitmap {
+        val safeW = vpW.coerceAtLeast(1)
+        val safeH = vpH.coerceAtLeast(1)
+        if (current != null && !current.isRecycled && current.width == safeW && current.height == safeH) {
             current.eraseColor(clearColor)
             return current
         }
         KodanimaBitmapPool.release(current)
-        return KodanimaBitmapPool.acquire(cacheW, cacheH, Bitmap.Config.ARGB_8888, clearColor)
+        return KodanimaBitmapPool.acquire(safeW, safeH, Bitmap.Config.ARGB_8888, clearColor)
     }
 
     fun beginEraserSession(
+        sessionMatrix: AndroidMatrix,
+        sessionVpScale: Float,
         activeSelection: SelectionRegion = SelectionRegion(),
-        cacheScale: Float = 1.0f,
         densityMult: Float = 1.0f
     ) {
+        activeSessionMatrix.set(sessionMatrix)
+        activeSessionVpScale = sessionVpScale
         val base = activeLayerBitmap
-        val dst = acquireOrReuse(eraserWorkBitmap, AndroidColor.TRANSPARENT)
+        val dst = acquireOrReuseViewport(eraserWorkBitmap, AndroidColor.TRANSPARENT)
         eraserWorkBitmap = dst
         val c = eraserWorkCanvas ?: AndroidCanvas(dst)
         c.setBitmap(dst)
         eraserWorkCanvas = c
         if (base != null && !base.isRecycled) {
-            c.drawBitmap(base, 0f, 0f, null)
+            val invCached = AndroidMatrix()
+            if (hasCachedMatrix && cachedProjToScreenMatrix.invert(invCached)) {
+                val delta = AndroidMatrix()
+                delta.setConcat(sessionMatrix, invCached)
+                val vpToScreen = AndroidMatrix().apply { setScale(1f / vpScale.coerceAtLeast(0.01f), 1f / vpScale.coerceAtLeast(0.01f)) }
+                val screenToVp = AndroidMatrix().apply { setScale(sessionVpScale, sessionVpScale) }
+                val finalMat = AndroidMatrix()
+                finalMat.setConcat(delta, vpToScreen)
+                finalMat.postConcat(screenToVp)
+                c.save()
+                c.concat(finalMat)
+                c.drawBitmap(base, 0f, 0f, null)
+                c.restore()
+            } else {
+                c.drawBitmap(base, 0f, 0f, null)
+            }
         }
         if (activeSelection.isActive && activeSelection.capturedStrokes.isNotEmpty()) {
+            val vpMat = AndroidMatrix(sessionMatrix).apply { postScale(sessionVpScale, sessionVpScale) }
             c.save()
-            c.scale(cacheScale, cacheScale)
+            c.concat(vpMat)
             c.translate(activeSelection.offsetX, activeSelection.offsetY)
             if (activeSelection.rotationDegrees != 0f) {
                 c.rotate(activeSelection.rotationDegrees, activeSelection.centerX, activeSelection.centerY)
@@ -250,8 +290,10 @@ private class CanvasBitmapCache {
         lastErasedPointIdx = 0
     }
 
-    fun beginActiveStrokeSession() {
-        val dst = acquireOrReuse(activeStrokeBitmap, AndroidColor.TRANSPARENT)
+    fun beginActiveStrokeSession(sessionMatrix: AndroidMatrix, sessionVpScale: Float) {
+        activeSessionMatrix.set(sessionMatrix)
+        activeSessionVpScale = sessionVpScale
+        val dst = acquireOrReuseViewport(activeStrokeBitmap, AndroidColor.TRANSPARENT)
         activeStrokeBitmap = dst
         val c = activeStrokeCanvas ?: AndroidCanvas(dst)
         c.setBitmap(dst)
@@ -270,25 +312,29 @@ private class CanvasBitmapCache {
         activeStrokeCanvas = null
     }
 
-    fun sampleEyedropperPixel(px: Int, py: Int): Long {
-        if (cacheW <= 0 || cacheH <= 0) return 0xFFFFFFFFL
-        val sx = px.coerceIn(0, cacheW - 1)
-        val sy = py.coerceIn(0, cacheH - 1)
+    fun sampleEyedropperPixel(projX: Float, projY: Float): Long {
+        if (vpW <= 0 || vpH <= 0) return 0xFFFFFFFFL
+        val pts = floatArrayOf(projX, projY)
+        if (hasCachedMatrix) {
+            cachedProjToScreenMatrix.mapPoints(pts)
+        }
+        val sx = (pts[0] * vpScale).roundToInt().coerceIn(0, vpW - 1)
+        val sy = (pts[1] * vpScale).roundToInt().coerceIn(0, vpH - 1)
         var argb = AndroidColor.WHITE
-        belowLayersBitmap?.takeIf { !it.isRecycled }?.let { bmp ->
+        belowLayersBitmap?.takeIf { !it.isRecycled && sx < it.width && sy < it.height }?.let { bmp ->
             argb = blendOver(argb, bmp.getPixel(sx, sy))
         }
-        activeLayerBitmap?.takeIf { !it.isRecycled }?.let { bmp ->
+        activeLayerBitmap?.takeIf { !it.isRecycled && sx < it.width && sy < it.height }?.let { bmp ->
             argb = blendOver(argb, bmp.getPixel(sx, sy))
         }
         if (aboveAdvancedIsActive) {
             aboveAdvancedLayers.forEach { adv ->
-                if (adv.layer.isVisible && !adv.bitmap.isRecycled) {
+                if (adv.layer.isVisible && !adv.bitmap.isRecycled && sx < adv.bitmap.width && sy < adv.bitmap.height) {
                     argb = blendOver(argb, adv.bitmap.getPixel(sx, sy))
                 }
             }
         } else {
-            aboveLayersBitmap?.takeIf { !it.isRecycled }?.let { bmp ->
+            aboveLayersBitmap?.takeIf { !it.isRecycled && sx < it.width && sy < it.height }?.let { bmp ->
                 argb = blendOver(argb, bmp.getPixel(sx, sy))
             }
         }
@@ -344,17 +390,24 @@ private class CanvasBitmapCache {
         canvas3DBgRealtimeKey = null
     }
 
-    fun releaseAll() {
+    fun releaseViewportLayers() {
         KodanimaBitmapPool.release(onionBitmap); onionBitmap = null; onionKey = null
         KodanimaBitmapPool.release(belowLayersBitmap); belowLayersBitmap = null; belowKey = null
         KodanimaBitmapPool.release(clipBaseBitmap); clipBaseBitmap = null; clipBaseKey = null
         KodanimaBitmapPool.release(activeLayerBitmap); activeLayerBitmap = null; activeKey = null
         KodanimaBitmapPool.release(aboveLayersBitmap); aboveLayersBitmap = null; aboveKey = null
         clearAboveAdvanced()
+        hasCachedMatrix = false
+        endActiveSessions()
+        vpW = 0
+        vpH = 0
+    }
+
+    fun releaseAll() {
+        releaseViewportLayers()
         releaseStage3D()
         releaseCanvas3DBg()
         releaseOffCanvas3D()
-        endActiveSessions()
         cacheW = 0
         cacheH = 0
     }
@@ -375,7 +428,8 @@ private data class OnionCacheKey(
     val nextLayers: List<List<Layer>>,
     val w: Int,
     val h: Int,
-    val densityMult: Float
+    val densityMult: Float,
+    val vpMatrixSignature: List<Float> = emptyList()
 )
 
 private data class LayerSliceCacheKey(
@@ -384,7 +438,8 @@ private data class LayerSliceCacheKey(
     val h: Int,
     val densityMult: Float,
     val hiddenStrokeIds: Set<String> = emptySet(),
-    val replacementStrokes: List<DrawingStroke> = emptyList()
+    val replacementStrokes: List<DrawingStroke> = emptyList(),
+    val vpMatrixSignature: List<Float> = emptyList()
 )
 
 private class CanvasOverlayScratch {
@@ -605,6 +660,15 @@ private class CanvasOverlayScratch {
         isFakeBoldText = true
         textAlign = AndroidPaint.Align.CENTER
     }
+    val liveMatrixScratch = AndroidMatrix()
+    val invMatrixScratch = AndroidMatrix()
+    val deltaMatrixScratch = AndroidMatrix()
+    val vpMatrixScratch = AndroidMatrix()
+    val paperMarginPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.argb(115, 130, 150, 185)
+        style = AndroidPaint.Style.STROKE
+        pathEffect = DashPathEffect(floatArrayOf(10f, 7f), 0f)
+    }
 }
 
 @OptIn(ExperimentalComposeUiApi::class)
@@ -682,6 +746,8 @@ fun CanvasView(
     stageFocusNonce: Int = 0,
     onStageTargetSelected: ((StageSelection) -> Unit)? = null,
     onSelectedStageObjectDelta: ((dx: Float, dy: Float, dz: Float, dRotX: Float, dRotY: Float, dRotZ: Float, scaleFactor: Float) -> Unit)? = null,
+    studio3DPaintEnabled: Boolean = false,
+    onPaintSceneObjectUV: ((objectId: String, u0: Float, v0: Float, u1: Float, v1: Float) -> Unit)? = null,
     theme: KodanimaTheme = KodanimaTheme.ROXO_BLACK,
     currentTimelineTick: Int = currentFrameIndex,
     playbackTimeMs: Long? = null,
@@ -781,6 +847,9 @@ fun CanvasView(
     var view3DZoom by remember { mutableFloatStateOf(1f) }
     var isOrbiting3D by remember { mutableStateOf(false) }
     var isDraggingStage3DCam by remember { mutableStateOf(false) }
+    var isPaintingStage3DObject by remember { mutableStateOf(false) }
+    var paint3DTargetObjId by remember { mutableStateOf<String?>(null) }
+    var paint3DLastUV by remember { mutableStateOf<Pair<Float, Float>?>(null) }
     var active3DGizmoAxis by remember { mutableIntStateOf(0) } // 0=none, 1=X, 2=Y, 3=Z, 4=Free
     var lastOrbitTouchPos by remember { mutableStateOf(Offset.Zero) }
     var stage3DDownPos by remember { mutableStateOf(Offset.Zero) }
@@ -894,7 +963,7 @@ fun CanvasView(
         } else null
     }
 
-    // Rebuild static caches only when underlying frame/layer/onion skin/selection split changes (ZERO work on pan/zoom/move or sub-tick playback interpolation)
+    // Rebuild Stage 3D & Camera POV caches cleanly before DrawScope
     LaunchedEffect(
         cacheW,
         cacheH,
@@ -902,221 +971,17 @@ fun CanvasView(
         currentFrameIndex,
         activeGlobalLayerIdx,
         currFrame,
-        onionSkinEnabled,
-        project.onionSkin,
         project.canvasBackground,
         project.camera3D,
         isCameraModeActive,
         isCameraSideView3D,
         stage3DMode,
         densityMult,
-        activeSelection.isActive,
-        activeSelection.hiddenSourceStrokeIds,
-        activeSelection.outsideReplacementStrokes
+        effectiveTickFloat
     ) {
         cacheHolder.ensureSize(cacheW, cacheH)
 
-        // 1. Onion Skin Cache (per-layer independent cel stepping so stretched held cels never ghost over themselves)
-        val prevCount = project.onionSkin.prevFramesCount
-        val nextCount = project.onionSkin.nextFramesCount
-        val prevList = if (onionSkinEnabled && project.onionSkin.isEnabled && prevCount > 0) {
-            (prevCount downTo 1).map { step ->
-                TimelineTrackEngine.resolveOnionSkinLayersAtTick(project, currentTimelineTick, -step)
-            }
-        } else emptyList()
-        val nextList = if (onionSkinEnabled && project.onionSkin.isEnabled && nextCount > 0) {
-            (1..nextCount).map { step ->
-                TimelineTrackEngine.resolveOnionSkinLayersAtTick(project, currentTimelineTick, step)
-            }
-        } else emptyList()
-
-        val oKey = OnionCacheKey(
-            currentTimelineTick,
-            onionSkinEnabled && project.onionSkin.isEnabled,
-            project.onionSkin,
-            prevList,
-            nextList,
-            cacheW,
-            cacheH,
-            densityMult
-        )
-        if (cacheHolder.onionKey != oKey) {
-            val bmp = cacheHolder.acquireOrReuse(cacheHolder.onionBitmap, AndroidColor.TRANSPARENT)
-            if (oKey.enabled && (prevList.any { it.isNotEmpty() } || nextList.any { it.isNotEmpty() })) {
-                val c = AndroidCanvas(bmp)
-                c.scale(cacheScale, cacheScale)
-                val onionOpacity = project.onionSkin.opacity
-
-                val prevFilter = KodanimaGraphicsEngine.createOnionSkinColorFilter(project.onionSkin.prevColor)
-                prevList.forEachIndexed { idx, fLayers ->
-                    val step = prevCount - idx
-                    val alpha = (onionOpacity * (1f - (step - 1) * 0.25f)).coerceAtLeast(0.1f)
-                    for (l in fLayers) {
-                        if (l.isVisible) {
-                            KodanimaGraphicsEngine.drawLayerToCanvas(
-                                l, c, project.resolution.width, project.resolution.height,
-                                alpha, prevFilter, null, null, densityMult
-                            )
-                        }
-                    }
-                }
-
-                val nextFilter = KodanimaGraphicsEngine.createOnionSkinColorFilter(project.onionSkin.nextColor)
-                nextList.forEachIndexed { idx, fLayers ->
-                    val step = idx + 1
-                    val alpha = (onionOpacity * (1f - (step - 1) * 0.25f)).coerceAtLeast(0.1f)
-                    for (l in fLayers) {
-                        if (l.isVisible) {
-                            KodanimaGraphicsEngine.drawLayerToCanvas(
-                                l, c, project.resolution.width, project.resolution.height,
-                                alpha, nextFilter, null, null, densityMult
-                            )
-                        }
-                    }
-                }
-            }
-            cacheHolder.onionBitmap = bmp
-            cacheHolder.onionKey = oKey
-        }
-
-        // 2. Static Frame Layers (Below Active, Clip Base if needed, Active, Above Active)
-        val belowSlice = if (combinedLayers.isNotEmpty() && activeGlobalLayerIdx > 0) {
-            combinedLayers.subList(0, activeGlobalLayerIdx)
-        } else emptyList()
-        val activeSlice = if (activeGlobalLayerIdx in combinedLayers.indices) {
-            listOf(combinedLayers[activeGlobalLayerIdx])
-        } else emptyList()
-        val aboveSlice = if (activeGlobalLayerIdx + 1 < combinedLayers.size) {
-            combinedLayers.subList(activeGlobalLayerIdx + 1, combinedLayers.size)
-        } else emptyList()
-
-        val bKey = LayerSliceCacheKey(belowSlice, cacheW, cacheH, densityMult)
-        if (cacheHolder.belowKey != bKey) {
-            val bmp = cacheHolder.acquireOrReuse(cacheHolder.belowLayersBitmap, AndroidColor.TRANSPARENT)
-            if (belowSlice.isNotEmpty()) {
-                val c = AndroidCanvas(bmp)
-                KodanimaGraphicsEngine.drawLayersStackToCanvas(
-                    layers = belowSlice,
-                    canvas = c,
-                    targetWidth = project.resolution.width,
-                    targetHeight = project.resolution.height,
-                    densityMultiplier = densityMult,
-                    renderScale = cacheScale
-                )
-            }
-            cacheHolder.belowLayersBitmap = bmp
-            cacheHolder.belowKey = bKey
-        }
-
-        val rawActiveLayer = activeSlice.firstOrNull()
-        val clipBaseLayer = if (rawActiveLayer != null && rawActiveLayer.isClippingMask) {
-            belowSlice.lastOrNull { !it.isClippingMask && it.isVisible && it.opacity > 0f }
-        } else null
-        val cbSlice = if (clipBaseLayer != null) listOf(clipBaseLayer) else emptyList()
-        val cbKey = LayerSliceCacheKey(cbSlice, cacheW, cacheH, densityMult)
-        if (cacheHolder.clipBaseKey != cbKey) {
-            if (cbSlice.isNotEmpty()) {
-                val bmp = cacheHolder.acquireOrReuse(cacheHolder.clipBaseBitmap, AndroidColor.TRANSPARENT)
-                val c = AndroidCanvas(bmp)
-                c.scale(cacheScale, cacheScale)
-                KodanimaGraphicsEngine.drawLayerToCanvas(
-                    cbSlice[0], c, project.resolution.width, project.resolution.height,
-                    1.0f, null, null, null, densityMult
-                )
-                cacheHolder.clipBaseBitmap = bmp
-            } else {
-                KodanimaBitmapPool.release(cacheHolder.clipBaseBitmap)
-                cacheHolder.clipBaseBitmap = null
-            }
-            cacheHolder.clipBaseKey = cbKey
-        }
-
-        val hideIds = if (activeSelection.isActive) activeSelection.hiddenSourceStrokeIds else emptySet()
-        val outsideRepl = if (activeSelection.isActive) activeSelection.outsideReplacementStrokes else emptyList()
-        val effectiveActiveSlice = if (rawActiveLayer != null && (hideIds.isNotEmpty() || outsideRepl.isNotEmpty())) {
-            listOf(rawActiveLayer.copy(strokes = rawActiveLayer.strokes.filter { it.id !in hideIds } + outsideRepl))
-        } else {
-            activeSlice
-        }
-        val aKey = LayerSliceCacheKey(effectiveActiveSlice, cacheW, cacheH, densityMult, hideIds, outsideRepl)
-        if (cacheHolder.activeKey != aKey) {
-            val bmp = cacheHolder.acquireOrReuse(cacheHolder.activeLayerBitmap, AndroidColor.TRANSPARENT)
-            if (effectiveActiveSlice.isNotEmpty()) {
-                val l = effectiveActiveSlice[0]
-                if (l.isVisible) {
-                    val c = AndroidCanvas(bmp)
-                    c.scale(cacheScale, cacheScale)
-                    KodanimaGraphicsEngine.drawLayerToCanvas(
-                        l, c, project.resolution.width, project.resolution.height,
-                        1.0f, null, null, null, densityMult
-                    )
-                }
-            }
-            cacheHolder.activeLayerBitmap = bmp
-            cacheHolder.activeKey = aKey
-        }
-
-        val aboveNeedsAdvanced = aboveSlice.any {
-            it.isClippingMask || it.blendEffect != LayerBlendEffect.NORMAL
-        }
-        if (!aboveNeedsAdvanced) {
-            if (cacheHolder.aboveAdvancedIsActive) {
-                cacheHolder.clearAboveAdvanced()
-            }
-            val abKey = LayerSliceCacheKey(aboveSlice, cacheW, cacheH, densityMult)
-            if (cacheHolder.aboveKey != abKey) {
-                val bmp = cacheHolder.acquireOrReuse(cacheHolder.aboveLayersBitmap, AndroidColor.TRANSPARENT)
-                if (aboveSlice.isNotEmpty()) {
-                    val c = AndroidCanvas(bmp)
-                    c.scale(cacheScale, cacheScale)
-                    for (l in aboveSlice) {
-                        if (l.isVisible) {
-                            KodanimaGraphicsEngine.drawLayerToCanvas(
-                                l, c, project.resolution.width, project.resolution.height,
-                                1.0f, null, null, null, densityMult
-                            )
-                        }
-                    }
-                }
-                cacheHolder.aboveLayersBitmap = bmp
-                cacheHolder.aboveKey = abKey
-            }
-        } else {
-            cacheHolder.aboveKey = null
-            // Rebuild only layers in aboveSlice whose strokes/settings changed
-            val oldList = cacheHolder.aboveAdvancedLayers.toList()
-            val nextList = ArrayList<CanvasBitmapCache.AdvancedCachedLayer>(aboveSlice.size)
-            for (idx in aboveSlice.indices) {
-                val l = aboveSlice[idx]
-                val lKey = LayerSliceCacheKey(listOf(l), cacheW, cacheH, densityMult)
-                val reused = oldList.getOrNull(idx)
-                if (reused != null && reused.key == lKey && !reused.bitmap.isRecycled) {
-                    nextList.add(reused)
-                } else {
-                    val bmp = KodanimaBitmapPool.acquire(cacheW, cacheH, Bitmap.Config.ARGB_8888, AndroidColor.TRANSPARENT)
-                    if (l.isVisible && l.opacity > 0f) {
-                        val c = AndroidCanvas(bmp)
-                        c.scale(cacheScale, cacheScale)
-                        KodanimaGraphicsEngine.drawLayerToCanvas(
-                            l, c, project.resolution.width, project.resolution.height,
-                            1.0f, null, null, null, densityMult
-                        )
-                    }
-                    nextList.add(CanvasBitmapCache.AdvancedCachedLayer(l, bmp, lKey))
-                }
-            }
-            val keptBmps = nextList.map { it.bitmap }.toSet()
-            oldList.forEach { old ->
-                if (old.bitmap !in keptBmps) {
-                    KodanimaBitmapPool.release(old.bitmap)
-                }
-            }
-            cacheHolder.aboveAdvancedLayers.clear()
-            cacheHolder.aboveAdvancedLayers.addAll(nextList)
-            cacheHolder.aboveAdvancedIsActive = true
-        }
-
-        // 3. Per-layer transparent bitmaps + paper plane for interactive 3D Stage & animated 2D Camera layers
+        // Per-layer transparent bitmaps + paper plane for interactive 3D Stage & animated 2D Camera layers
         if (isCameraSideView3D || isCameraModeActive) {
             val bgKey = Pair(project.canvasBackground, Pair(cacheW, cacheH))
             if (project.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE) {
@@ -1124,7 +989,14 @@ fun CanvasView(
                 cacheHolder.stage3DBgBitmap = null
                 cacheHolder.stage3DBgKey = bgKey
             } else if (cacheHolder.stage3DBgKey != bgKey || cacheHolder.stage3DBgBitmap?.isRecycled != false) {
-                val bgBmp = cacheHolder.acquireOrReuse(cacheHolder.stage3DBgBitmap, AndroidColor.TRANSPARENT)
+                val bgBmp = if (cacheHolder.stage3DBgBitmap != null && !cacheHolder.stage3DBgBitmap!!.isRecycled &&
+                    cacheHolder.stage3DBgBitmap!!.width == cacheW && cacheHolder.stage3DBgBitmap!!.height == cacheH
+                ) {
+                    cacheHolder.stage3DBgBitmap!!.also { it.eraseColor(AndroidColor.TRANSPARENT) }
+                } else {
+                    KodanimaBitmapPool.release(cacheHolder.stage3DBgBitmap)
+                    KodanimaBitmapPool.acquire(cacheW, cacheH, Bitmap.Config.ARGB_8888, AndroidColor.TRANSPARENT)
+                }
                 val c = AndroidCanvas(bgBmp)
                 KodanimaGraphicsEngine.drawProjectBackgroundToCanvas(
                     canvas = c,
@@ -1150,7 +1022,12 @@ fun CanvasView(
                 if (existing != null && !existing.isRecycled && cacheHolder.stage3DLayerKeys[layer.id] == lKey) {
                     continue
                 }
-                val bmp = cacheHolder.acquireOrReuse(existing, AndroidColor.TRANSPARENT)
+                val bmp = if (existing != null && !existing.isRecycled && existing.width == cacheW && existing.height == cacheH) {
+                    existing.also { it.eraseColor(AndroidColor.TRANSPARENT) }
+                } else {
+                    KodanimaBitmapPool.release(existing)
+                    KodanimaBitmapPool.acquire(cacheW, cacheH, Bitmap.Config.ARGB_8888, AndroidColor.TRANSPARENT)
+                }
                 if (layer.isVisible && layer.opacity > 0f) {
                     val c = AndroidCanvas(bmp)
                     c.scale(cacheScale, cacheScale)
@@ -1432,6 +1309,302 @@ fun CanvasView(
             Camera3DEngine.evaluateCameraAtTick(camSettings, effectiveTickFloat)
         }
 
+        // Screen-resolution off-canvas viewport sizing & settled transform tracking (zero OOM, unbounded drawing)
+        val vpLongest = max(containerWidth, containerHeight).coerceAtLeast(1f)
+        val vpScale = if (vpLongest > maxCacheDim) maxCacheDim.toFloat() / vpLongest else 1.0f
+        val vpCacheW = (containerWidth * vpScale).roundToInt().coerceAtLeast(1)
+        val vpCacheH = (containerHeight * vpScale).roundToInt().coerceAtLeast(1)
+
+        var settledTransformSnap by remember {
+            mutableStateOf(Triple(zoom, panX, panY) to rotation)
+        }
+        LaunchedEffect(isTransforming, zoom, panX, panY, rotation, boxW, boxH, mirrorHorizontal) {
+            if (!isTransforming) {
+                if (cacheHolder.hasCachedMatrix) {
+                    kotlinx.coroutines.delay(45L)
+                }
+                settledTransformSnap = Triple(zoom, panX, panY) to rotation
+            }
+        }
+
+        // Rebuild full-viewport screen-resolution layer & onion caches culled to visible screen bounds
+        LaunchedEffect(
+            vpCacheW,
+            vpCacheH,
+            vpScale,
+            settledTransformSnap,
+            boxW,
+            boxH,
+            projWidth,
+            projHeight,
+            mirrorHorizontal,
+            currentTimelineTick,
+            currentFrameIndex,
+            activeGlobalLayerIdx,
+            currFrame,
+            onionSkinEnabled,
+            project.onionSkin,
+            densityMult,
+            activeSelection.isActive,
+            activeSelection.hiddenSourceStrokeIds,
+            activeSelection.outsideReplacementStrokes
+        ) {
+            if (containerWidth <= 2f || containerHeight <= 2f) return@LaunchedEffect
+            cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale)
+
+            val (snapZ, snapPx, snapPy) = settledTransformSnap.first
+            val snapRot = settledTransformSnap.second
+            val safeZ = snapZ.coerceAtLeast(0.05f)
+            val snapProjToScreen = AndroidMatrix().apply {
+                setScale(boxW / projWidth, boxH / projHeight)
+                postTranslate(-boxW * 0.5f, -boxH * 0.5f)
+                postScale(if (mirrorHorizontal) -safeZ else safeZ, safeZ)
+                postRotate(snapRot)
+                postTranslate(halfContainerW + snapPx, halfContainerH + snapPy)
+            }
+            val invSnap = AndroidMatrix()
+            val visibleProjBounds = if (snapProjToScreen.invert(invSnap)) {
+                val corners = floatArrayOf(
+                    0f, 0f,
+                    containerWidth, 0f,
+                    containerWidth, containerHeight,
+                    0f, containerHeight
+                )
+                invSnap.mapPoints(corners)
+                val pad = (140f / safeZ).coerceIn(64f, 600f)
+                val minX = min(min(corners[0], corners[2]), min(corners[4], corners[6])) - pad
+                val maxX = max(max(corners[0], corners[2]), max(corners[4], corners[6])) + pad
+                val minY = min(min(corners[1], corners[3]), min(corners[5], corners[7])) - pad
+                val maxY = max(max(corners[1], corners[3]), max(corners[5], corners[7])) + pad
+                RectF(minX, minY, maxX, maxY)
+            } else {
+                null
+            }
+            val vpMat = AndroidMatrix(snapProjToScreen).apply {
+                postScale(vpScale, vpScale)
+            }
+            val matValues = FloatArray(9).also { snapProjToScreen.getValues(it) }.toList()
+            cacheHolder.cachedProjToScreenMatrix.set(snapProjToScreen)
+            cacheHolder.hasCachedMatrix = true
+
+            // 1. Onion Skin Cache (culled to screen, unbounded off-canvas)
+            val prevCount = project.onionSkin.prevFramesCount
+            val nextCount = project.onionSkin.nextFramesCount
+            val prevList = if (onionSkinEnabled && project.onionSkin.isEnabled && prevCount > 0) {
+                (prevCount downTo 1).map { step ->
+                    TimelineTrackEngine.resolveOnionSkinLayersAtTick(project, currentTimelineTick, -step)
+                }
+            } else emptyList()
+            val nextList = if (onionSkinEnabled && project.onionSkin.isEnabled && nextCount > 0) {
+                (1..nextCount).map { step ->
+                    TimelineTrackEngine.resolveOnionSkinLayersAtTick(project, currentTimelineTick, step)
+                }
+            } else emptyList()
+
+            val oKey = OnionCacheKey(
+                currentTimelineTick,
+                onionSkinEnabled && project.onionSkin.isEnabled,
+                project.onionSkin,
+                prevList,
+                nextList,
+                vpCacheW,
+                vpCacheH,
+                densityMult,
+                matValues
+            )
+            if (cacheHolder.onionKey != oKey) {
+                val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.onionBitmap, AndroidColor.TRANSPARENT)
+                if (oKey.enabled && (prevList.any { it.isNotEmpty() } || nextList.any { it.isNotEmpty() })) {
+                    val c = AndroidCanvas(bmp)
+                    c.save()
+                    c.concat(vpMat)
+                    val onionOpacity = project.onionSkin.opacity
+
+                    val prevFilter = KodanimaGraphicsEngine.createOnionSkinColorFilter(project.onionSkin.prevColor)
+                    prevList.forEachIndexed { idx, fLayers ->
+                        val step = prevCount - idx
+                        val alpha = (onionOpacity * (1f - (step - 1) * 0.25f)).coerceAtLeast(0.1f)
+                        for (l in fLayers) {
+                            if (l.isVisible) {
+                                KodanimaGraphicsEngine.drawLayerToCanvas(
+                                    l, c, project.resolution.width, project.resolution.height,
+                                    alpha, prevFilter, visibleProjBounds, null, densityMult,
+                                    allowOutOfBounds = true
+                                )
+                            }
+                        }
+                    }
+
+                    val nextFilter = KodanimaGraphicsEngine.createOnionSkinColorFilter(project.onionSkin.nextColor)
+                    nextList.forEachIndexed { idx, fLayers ->
+                        val step = idx + 1
+                        val alpha = (onionOpacity * (1f - (step - 1) * 0.25f)).coerceAtLeast(0.1f)
+                        for (l in fLayers) {
+                            if (l.isVisible) {
+                                KodanimaGraphicsEngine.drawLayerToCanvas(
+                                    l, c, project.resolution.width, project.resolution.height,
+                                    alpha, nextFilter, visibleProjBounds, null, densityMult,
+                                    allowOutOfBounds = true
+                                )
+                            }
+                        }
+                    }
+                    c.restore()
+                }
+                cacheHolder.onionBitmap = bmp
+                cacheHolder.onionKey = oKey
+            }
+
+            // 2. Viewport Frame Layers (Below, Clip Base, Active, Above)
+            val belowSlice = if (combinedLayers.isNotEmpty() && activeGlobalLayerIdx > 0) {
+                combinedLayers.subList(0, activeGlobalLayerIdx)
+            } else emptyList()
+            val activeSlice = if (activeGlobalLayerIdx in combinedLayers.indices) {
+                listOf(combinedLayers[activeGlobalLayerIdx])
+            } else emptyList()
+            val aboveSlice = if (activeGlobalLayerIdx + 1 < combinedLayers.size) {
+                combinedLayers.subList(activeGlobalLayerIdx + 1, combinedLayers.size)
+            } else emptyList()
+
+            val bKey = LayerSliceCacheKey(belowSlice, vpCacheW, vpCacheH, densityMult, vpMatrixSignature = matValues)
+            if (cacheHolder.belowKey != bKey) {
+                val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.belowLayersBitmap, AndroidColor.TRANSPARENT)
+                if (belowSlice.isNotEmpty()) {
+                    val c = AndroidCanvas(bmp)
+                    KodanimaGraphicsEngine.drawLayersStackToCanvas(
+                        layers = belowSlice,
+                        canvas = c,
+                        targetWidth = project.resolution.width,
+                        targetHeight = project.resolution.height,
+                        visibleBounds = visibleProjBounds,
+                        densityMultiplier = densityMult,
+                        allowOutOfBounds = true,
+                        viewportMatrix = vpMat,
+                        viewportWidth = vpCacheW,
+                        viewportHeight = vpCacheH
+                    )
+                }
+                cacheHolder.belowLayersBitmap = bmp
+                cacheHolder.belowKey = bKey
+            }
+
+            val rawActiveLayer = activeSlice.firstOrNull()
+            val clipBaseLayer = if (rawActiveLayer != null && rawActiveLayer.isClippingMask) {
+                belowSlice.lastOrNull { !it.isClippingMask && it.isVisible && it.opacity > 0f }
+            } else null
+            val cbSlice = if (clipBaseLayer != null) listOf(clipBaseLayer) else emptyList()
+            val cbKey = LayerSliceCacheKey(cbSlice, vpCacheW, vpCacheH, densityMult, vpMatrixSignature = matValues)
+            if (cacheHolder.clipBaseKey != cbKey) {
+                if (cbSlice.isNotEmpty()) {
+                    val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.clipBaseBitmap, AndroidColor.TRANSPARENT)
+                    val c = AndroidCanvas(bmp)
+                    c.save()
+                    c.concat(vpMat)
+                    KodanimaGraphicsEngine.drawLayerToCanvas(
+                        cbSlice[0], c, project.resolution.width, project.resolution.height,
+                        1.0f, null, visibleProjBounds, null, densityMult, allowOutOfBounds = true
+                    )
+                    c.restore()
+                    cacheHolder.clipBaseBitmap = bmp
+                } else {
+                    KodanimaBitmapPool.release(cacheHolder.clipBaseBitmap)
+                    cacheHolder.clipBaseBitmap = null
+                }
+                cacheHolder.clipBaseKey = cbKey
+            }
+
+            val hideIds = if (activeSelection.isActive) activeSelection.hiddenSourceStrokeIds else emptySet()
+            val outsideRepl = if (activeSelection.isActive) activeSelection.outsideReplacementStrokes else emptyList()
+            val effectiveActiveSlice = if (rawActiveLayer != null && (hideIds.isNotEmpty() || outsideRepl.isNotEmpty())) {
+                listOf(rawActiveLayer.copy(strokes = rawActiveLayer.strokes.filter { it.id !in hideIds } + outsideRepl))
+            } else {
+                activeSlice
+            }
+            val aKey = LayerSliceCacheKey(effectiveActiveSlice, vpCacheW, vpCacheH, densityMult, hideIds, outsideRepl, matValues)
+            if (cacheHolder.activeKey != aKey) {
+                val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.activeLayerBitmap, AndroidColor.TRANSPARENT)
+                if (effectiveActiveSlice.isNotEmpty()) {
+                    val l = effectiveActiveSlice[0]
+                    if (l.isVisible) {
+                        val c = AndroidCanvas(bmp)
+                        c.save()
+                        c.concat(vpMat)
+                        KodanimaGraphicsEngine.drawLayerToCanvas(
+                            l, c, project.resolution.width, project.resolution.height,
+                            1.0f, null, visibleProjBounds, null, densityMult, allowOutOfBounds = true
+                        )
+                        c.restore()
+                    }
+                }
+                cacheHolder.activeLayerBitmap = bmp
+                cacheHolder.activeKey = aKey
+            }
+
+            val aboveNeedsAdvanced = aboveSlice.any {
+                it.isClippingMask || it.blendEffect != LayerBlendEffect.NORMAL
+            }
+            if (!aboveNeedsAdvanced) {
+                if (cacheHolder.aboveAdvancedIsActive) {
+                    cacheHolder.clearAboveAdvanced()
+                }
+                val abKey = LayerSliceCacheKey(aboveSlice, vpCacheW, vpCacheH, densityMult, vpMatrixSignature = matValues)
+                if (cacheHolder.aboveKey != abKey) {
+                    val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.aboveLayersBitmap, AndroidColor.TRANSPARENT)
+                    if (aboveSlice.isNotEmpty()) {
+                        val c = AndroidCanvas(bmp)
+                        c.save()
+                        c.concat(vpMat)
+                        for (l in aboveSlice) {
+                            if (l.isVisible) {
+                                KodanimaGraphicsEngine.drawLayerToCanvas(
+                                    l, c, project.resolution.width, project.resolution.height,
+                                    1.0f, null, visibleProjBounds, null, densityMult, allowOutOfBounds = true
+                                )
+                            }
+                        }
+                        c.restore()
+                    }
+                    cacheHolder.aboveLayersBitmap = bmp
+                    cacheHolder.aboveKey = abKey
+                }
+            } else {
+                cacheHolder.aboveKey = null
+                val oldList = cacheHolder.aboveAdvancedLayers.toList()
+                val nextList = ArrayList<CanvasBitmapCache.AdvancedCachedLayer>(aboveSlice.size)
+                for (idx in aboveSlice.indices) {
+                    val l = aboveSlice[idx]
+                    val lKey = LayerSliceCacheKey(listOf(l), vpCacheW, vpCacheH, densityMult, vpMatrixSignature = matValues)
+                    val reused = oldList.getOrNull(idx)
+                    if (reused != null && reused.key == lKey && !reused.bitmap.isRecycled) {
+                        nextList.add(reused)
+                    } else {
+                        val bmp = KodanimaBitmapPool.acquire(vpCacheW, vpCacheH, Bitmap.Config.ARGB_8888, AndroidColor.TRANSPARENT)
+                        if (l.isVisible && l.opacity > 0f) {
+                            val c = AndroidCanvas(bmp)
+                            c.save()
+                            c.concat(vpMat)
+                            KodanimaGraphicsEngine.drawLayerToCanvas(
+                                l, c, project.resolution.width, project.resolution.height,
+                                1.0f, null, visibleProjBounds, null, densityMult, allowOutOfBounds = true
+                            )
+                            c.restore()
+                        }
+                        nextList.add(CanvasBitmapCache.AdvancedCachedLayer(l, bmp, lKey))
+                    }
+                }
+                val keptBmps = nextList.map { it.bitmap }.toSet()
+                oldList.forEach { old ->
+                    if (old.bitmap !in keptBmps) {
+                        KodanimaBitmapPool.release(old.bitmap)
+                    }
+                }
+                cacheHolder.aboveAdvancedLayers.clear()
+                cacheHolder.aboveAdvancedLayers.addAll(nextList)
+                cacheHolder.aboveAdvancedIsActive = true
+            }
+            activeStrokeVersion++
+        }
+
         // Background-thread 3D rasterization for off-canvas backdrop (matches active camera angle & framing at 60fps UI)
         LaunchedEffect(
             isCameraSideView3D,
@@ -1649,8 +1822,8 @@ fun CanvasView(
         }
 
         fun applyTabletInversion(rawX: Float, rawY: Float): Offset {
-            val px = if (tabletSettings.invertX) (projWidth - rawX).coerceIn(0f, projWidth) else rawX
-            val py = if (tabletSettings.invertY) (projHeight - rawY).coerceIn(0f, projHeight) else rawY
+            val px = if (tabletSettings.invertX) (projWidth - rawX) else rawX
+            val py = if (tabletSettings.invertY) (projHeight - rawY) else rawY
             return Offset(px, py)
         }
 
@@ -1689,6 +1862,8 @@ fun CanvasView(
         val curStageSelection by rememberUpdatedState(stageSelection)
         val curOnStageTargetSelected by rememberUpdatedState(onStageTargetSelected)
         val curOnStageObjectDelta by rememberUpdatedState(onSelectedStageObjectDelta)
+        val curStudio3DPaintEnabled by rememberUpdatedState(studio3DPaintEnabled)
+        val curOnPaintSceneObjectUV by rememberUpdatedState(onPaintSceneObjectUV)
         val curOnStrokeCompleted by rememberUpdatedState(onStrokeCompleted)
         val curOnEyedropper by rememberUpdatedState(onEyedropperColorPicked)
         val curOnBucket by rememberUpdatedState(onBucketFill)
@@ -1732,8 +1907,6 @@ fun CanvasView(
             }
 
             if (!isStylusInput) {
-                // Capacitive touch drivers vary wildly across devices (e.g. Moto G 0.25..0.55 vs Tecno 1.0/0.0).
-                // Keep brushSize faithful (e.g. 6px stays 6px across Host & Visitor) with subtle weight feel.
                 if (normalizedRaw <= 0.02f || normalizedRaw >= 0.99f) {
                     return 0.96f
                 }
@@ -1765,6 +1938,9 @@ fun CanvasView(
 
         fun flushIncrementalRaster() {
             if (currentPoints.isEmpty()) return
+            val sessionVpMat = AndroidMatrix(cacheHolder.activeSessionMatrix).apply {
+                postScale(cacheHolder.activeSessionVpScale, cacheHolder.activeSessionVpScale)
+            }
             if (selectedTool == ToolType.ERASER) {
                 val eCanvas = cacheHolder.eraserWorkCanvas ?: return
                 val startIdx = max(0, cacheHolder.lastErasedPointIdx - 1)
@@ -1782,7 +1958,7 @@ fun CanvasView(
                         clipBoundsHeight = projHeight
                     )
                     eCanvas.save()
-                    eCanvas.scale(cacheScale, cacheScale)
+                    eCanvas.concat(sessionVpMat)
                     KodanimaGraphicsEngine.drawStrokeSegmentRange(
                         eraserStroke, eCanvas, startIdx, endIdx, 1.0f, null, densityMult
                     )
@@ -1795,7 +1971,7 @@ fun CanvasView(
                 selectedTool != ToolType.CIRCLE &&
                 selectedTool != ToolType.LASSO &&
                 selectedTool != ToolType.EYEDROPPER &&
-                brushPresetId != 3 // Krita Ink-3 G-Pen uses end tapering
+                brushPresetId != 3
             ) {
                 val sCanvas = cacheHolder.activeStrokeCanvas ?: return
                 val activeStroke = DrawingStroke(
@@ -1812,10 +1988,9 @@ fun CanvasView(
                     clipBoundsHeight = projHeight
                 )
                 if (currentPoints.size <= 280) {
-                    // Full quadratic midpoint Bezier curve pass on active buffer for silky-smooth live strokes
                     sCanvas.drawColor(AndroidColor.TRANSPARENT, PorterDuff.Mode.CLEAR)
                     sCanvas.save()
-                    sCanvas.scale(cacheScale, cacheScale)
+                    sCanvas.concat(sessionVpMat)
                     KodanimaGraphicsEngine.drawStrokeToCanvas(
                         activeStroke, sCanvas, 1.0f, null, densityMult
                     )
@@ -1826,7 +2001,7 @@ fun CanvasView(
                     val endIdx = currentPoints.lastIndex
                     if (endIdx > cacheHolder.lastRenderedStrokeIdx || currentPoints.size == 1) {
                         sCanvas.save()
-                        sCanvas.scale(cacheScale, cacheScale)
+                        sCanvas.concat(sessionVpMat)
                         KodanimaGraphicsEngine.drawStrokeSegmentRange(
                             activeStroke, sCanvas, startIdx, endIdx, 1.0f, null, densityMult
                         )
@@ -2204,11 +2379,64 @@ fun CanvasView(
                             MotionEvent.ACTION_DOWN -> {
                                 curOnFocusActive?.invoke()
 
-                                // Interactive 3D Studio Viewport: Gizmo X/Y/Z handles, Direct 3D Transform, Tap-to-Select, or Stage Orbit
+                                // Interactive 3D Studio Viewport: 3D Paint, Gizmo X/Y/Z handles, Direct 3D Transform, Ray-Triangle Tap-to-Select, or Stage Orbit
                                 if (curIsSideView3D) {
                                     lastOrbitTouchPos = Offset(motionEvent.x, motionEvent.y)
                                     stage3DDownPos = Offset(motionEvent.x, motionEvent.y)
                                     stage3DMovedPastSlop = false
+                                    if (curStudio3DPaintEnabled &&
+                                        curOnPaintSceneObjectUV != null &&
+                                        curStage3DMode != Stage3DInteractionMode.CAMERA_POV
+                                    ) {
+                                        val fovScale = (tan(Math.toRadians(25.0)) / tan(Math.toRadians(evaluatedCameraKf.fovDegrees.coerceIn(18f, 120f) * 0.5)))
+                                            .toFloat().coerceIn(0.35f, 2.6f)
+                                        val stageFocal = max(containerWidth, containerHeight) * 0.85f * fovScale
+                                        val stageVpCx = containerWidth * 0.5f + view3DPanX
+                                        val stageVpCy = containerHeight * 0.50f + view3DPanY
+                                        val stageProjScale = computeStage3DProjScale(containerWidth, containerHeight, projWidth, view3DZoom)
+                                        val animTimeSec = effectiveTickFloat / max(1, project.fps).toFloat()
+                                        val candidateObjs = if (curStageSelection.type == StageTargetType.OBJECT_3D) {
+                                            val sel = curCamSettings.scene3DObjects.firstOrNull { it.id == curStageSelection.id }
+                                            if (sel != null) listOf(sel) + curCamSettings.scene3DObjects.filter { it.id != sel.id }
+                                            else curCamSettings.scene3DObjects
+                                        } else curCamSettings.scene3DObjects
+
+                                        var bestHit: com.example.engine.TrianglePickResult? = null
+                                        for (obj in candidateObjs) {
+                                            if (!obj.isVisible || obj.meshAssetPath.isBlank()) continue
+                                            val h = Studio3DPaintEngine.pickObjectTriangleUV(
+                                                obj = obj,
+                                                frameIndex = currentTimelineTick,
+                                                autoInterpolate = curCamSettings.autoInterpolate,
+                                                screenX = motionEvent.x,
+                                                screenY = motionEvent.y,
+                                                camYawDeg = view3DYaw,
+                                                camPitchDeg = view3DPitch,
+                                                camRollDeg = 0f,
+                                                camPanX = 0f,
+                                                camPanY = 0f,
+                                                focalPx = stageFocal,
+                                                vpCx = stageVpCx,
+                                                vpCy = stageVpCy,
+                                                worldUnitScale = stageProjScale,
+                                                tickFloat = effectiveTickFloat,
+                                                animTimeSec = animTimeSec
+                                            )
+                                            if (h != null && (bestHit == null || h.depth < bestHit.depth)) {
+                                                bestHit = h
+                                            }
+                                        }
+                                        if (bestHit != null) {
+                                            isPaintingStage3DObject = true
+                                            paint3DTargetObjId = bestHit.objectId
+                                            paint3DLastUV = bestHit.u to bestHit.v
+                                            if (curStageSelection.type != StageTargetType.OBJECT_3D || curStageSelection.id != bestHit.objectId) {
+                                                curOnStageTargetSelected?.invoke(StageSelection(StageTargetType.OBJECT_3D, bestHit.objectId))
+                                            }
+                                            curOnPaintSceneObjectUV!!.invoke(bestHit.objectId, bestHit.u, bestHit.v, bestHit.u, bestHit.v)
+                                            return@pointerInteropFilter true
+                                        }
+                                    }
                                     if (curStage3DMode == Stage3DInteractionMode.CAMERA_POV) {
                                         isDraggingStage3DCam = true
                                         active3DGizmoAxis = 4
@@ -2220,7 +2448,7 @@ fun CanvasView(
                                         curOnStageObjectDelta != null
                                     }
                                     if (stage3DGizmo.valid && canManipulateSelected) {
-                                        val gHitR = 24f * density.density
+                                        val gHitR = 26f * density.density
                                         val gHitRSq = gHitR * gHitR
                                         fun distSq(ax: Float, ay: Float): Float {
                                             val ddx = motionEvent.x - ax
@@ -2343,9 +2571,7 @@ fun CanvasView(
                                 }
 
                                 if (curSelectedTool == ToolType.EYEDROPPER) {
-                                    val sx = (projPt.x * cacheScale).roundToInt()
-                                    val sy = (projPt.y * cacheScale).roundToInt()
-                                    curOnEyedropper(cacheHolder.sampleEyedropperPixel(sx, sy))
+                                    curOnEyedropper(cacheHolder.sampleEyedropperPixel(projPt.x, projPt.y))
                                     isDrawingActive = false
                                     return@pointerInteropFilter true
                                 }
@@ -2392,15 +2618,20 @@ fun CanvasView(
                                     return@pointerInteropFilter true
                                 }
 
-                                cacheHolder.ensureSize(cacheW, cacheH)
+                                syncProjectionMatrices()
+                                cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale)
                                 if (curSelectedTool == ToolType.ERASER) {
                                     cacheHolder.beginEraserSession(
+                                        sessionMatrix = projToScreenMatrix,
+                                        sessionVpScale = vpScale,
                                         activeSelection = curActiveSel,
-                                        cacheScale = cacheScale,
                                         densityMult = densityMult
                                     )
                                 } else {
-                                    cacheHolder.beginActiveStrokeSession()
+                                    cacheHolder.beginActiveStrokeSession(
+                                        sessionMatrix = projToScreenMatrix,
+                                        sessionVpScale = vpScale
+                                    )
                                 }
 
                                 activeStrokeId = UUID.randomUUID().toString()
@@ -2416,6 +2647,43 @@ fun CanvasView(
                                 if (curIsSideView3D) {
                                     val moveDist = hypot(motionEvent.x - stage3DDownPos.x, motionEvent.y - stage3DDownPos.y)
                                     if (moveDist > 9f * density.density) stage3DMovedPastSlop = true
+                                    if (isPaintingStage3DObject && curOnPaintSceneObjectUV != null) {
+                                        val targetId = paint3DTargetObjId
+                                        val targetObj = curCamSettings.scene3DObjects.firstOrNull { it.id == targetId }
+                                        if (targetObj != null) {
+                                            val fovScale = (tan(Math.toRadians(25.0)) / tan(Math.toRadians(evaluatedCameraKf.fovDegrees.coerceIn(18f, 120f) * 0.5)))
+                                                .toFloat().coerceIn(0.35f, 2.6f)
+                                            val stageFocal = max(containerWidth, containerHeight) * 0.85f * fovScale
+                                            val stageVpCx = containerWidth * 0.5f + view3DPanX
+                                            val stageVpCy = containerHeight * 0.50f + view3DPanY
+                                            val stageProjScale = computeStage3DProjScale(containerWidth, containerHeight, projWidth, view3DZoom)
+                                            val animTimeSec = effectiveTickFloat / max(1, project.fps).toFloat()
+                                            val hit = Studio3DPaintEngine.pickObjectTriangleUV(
+                                                obj = targetObj,
+                                                frameIndex = currentTimelineTick,
+                                                autoInterpolate = curCamSettings.autoInterpolate,
+                                                screenX = motionEvent.x,
+                                                screenY = motionEvent.y,
+                                                camYawDeg = view3DYaw,
+                                                camPitchDeg = view3DPitch,
+                                                camRollDeg = 0f,
+                                                camPanX = 0f,
+                                                camPanY = 0f,
+                                                focalPx = stageFocal,
+                                                vpCx = stageVpCx,
+                                                vpCy = stageVpCy,
+                                                worldUnitScale = stageProjScale,
+                                                tickFloat = effectiveTickFloat,
+                                                animTimeSec = animTimeSec
+                                            )
+                                            if (hit != null) {
+                                                val prev = paint3DLastUV ?: (hit.u to hit.v)
+                                                curOnPaintSceneObjectUV!!.invoke(targetObj.id, prev.first, prev.second, hit.u, hit.v)
+                                                paint3DLastUV = hit.u to hit.v
+                                            }
+                                        }
+                                        return@pointerInteropFilter true
+                                    }
                                 }
                                 if (isDraggingStage3DCam && curIsSideView3D) {
                                     val dx = motionEvent.x - lastOrbitTouchPos.x
@@ -2483,9 +2751,9 @@ fun CanvasView(
                                                         curOnStageObjectDelta!!.invoke(0f, 0f, 0f, 0f, 0f, 0f, sf)
                                                     }
                                                     CameraToolAction.ROTATE_Z ->
-                                                        curOnStageObjectDelta!!.invoke(0f, 0f, 0f, 0f, 0f, dx * 0.45f, 1f)
+                                                        curOnStageObjectDelta!!.invoke(0f, 0f, 0f, 0f, 0f, dx * 0.52f, 1f)
                                                     CameraToolAction.ORBIT_3D ->
-                                                        curOnStageObjectDelta!!.invoke(0f, 0f, 0f, -dy * 0.45f, dx * 0.45f, 0f, 1f)
+                                                        curOnStageObjectDelta!!.invoke(0f, 0f, 0f, -dy * 0.52f, dx * 0.52f, 0f, 1f)
                                                     CameraToolAction.FOV_LENS ->
                                                         curOnStageObjectDelta!!.invoke(0f, 0f, -dy * objStep * 0.6f, 0f, 0f, 0f, 1f)
                                                 }
@@ -2663,6 +2931,12 @@ fun CanvasView(
                                 true
                             }
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                if (isPaintingStage3DObject) {
+                                    isPaintingStage3DObject = false
+                                    paint3DTargetObjId = null
+                                    paint3DLastUV = null
+                                    return@pointerInteropFilter true
+                                }
                                 if (isDraggingStage3DCam || isOrbiting3D) {
                                     val wasTap = motionEvent.actionMasked == MotionEvent.ACTION_UP &&
                                         !stage3DMovedPastSlop &&
@@ -2673,24 +2947,53 @@ fun CanvasView(
                                     if (wasTap && curOnStageTargetSelected != null) {
                                         val tx = motionEvent.x
                                         val ty = motionEvent.y
-                                        val camApexHitR = 26f * density.density
+                                        val fovScale = (tan(Math.toRadians(25.0)) / tan(Math.toRadians(evaluatedCameraKf.fovDegrees.coerceIn(18f, 120f) * 0.5)))
+                                            .toFloat().coerceIn(0.35f, 2.6f)
+                                        val stageFocal = max(containerWidth, containerHeight) * 0.85f * fovScale
+                                        val stageVpCx = containerWidth * 0.5f + view3DPanX
+                                        val stageVpCy = containerHeight * 0.50f + view3DPanY
+                                        val stageProjScale = computeStage3DProjScale(containerWidth, containerHeight, projWidth, view3DZoom)
+                                        val animTimeSec = effectiveTickFloat / max(1, project.fps).toFloat()
+
+                                        val exactObjId = Camera3DEngine.pickStageObject3DAtScreenPoint(
+                                            sceneObjects = curCamSettings.scene3DObjects,
+                                            frameIndex = currentTimelineTick,
+                                            autoInterpolate = curCamSettings.autoInterpolate,
+                                            screenX = tx,
+                                            screenY = ty,
+                                            camYawDeg = view3DYaw,
+                                            camPitchDeg = view3DPitch,
+                                            camRollDeg = 0f,
+                                            camPanX = 0f,
+                                            camPanY = 0f,
+                                            focalPx = stageFocal,
+                                            vpCx = stageVpCx,
+                                            vpCy = stageVpCy,
+                                            worldUnitScale = stageProjScale,
+                                            tickFloat = effectiveTickFloat,
+                                            animTimeSec = animTimeSec
+                                        )
+
+                                        val camApexHitR = 32f * density.density
                                         val hitCam = stage3DGizmo.valid &&
                                             hypot(tx - stage3DGizmo.apexX, ty - stage3DGizmo.apexY) <= camApexHitR
-                                        if (hitCam) {
-                                            curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.CAMERA, "camera"))
-                                        } else {
-                                            val pad = 12f * density.density
-                                            val hitObj = stage3DObjectBounds.values
-                                                .filter { b -> tx in (b.minX - pad)..(b.maxX + pad) && ty in (b.minY - pad)..(b.maxY + pad) }
-                                                .minByOrNull { it.avgDepth }
-                                            if (hitObj != null) {
-                                                curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.OBJECT_3D, hitObj.id))
-                                            } else {
-                                                val hitLayerId = stage3DLayerBounds.entries.lastOrNull { (_, r) ->
-                                                    tx in (r.left - pad)..(r.right + pad) && ty in (r.top - pad)..(r.bottom + pad)
-                                                }?.key
-                                                if (hitLayerId != null) {
-                                                    curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.LAYER, hitLayerId))
+                                        when {
+                                            hitCam -> curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.CAMERA, "camera"))
+                                            exactObjId != null -> curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.OBJECT_3D, exactObjId))
+                                            else -> {
+                                                val pad = 16f * density.density
+                                                val hitObj = stage3DObjectBounds.values
+                                                    .filter { b -> tx in (b.minX - pad)..(b.maxX + pad) && ty in (b.minY - pad)..(b.maxY + pad) }
+                                                    .minByOrNull { it.avgDepth }
+                                                if (hitObj != null) {
+                                                    curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.OBJECT_3D, hitObj.id))
+                                                } else {
+                                                    val hitLayerId = stage3DLayerBounds.entries.lastOrNull { (_, r) ->
+                                                        tx in (r.left - pad)..(r.right + pad) && ty in (r.top - pad)..(r.bottom + pad)
+                                                    }?.key
+                                                    if (hitLayerId != null) {
+                                                        curOnStageTargetSelected!!.invoke(StageSelection(StageTargetType.LAYER, hitLayerId))
+                                                    }
                                                 }
                                             }
                                         }
@@ -2752,13 +3055,11 @@ fun CanvasView(
                                             clipBoundsWidth = projWidth,
                                             clipBoundsHeight = projHeight
                                         )
-                                        // Synchronously commit onto cached activeLayerBitmap BEFORE clearing active overlay
-                                        // only when the active layer is unlocked and visible (prevents vanished phantom strokes).
                                         val canCommitLocally = curActiveLayer?.isLocked != true && curActiveLayer?.isVisible != false
                                         if (canCommitLocally) {
-                                            cacheHolder.ensureSize(cacheW, cacheH)
+                                            cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale)
                                             val targetBmp = cacheHolder.activeLayerBitmap?.takeIf { !it.isRecycled }
-                                                ?: cacheHolder.acquireOrReuse(null, AndroidColor.TRANSPARENT).also {
+                                                ?: cacheHolder.acquireOrReuseViewport(null, AndroidColor.TRANSPARENT).also {
                                                     cacheHolder.activeLayerBitmap = it
                                                 }
                                             val commitCanvas = AndroidCanvas(targetBmp)
@@ -2766,9 +3067,20 @@ fun CanvasView(
                                             if (curSelectedTool == ToolType.ERASER && eraserBuf != null && !eraserBuf.isRecycled) {
                                                 flushIncrementalRaster()
                                                 commitCanvas.drawBitmap(eraserBuf, 0f, 0f, overlayScratch.srcCopyPaint)
+                                                cacheHolder.cachedProjToScreenMatrix.set(cacheHolder.activeSessionMatrix)
+                                                cacheHolder.hasCachedMatrix = true
                                             } else {
+                                                val commitMat = if (cacheHolder.hasCachedMatrix) {
+                                                    AndroidMatrix(cacheHolder.cachedProjToScreenMatrix)
+                                                } else {
+                                                    AndroidMatrix(cacheHolder.activeSessionMatrix).also {
+                                                        cacheHolder.cachedProjToScreenMatrix.set(it)
+                                                        cacheHolder.hasCachedMatrix = true
+                                                    }
+                                                }
+                                                commitMat.postScale(cacheHolder.vpScale, cacheHolder.vpScale)
                                                 commitCanvas.save()
-                                                commitCanvas.scale(cacheScale, cacheScale)
+                                                commitCanvas.concat(commitMat)
                                                 KodanimaGraphicsEngine.drawStrokeToCanvas(
                                                     completedStroke,
                                                     commitCanvas,
@@ -2957,7 +3269,7 @@ fun CanvasView(
                     }
                 }
 
-                // Main Hardware-Accelerated 2D Drawing Canvas (transforms execute on GPU RenderThread)
+                // Layer 0: Paper sheet backdrop (shadow, paper tint/texture/3D backdrop & synced video reference)
                 Box(
                     modifier = Modifier
                         .graphicsLayer {
@@ -2985,7 +3297,81 @@ fun CanvasView(
                         )
                     }
 
-                // Layer 1: Cached GPU texture compositing (O(1) per frame)
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("drawing_canvas_paper")
+                    ) {
+                        val trigger = activeStrokeVersion
+                        val nativeCanvas = drawContext.canvas.nativeCanvas
+                        val screenPxPerProjPx = (size.width / projWidth) * zoom
+                        overlayScratch.bitmapPaint.isFilterBitmap = screenPxPerProjPx < 4.0f
+                        overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
+
+                        val isBgTransparent = project.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE
+                        val show3DBg = project.canvasBackground.show3DInCanvas
+                        if (!effectiveFloatingRefBelow) {
+                            if (show3DBg) {
+                                val bg3DBmp = when (project.canvasBackground.canvas3DRenderMode) {
+                                    Canvas3DBackgroundRenderMode.STATIC_2D_CACHE -> cacheHolder.canvas3DBgStaticBitmap
+                                    Canvas3DBackgroundRenderMode.PRE_RENDER_ON_PLAY ->
+                                        cacheHolder.canvas3DBgPlayFrames[currentTimelineTick]
+                                            ?: cacheHolder.canvas3DBgStaticBitmap
+                                            ?: cacheHolder.canvas3DBgPlayFrames.values.lastOrNull()
+                                    Canvas3DBackgroundRenderMode.REALTIME_3D ->
+                                        cacheHolder.canvas3DBgRealtimeBitmap ?: cacheHolder.canvas3DBgStaticBitmap
+                                }
+                                if (bg3DBmp != null && !bg3DBmp.isRecycled && bg3DBmp.width > 0 && bg3DBmp.height > 0) {
+                                    overlayScratch.srcRect.set(0, 0, bg3DBmp.width, bg3DBmp.height)
+                                    nativeCanvas.drawBitmap(bg3DBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                                } else {
+                                    KodanimaGraphicsEngine.drawSkyBackdropToCanvas(
+                                        nativeCanvas, size.width, size.height, project.canvasBackground
+                                    )
+                                }
+                            } else if (isBgTransparent) {
+                                if (!isCameraModeActive && !camSettings.isEnabled) {
+                                    drawTransparencyCheckerboard(nativeCanvas, size.width, size.height, density.density, overlayScratch)
+                                }
+                            } else {
+                                KodanimaGraphicsEngine.drawProjectBackgroundToCanvas(
+                                    canvas = nativeCanvas,
+                                    width = size.width,
+                                    height = size.height,
+                                    bgSettings = project.canvasBackground,
+                                    drawSkyWhenTransparent = false
+                                )
+                            }
+                        }
+
+                        // Video / GIF Reference Layer synchronized to current frame / scrub timestamp
+                        val vBmp = videoFrameBitmap
+                        if (videoAsset != null && vBmp != null && !vBmp.isRecycled && vBmp.width > 0 && vBmp.height > 0) {
+                            val scaleFactor = (videoAsset.scalePercent / 100.0).toFloat().coerceIn(0.1f, 5f)
+                            val fitScale = min(size.width / vBmp.width.toFloat(), size.height / vBmp.height.toFloat())
+                            val drawW = vBmp.width * fitScale * scaleFactor
+                            val drawH = vBmp.height * fitScale * scaleFactor
+                            val cx = size.width * 0.5f + videoAsset.offsetX.toFloat() * (size.width / projWidth)
+                            val cy = size.height * 0.5f + videoAsset.offsetY.toFloat() * (size.height / projHeight)
+
+                            nativeCanvas.save()
+                            nativeCanvas.translate(cx, cy)
+                            if (videoAsset.rotationDegrees != 0.0) {
+                                nativeCanvas.rotate(videoAsset.rotationDegrees.toFloat())
+                            }
+                            overlayScratch.srcRect.set(0, 0, vBmp.width, vBmp.height)
+                            overlayScratch.dstRectF.set(-drawW * 0.5f, -drawH * 0.5f, drawW * 0.5f, drawH * 0.5f)
+                            overlayScratch.videoBitmapPaint.alpha =
+                                ((videoAsset.opacityPercent.coerceIn(0, 100) / 100f) * 255f).roundToInt()
+                            nativeCanvas.drawBitmap(vBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.videoBitmapPaint)
+                            nativeCanvas.restore()
+                        }
+                        @Suppress("UNUSED_EXPRESSION")
+                        trigger
+                    }
+                }
+
+                // Layer 1: Full-Viewport Unclipped Cached GPU Layer Compositing (screen-resolution, unbounded off-canvas drawing)
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
@@ -2993,49 +3379,33 @@ fun CanvasView(
                 ) {
                     val trigger = activeStrokeVersion
                     val nativeCanvas = drawContext.canvas.nativeCanvas
-                    val screenPxPerProjPx = (size.width / projWidth) * zoom
-                    // Keep silky bilinear AA smoothing normally; switch to crisp nearest-neighbor pixels on deep zoom
+                    val safeZ = zoom.coerceAtLeast(0.05f)
+                    val liveMat = overlayScratch.liveMatrixScratch.apply {
+                        reset()
+                        setScale(boxW / projWidth, boxH / projHeight)
+                        postTranslate(-boxW * 0.5f, -boxH * 0.5f)
+                        postScale(if (mirrorHorizontal) -safeZ else safeZ, safeZ)
+                        postRotate(rotation)
+                        postTranslate(halfContainerW + panX, halfContainerH + panY)
+                    }
+                    val invCached = overlayScratch.invMatrixScratch
+                    val hasDelta = cacheHolder.hasCachedMatrix && cacheHolder.cachedProjToScreenMatrix.invert(invCached)
+                    val deltaMat = overlayScratch.deltaMatrixScratch
+                    if (hasDelta) {
+                        deltaMat.setConcat(liveMat, invCached)
+                    } else {
+                        deltaMat.reset()
+                    }
+
+                    val screenPxPerProjPx = (boxW / projWidth) * zoom
                     overlayScratch.bitmapPaint.isFilterBitmap = screenPxPerProjPx < 4.0f
-                    overlayScratch.srcRect.set(0, 0, cacheW, cacheH)
+                    val drawVpW = cacheHolder.vpW.coerceAtLeast(1)
+                    val drawVpH = cacheHolder.vpH.coerceAtLeast(1)
+                    overlayScratch.srcRect.set(0, 0, drawVpW, drawVpH)
                     overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
 
                     val isBgTransparent = project.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE
                     val show3DBg = project.canvasBackground.show3DInCanvas
-                    if (!effectiveFloatingRefBelow) {
-                        if (show3DBg) {
-                            val bg3DBmp = when (project.canvasBackground.canvas3DRenderMode) {
-                                Canvas3DBackgroundRenderMode.STATIC_2D_CACHE -> cacheHolder.canvas3DBgStaticBitmap
-                                Canvas3DBackgroundRenderMode.PRE_RENDER_ON_PLAY ->
-                                    cacheHolder.canvas3DBgPlayFrames[currentTimelineTick]
-                                        ?: cacheHolder.canvas3DBgStaticBitmap
-                                        ?: cacheHolder.canvas3DBgPlayFrames.values.lastOrNull()
-                                Canvas3DBackgroundRenderMode.REALTIME_3D ->
-                                    cacheHolder.canvas3DBgRealtimeBitmap ?: cacheHolder.canvas3DBgStaticBitmap
-                            }
-                            if (bg3DBmp != null && !bg3DBmp.isRecycled && bg3DBmp.width > 0 && bg3DBmp.height > 0) {
-                                overlayScratch.srcRect.set(0, 0, bg3DBmp.width, bg3DBmp.height)
-                                nativeCanvas.drawBitmap(bg3DBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
-                                overlayScratch.srcRect.set(0, 0, cacheW, cacheH)
-                            } else {
-                                KodanimaGraphicsEngine.drawSkyBackdropToCanvas(
-                                    nativeCanvas, size.width, size.height, project.canvasBackground
-                                )
-                            }
-                        } else if (isBgTransparent) {
-                            if (!isCameraModeActive && !camSettings.isEnabled) {
-                                drawTransparencyCheckerboard(nativeCanvas, size.width, size.height, density.density, overlayScratch)
-                            }
-                        } else {
-                            KodanimaGraphicsEngine.drawProjectBackgroundToCanvas(
-                                canvas = nativeCanvas,
-                                width = size.width,
-                                height = size.height,
-                                bgSettings = project.canvasBackground,
-                                drawSkyWhenTransparent = false
-                            )
-                        }
-                    }
-
                     val activeIsClip = activeLayerObj?.isClippingMask == true
                     val activeBlend = activeLayerObj?.blendEffect ?: LayerBlendEffect.NORMAL
                     val needsLayerStackBlend = activeIsClip ||
@@ -3047,62 +3417,46 @@ fun CanvasView(
                         layerStackSaveCount = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
                     }
 
-                    // Video / GIF Reference Layer synchronized to current frame / scrub timestamp
-                    val vBmp = videoFrameBitmap
-                    if (videoAsset != null && vBmp != null && !vBmp.isRecycled && vBmp.width > 0 && vBmp.height > 0) {
-                        val scaleFactor = (videoAsset.scalePercent / 100.0).toFloat().coerceIn(0.1f, 5f)
-                        val fitScale = min(size.width / vBmp.width.toFloat(), size.height / vBmp.height.toFloat())
-                        val drawW = vBmp.width * fitScale * scaleFactor
-                        val drawH = vBmp.height * fitScale * scaleFactor
-                        val cx = size.width * 0.5f + videoAsset.offsetX.toFloat() * (size.width / projWidth)
-                        val cy = size.height * 0.5f + videoAsset.offsetY.toFloat() * (size.height / projHeight)
+                    nativeCanvas.save()
+                    if (hasDelta) nativeCanvas.concat(deltaMat)
 
-                        nativeCanvas.save()
-                        nativeCanvas.translate(cx, cy)
-                        if (videoAsset.rotationDegrees != 0.0) {
-                            nativeCanvas.rotate(videoAsset.rotationDegrees.toFloat())
-                        }
-                        overlayScratch.srcRect.set(0, 0, vBmp.width, vBmp.height)
-                        overlayScratch.dstRectF.set(-drawW * 0.5f, -drawH * 0.5f, drawW * 0.5f, drawH * 0.5f)
-                        overlayScratch.videoBitmapPaint.alpha =
-                            ((videoAsset.opacityPercent.coerceIn(0, 100) / 100f) * 255f).roundToInt()
-                        nativeCanvas.drawBitmap(vBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.videoBitmapPaint)
-                        nativeCanvas.restore()
-                        overlayScratch.srcRect.set(0, 0, cacheW, cacheH)
-                        overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
-                    }
-
-                    // Onion skin under current layers
                     cacheHolder.onionBitmap?.takeIf { !it.isRecycled && onionSkinEnabled && project.onionSkin.isEnabled }?.let { bmp ->
+                        overlayScratch.srcRect.set(0, 0, bmp.width, bmp.height)
                         nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
                     }
-                    // Below active layer
                     cacheHolder.belowLayersBitmap?.takeIf { !it.isRecycled }?.let { bmp ->
+                        overlayScratch.srcRect.set(0, 0, bmp.width, bmp.height)
                         nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
                     }
-                    // Grid Ruler behind active layer strokes when configured
+                    nativeCanvas.restore()
+
                     if (gridRulerSettings.isEnabled && gridRulerSettings.renderBehindActiveLayer) {
+                        nativeCanvas.save()
+                        nativeCanvas.concat(liveMat)
                         drawGridRulerCanvas(
                             nativeCanvas = nativeCanvas,
-                            canvasScaleX = size.width / projWidth,
-                            canvasScaleY = size.height / projHeight,
+                            canvasScaleX = boxW / projWidth,
+                            canvasScaleY = boxH / projHeight,
                             projWidth = projWidth,
                             projHeight = projHeight,
                             screenDensity = density.density,
                             zoom = zoom,
                             settings = gridRulerSettings,
-                            scratch = overlayScratch
+                            scratch = overlayScratch,
+                            applyScale = false
                         )
+                        nativeCanvas.restore()
                     }
-                    // Perspective Ruler behind active layer strokes when configured
                     if (perspectiveRulerSettings.isEnabled && perspectiveRulerSettings.renderBehindActiveLayer) {
                         val activeSnapOrigin = if (isDrawingActive && perspectiveRulerSettings.snapToGuide) {
                             currentPoints.firstOrNull()?.let { Offset(it.x, it.y) }
                         } else null
+                        nativeCanvas.save()
+                        nativeCanvas.concat(liveMat)
                         drawPerspectiveRulerCanvas(
                             nativeCanvas = nativeCanvas,
-                            canvasScaleX = size.width / projWidth,
-                            canvasScaleY = size.height / projHeight,
+                            canvasScaleX = boxW / projWidth,
+                            canvasScaleY = boxH / projHeight,
                             projWidth = projWidth,
                             projHeight = projHeight,
                             screenDensity = density.density,
@@ -3110,35 +3464,54 @@ fun CanvasView(
                             settings = perspectiveRulerSettings,
                             activeSnapOrigin = activeSnapOrigin,
                             lockedSnapVpIdx = lockedPerspectiveTargetVpIdx,
-                            scratch = overlayScratch
+                            scratch = overlayScratch,
+                            applyScale = false
                         )
+                        nativeCanvas.restore()
                     }
-                    // Active layer (isolated eraser working buffer when erasing, or cached committed layer)
-                    val activeBmp = if (isDrawingActive && selectedTool == ToolType.ERASER && cacheHolder.eraserWorkBitmap != null) {
-                        cacheHolder.eraserWorkBitmap
-                    } else {
-                        cacheHolder.activeLayerBitmap
-                    }
+
+                    // Active layer (isolated viewport eraser buffer when erasing, or cached committed layer)
+                    val isUsingEraserBuf = isDrawingActive && selectedTool == ToolType.ERASER && cacheHolder.eraserWorkBitmap != null
+                    val activeBmp = if (isUsingEraserBuf) cacheHolder.eraserWorkBitmap else cacheHolder.activeLayerBitmap
                     val clipBaseBmp = cacheHolder.clipBaseBitmap?.takeIf { !it.isRecycled }
-                    activeBmp?.takeIf { !it.isRecycled && (activeLayerObj?.isVisible != false) }?.let { bmp ->
+
+                    if (activeBmp != null && !activeBmp.isRecycled && (activeLayerObj?.isVisible != false)) {
+                        val invActive = AndroidMatrix()
+                        val useActiveDelta = if (isUsingEraserBuf && cacheHolder.activeSessionMatrix.invert(invActive)) {
+                            overlayScratch.vpMatrixScratch.setConcat(liveMat, invActive)
+                            true
+                        } else hasDelta
+                        val activeMat = if (isUsingEraserBuf && useActiveDelta) overlayScratch.vpMatrixScratch else deltaMat
+                        overlayScratch.srcRect.set(0, 0, activeBmp.width, activeBmp.height)
+
+                        nativeCanvas.save()
+                        if (useActiveDelta) nativeCanvas.concat(activeMat)
                         if (!activeIsClip && activeBlend == LayerBlendEffect.NORMAL) {
-                            nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                            nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
                         } else if (!activeIsClip) {
                             overlayScratch.layerBlendPaint.alpha = 255
                             KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
-                            nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
+                            nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
                         } else if (clipBaseBmp != null) {
                             overlayScratch.layerBlendPaint.alpha = 255
                             KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
                             val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
-                            nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                            nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                            nativeCanvas.restore()
+                            nativeCanvas.save()
+                            if (hasDelta) nativeCanvas.concat(deltaMat)
+                            overlayScratch.srcRect.set(0, 0, clipBaseBmp.width, clipBaseBmp.height)
                             nativeCanvas.drawBitmap(clipBaseBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
                             nativeCanvas.restoreToCount(sc)
                         }
+                        nativeCanvas.restore()
                     }
-                    // Above active layer
+
+                    nativeCanvas.save()
+                    if (hasDelta) nativeCanvas.concat(deltaMat)
                     if (!cacheHolder.aboveAdvancedIsActive) {
                         cacheHolder.aboveLayersBitmap?.takeIf { !it.isRecycled }?.let { bmp ->
+                            overlayScratch.srcRect.set(0, 0, bmp.width, bmp.height)
                             nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
                         }
                     } else {
@@ -3154,6 +3527,7 @@ fun CanvasView(
                                     lastNonClippedBmp = null
                                 } else {
                                     lastNonClippedBmp = adv.bitmap
+                                    overlayScratch.srcRect.set(0, 0, adv.bitmap.width, adv.bitmap.height)
                                     if (advLayer.blendEffect == LayerBlendEffect.NORMAL) {
                                         nativeCanvas.drawBitmap(adv.bitmap, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
                                     } else {
@@ -3168,13 +3542,17 @@ fun CanvasView(
                                     overlayScratch.layerBlendPaint.alpha = 255
                                     KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, advLayer.blendEffect)
                                     val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
+                                    overlayScratch.srcRect.set(0, 0, adv.bitmap.width, adv.bitmap.height)
                                     nativeCanvas.drawBitmap(adv.bitmap, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                                    overlayScratch.srcRect.set(0, 0, maskBmp.width, maskBmp.height)
                                     nativeCanvas.drawBitmap(maskBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
                                     nativeCanvas.restoreToCount(sc)
                                 }
                             }
                         }
                     }
+                    nativeCanvas.restore()
+
                     if (layerStackSaveCount != -1) {
                         nativeCanvas.restoreToCount(layerStackSaveCount)
                     }
@@ -3182,25 +3560,33 @@ fun CanvasView(
                     trigger
                 }
 
-                // Layer 2: Dedicated incremental active stroke & selection canvas (60-120 FPS zero-alloc overlay)
+                // Layer 2: Dedicated incremental unclipped active stroke, selection & rulers overlay
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
                         .testTag("drawing_canvas_active")
                 ) {
                     val trigger = activeStrokeVersion
-                    val canvasScaleX = size.width / projWidth
-                    val canvasScaleY = size.height / projHeight
+                    val canvasScaleX = boxW / projWidth
+                    val canvasScaleY = boxH / projHeight
                     val nativeCanvas = drawContext.canvas.nativeCanvas
+                    val safeZ = zoom.coerceAtLeast(0.05f)
+                    val liveMat = overlayScratch.liveMatrixScratch.apply {
+                        reset()
+                        setScale(canvasScaleX, canvasScaleY)
+                        postTranslate(-boxW * 0.5f, -boxH * 0.5f)
+                        postScale(if (mirrorHorizontal) -safeZ else safeZ, safeZ)
+                        postRotate(rotation)
+                        postTranslate(halfContainerW + panX, halfContainerH + panY)
+                    }
                     val activeIsClip = activeLayerObj?.isClippingMask == true
                     val activeClipMaskBmp = if (activeIsClip) cacheHolder.clipBaseBitmap?.takeIf { !it.isRecycled } else null
 
-                    // Render captured strokes of an active selection BEFORE the live stroke so drawing/filling/erasing
-                    // inside (or outside when inverted) renders immediately in real time on top of selected content.
+                    // Render captured strokes of an active selection BEFORE the live stroke
                     val hideCapturedForLiveEraser = isDrawingActive && selectedTool == ToolType.ERASER
                     if (activeSelection.isActive && activeSelection.capturedStrokes.isNotEmpty() && !hideCapturedForLiveEraser) {
                         nativeCanvas.save()
-                        nativeCanvas.scale(canvasScaleX, canvasScaleY)
+                        nativeCanvas.concat(liveMat)
                         nativeCanvas.translate(activeSelection.offsetX, activeSelection.offsetY)
                         val cx = activeSelection.centerX
                         val cy = activeSelection.centerY
@@ -3219,13 +3605,12 @@ fun CanvasView(
                     if (currentPoints.isNotEmpty()) {
                         if (selectedTool == ToolType.ERASER) {
                             val lastPt = currentPoints[currentPoints.lastIndex]
+                            val pts = floatArrayOf(lastPt.x, lastPt.y)
+                            liveMat.mapPoints(pts)
                             val pFactor = if (eraserUsesPressure) lastPt.pressure else 1.0f
-                            val eRadius = ((effectiveToolSize * pFactor * canvasScaleX) * 0.5f).coerceAtLeast(3f)
-                            val cx = lastPt.x * canvasScaleX
-                            val cy = lastPt.y * canvasScaleY
-                            // Crisp dual-ring without slow software ShadowLayer (Mali-G57 TBDR friendly!)
-                            nativeCanvas.drawCircle(cx, cy, eRadius, overlayScratch.eraserRingDarkPaint)
-                            nativeCanvas.drawCircle(cx, cy, eRadius, overlayScratch.eraserRingLightPaint)
+                            val eRadius = ((effectiveToolSize * pFactor * canvasScaleX * safeZ) * 0.5f).coerceAtLeast(3f)
+                            nativeCanvas.drawCircle(pts[0], pts[1], eRadius, overlayScratch.eraserRingDarkPaint)
+                            nativeCanvas.drawCircle(pts[0], pts[1], eRadius, overlayScratch.eraserRingLightPaint)
                         } else if (
                             selectedTool != ToolType.LINE &&
                             selectedTool != ToolType.RECTANGLE &&
@@ -3236,31 +3621,37 @@ fun CanvasView(
                             cacheHolder.activeStrokeBitmap != null &&
                             !cacheHolder.activeStrokeBitmap!!.isRecycled
                         ) {
-                            overlayScratch.bitmapPaint.isFilterBitmap = ((size.width / projWidth) * zoom) < 4.0f
-                            overlayScratch.srcRect.set(0, 0, cacheW, cacheH)
+                            val activeStrokeBmp = cacheHolder.activeStrokeBitmap!!
+                            val invSession = overlayScratch.invMatrixScratch
+                            val hasSessDelta = cacheHolder.activeSessionMatrix.invert(invSession)
+                            val sessDelta = overlayScratch.deltaMatrixScratch
+                            if (hasSessDelta) sessDelta.setConcat(liveMat, invSession) else sessDelta.reset()
+
+                            overlayScratch.bitmapPaint.isFilterBitmap = (canvasScaleX * safeZ) < 4.0f
+                            overlayScratch.srcRect.set(0, 0, activeStrokeBmp.width, activeStrokeBmp.height)
                             overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
                             if (activeIsClip && activeClipMaskBmp != null) {
+                                val invCached = AndroidMatrix()
+                                val hasCachedDelta = cacheHolder.hasCachedMatrix && cacheHolder.cachedProjToScreenMatrix.invert(invCached)
                                 val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
-                                nativeCanvas.drawBitmap(
-                                    cacheHolder.activeStrokeBitmap!!,
-                                    overlayScratch.srcRect,
-                                    overlayScratch.dstRectF,
-                                    overlayScratch.bitmapPaint
-                                )
-                                nativeCanvas.drawBitmap(
-                                    activeClipMaskBmp,
-                                    overlayScratch.srcRect,
-                                    overlayScratch.dstRectF,
-                                    overlayScratch.clipDstInPaint
-                                )
+                                nativeCanvas.save()
+                                if (hasSessDelta) nativeCanvas.concat(sessDelta)
+                                nativeCanvas.drawBitmap(activeStrokeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                                nativeCanvas.restore()
+                                nativeCanvas.save()
+                                if (hasCachedDelta) {
+                                    val cDelta = AndroidMatrix().apply { setConcat(liveMat, invCached) }
+                                    nativeCanvas.concat(cDelta)
+                                }
+                                overlayScratch.srcRect.set(0, 0, activeClipMaskBmp.width, activeClipMaskBmp.height)
+                                nativeCanvas.drawBitmap(activeClipMaskBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
+                                nativeCanvas.restore()
                                 nativeCanvas.restoreToCount(sc)
                             } else if (!activeIsClip) {
-                                nativeCanvas.drawBitmap(
-                                    cacheHolder.activeStrokeBitmap!!,
-                                    overlayScratch.srcRect,
-                                    overlayScratch.dstRectF,
-                                    overlayScratch.bitmapPaint
-                                )
+                                nativeCanvas.save()
+                                if (hasSessDelta) nativeCanvas.concat(sessDelta)
+                                nativeCanvas.drawBitmap(activeStrokeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                                nativeCanvas.restore()
                             }
                         } else {
                             val previewStroke = DrawingStroke(
@@ -3277,33 +3668,36 @@ fun CanvasView(
                                 clipBoundsHeight = projHeight
                             )
                             if (activeIsClip && activeClipMaskBmp != null) {
+                                val invCached = overlayScratch.invMatrixScratch
+                                val hasCachedDelta = cacheHolder.hasCachedMatrix && cacheHolder.cachedProjToScreenMatrix.invert(invCached)
                                 val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
                                 nativeCanvas.save()
-                                nativeCanvas.scale(canvasScaleX, canvasScaleY)
+                                nativeCanvas.concat(liveMat)
                                 KodanimaGraphicsEngine.drawStrokeToCanvas(previewStroke, nativeCanvas, 1.0f, null, densityMult)
                                 nativeCanvas.restore()
-                                overlayScratch.srcRect.set(0, 0, cacheW, cacheH)
+                                nativeCanvas.save()
+                                if (hasCachedDelta) {
+                                    overlayScratch.deltaMatrixScratch.setConcat(liveMat, invCached)
+                                    nativeCanvas.concat(overlayScratch.deltaMatrixScratch)
+                                }
+                                overlayScratch.srcRect.set(0, 0, activeClipMaskBmp.width, activeClipMaskBmp.height)
                                 overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
-                                nativeCanvas.drawBitmap(
-                                    activeClipMaskBmp,
-                                    overlayScratch.srcRect,
-                                    overlayScratch.dstRectF,
-                                    overlayScratch.clipDstInPaint
-                                )
+                                nativeCanvas.drawBitmap(activeClipMaskBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
+                                nativeCanvas.restore()
                                 nativeCanvas.restoreToCount(sc)
                             } else if (!activeIsClip) {
                                 nativeCanvas.save()
-                                nativeCanvas.scale(canvasScaleX, canvasScaleY)
+                                nativeCanvas.concat(liveMat)
                                 KodanimaGraphicsEngine.drawStrokeToCanvas(previewStroke, nativeCanvas, 1.0f, null, densityMult)
                                 nativeCanvas.restore()
                             }
                         }
                     }
 
-                    // Live in-progress remote collaborator strokes (zero-lag multiplayer feedback, skip committed duplicates)
+                    // Live in-progress remote collaborator strokes (zero-lag multiplayer feedback, unclipped)
                     if (remoteLiveStrokes.isNotEmpty()) {
                         nativeCanvas.save()
-                        nativeCanvas.scale(canvasScaleX, canvasScaleY)
+                        nativeCanvas.concat(liveMat)
                         remoteLiveStrokes.values.forEach { live ->
                             val targetLayerStrokes = if (live.isLocalLayer) {
                                 currFrame?.localLayers?.getOrNull(live.layerIndex)?.strokes
@@ -3331,7 +3725,7 @@ fun CanvasView(
                     // Active Selection Outline & Bounding Box
                     if (activeSelection.isActive && activeSelection.points.size >= 2) {
                         nativeCanvas.save()
-                        nativeCanvas.scale(canvasScaleX, canvasScaleY)
+                        nativeCanvas.concat(liveMat)
                         nativeCanvas.translate(activeSelection.offsetX, activeSelection.offsetY)
 
                         val cx = activeSelection.centerX
@@ -3348,7 +3742,7 @@ fun CanvasView(
                         } else {
                             AndroidColor.CYAN
                         }
-                        overlayScratch.selPaint.strokeWidth = 2.0f / canvasScaleX
+                        overlayScratch.selPaint.strokeWidth = 2.0f / (canvasScaleX * safeZ)
                         overlayScratch.selPath.reset()
                         val first = activeSelection.points[0]
                         overlayScratch.selPath.moveTo(first.x, first.y)
@@ -3358,12 +3752,12 @@ fun CanvasView(
                         }
                         nativeCanvas.drawPath(overlayScratch.selPath, overlayScratch.selPaint)
 
-                        overlayScratch.boxPaint.strokeWidth = 1.5f / canvasScaleX
+                        overlayScratch.boxPaint.strokeWidth = 1.5f / (canvasScaleX * safeZ)
                         val bLeft = activeSelection.minX
                         val bTop = activeSelection.minY
                         val bRight = activeSelection.maxX
                         val bBottom = activeSelection.maxY
-                        val hRadius = 5f / canvasScaleX
+                        val hRadius = 5f / (canvasScaleX * safeZ)
 
                         nativeCanvas.drawRect(bLeft, bTop, bRight, bBottom, overlayScratch.boxPaint)
                         nativeCanvas.drawCircle(bLeft, bTop, hRadius, overlayScratch.handlePaint)
@@ -3379,23 +3773,24 @@ fun CanvasView(
                     if (isVideoTransformMode && videoAsset != null) {
                         val vbW = if (vBmpBox != null && vBmpBox.width > 0) vBmpBox.width.toFloat() else projWidth
                         val vbH = if (vBmpBox != null && vBmpBox.height > 0) vBmpBox.height.toFloat() else projHeight
-                        val fitScale = min(size.width / vbW, size.height / vbH)
+                        val fitScale = min(boxW / vbW, boxH / vbH)
                         val scaleFactor = (videoAsset.scalePercent / 100.0).toFloat().coerceIn(0.1f, 5f)
-                        val drawW = vbW * fitScale * scaleFactor
-                        val drawH = vbH * fitScale * scaleFactor
-                        val cx = size.width * 0.5f + videoAsset.offsetX.toFloat() * canvasScaleX
-                        val cy = size.height * 0.5f + videoAsset.offsetY.toFloat() * canvasScaleY
+                        val drawW = (vbW * fitScale * scaleFactor) / canvasScaleX
+                        val drawH = (vbH * fitScale * scaleFactor) / canvasScaleY
+                        val cx = projWidth * 0.5f + videoAsset.offsetX.toFloat()
+                        val cy = projHeight * 0.5f + videoAsset.offsetY.toFloat()
                         val hw = drawW * 0.5f
                         val hh = drawH * 0.5f
 
                         nativeCanvas.save()
+                        nativeCanvas.concat(liveMat)
                         nativeCanvas.translate(cx, cy)
                         if (videoAsset.rotationDegrees != 0.0) {
                             nativeCanvas.rotate(videoAsset.rotationDegrees.toFloat())
                         }
-                        overlayScratch.videoBoxPaint.strokeWidth = 2.2f
+                        overlayScratch.videoBoxPaint.strokeWidth = 2.2f / (canvasScaleX * safeZ)
                         nativeCanvas.drawRect(-hw, -hh, hw, hh, overlayScratch.videoBoxPaint)
-                        val vr = 6.5f
+                        val vr = 6.5f / (canvasScaleX * safeZ)
                         nativeCanvas.drawCircle(-hw, -hh, vr, overlayScratch.videoHandlePaint)
                         nativeCanvas.drawCircle(hw, -hh, vr, overlayScratch.videoHandlePaint)
                         nativeCanvas.drawCircle(hw, hh, vr, overlayScratch.videoHandlePaint)
@@ -3403,7 +3798,7 @@ fun CanvasView(
                         nativeCanvas.restore()
                     }
 
-                    // Interactive Caneta Vetorial (Bezier Pen) Spline & Tangent Handles
+                    // Interactive Caneta Vetorial (Bezier Pen) Spline & Tangent Handles (unbounded off-canvas!)
                     if (selectedTool == ToolType.BEZIER_PEN && workingBezierNodes.isNotEmpty()) {
                         val sampledPts = sampleCubicBezierNodesToStrokePoints(
                             workingBezierNodes.toList(),
@@ -3411,7 +3806,7 @@ fun CanvasView(
                             samplesPerSegment = 22
                         )
                         nativeCanvas.save()
-                        nativeCanvas.scale(canvasScaleX, canvasScaleY)
+                        nativeCanvas.concat(liveMat)
                         if (sampledPts.size >= 2) {
                             val previewStroke = DrawingStroke(
                                 tool = ToolType.BEZIER_PEN,
@@ -3429,10 +3824,11 @@ fun CanvasView(
                             KodanimaGraphicsEngine.drawStrokeToCanvas(previewStroke, nativeCanvas, 1.0f, null, densityMult)
                         }
 
-                        overlayScratch.bezierLinePaint.strokeWidth = (1.5f / canvasScaleX).coerceAtLeast(0.5f)
-                        overlayScratch.bezierAnchorStrokePaint.strokeWidth = (1.8f / canvasScaleX).coerceAtLeast(0.6f)
-                        val handleR = (4.5f / canvasScaleX).coerceAtLeast(1.5f)
-                        val anchorHalf = (5.5f / canvasScaleX).coerceAtLeast(2f)
+                        val screenScaleFactor = (canvasScaleX * safeZ).coerceAtLeast(0.05f)
+                        overlayScratch.bezierLinePaint.strokeWidth = (1.5f / screenScaleFactor).coerceAtLeast(0.5f)
+                        overlayScratch.bezierAnchorStrokePaint.strokeWidth = (1.8f / screenScaleFactor).coerceAtLeast(0.6f)
+                        val handleR = (4.5f / screenScaleFactor).coerceAtLeast(1.5f)
+                        val anchorHalf = (5.5f / screenScaleFactor).coerceAtLeast(2f)
 
                         workingBezierNodes.forEach { node ->
                             val hasIn = node.handleInX != node.anchorX || node.handleInY != node.anchorY
@@ -3465,6 +3861,8 @@ fun CanvasView(
 
                     // FlipaClip-style Grid Ruler Overlay (when rendered in front of active layer)
                     if (gridRulerSettings.isEnabled && !gridRulerSettings.renderBehindActiveLayer) {
+                        nativeCanvas.save()
+                        nativeCanvas.concat(liveMat)
                         drawGridRulerCanvas(
                             nativeCanvas = nativeCanvas,
                             canvasScaleX = canvasScaleX,
@@ -3474,8 +3872,10 @@ fun CanvasView(
                             screenDensity = density.density,
                             zoom = zoom,
                             settings = gridRulerSettings,
-                            scratch = overlayScratch
+                            scratch = overlayScratch,
+                            applyScale = false
                         )
+                        nativeCanvas.restore()
                     }
 
                     // 1P / 2P / 3P Perspective Ruler Overlay in front when !renderBehindActiveLayer
@@ -3483,6 +3883,8 @@ fun CanvasView(
                         val activeSnapOrigin = if (isDrawingActive && perspectiveRulerSettings.snapToGuide) {
                             currentPoints.firstOrNull()?.let { Offset(it.x, it.y) }
                         } else null
+                        nativeCanvas.save()
+                        nativeCanvas.concat(liveMat)
                         drawPerspectiveRulerCanvas(
                             nativeCanvas = nativeCanvas,
                             canvasScaleX = canvasScaleX,
@@ -3494,24 +3896,18 @@ fun CanvasView(
                             settings = perspectiveRulerSettings,
                             activeSnapOrigin = activeSnapOrigin,
                             lockedSnapVpIdx = lockedPerspectiveTargetVpIdx,
-                            scratch = overlayScratch
+                            scratch = overlayScratch,
+                            applyScale = false
                         )
+                        nativeCanvas.restore()
                     }
 
-                    // Live Camera Capture Frame & Post-Effects Preview rendered unclipped inside overlay if Camera Mode is NOT using outer canvas
-                    if ((camSettings.isEnabled || camSettings.postEffects.hasAnyEffect()) && !isCameraModeActive) {
-                        drawCameraAndPostEffectsOverlay(
-                            nativeCanvas = nativeCanvas,
-                            canvasW = size.width,
-                            canvasH = size.height,
-                            projWidth = projWidth,
-                            projHeight = projHeight,
-                            screenDensity = density.density,
-                            camSettings = camSettings,
-                            evaluatedKf = evaluatedCameraKf,
-                            scratch = overlayScratch
-                        )
-                    }
+                    // Subtle project paper boundary hairline so off-canvas artists always see paper frame
+                    nativeCanvas.save()
+                    nativeCanvas.concat(liveMat)
+                    overlayScratch.paperMarginPaint.strokeWidth = (1.1f * density.density / (canvasScaleX * safeZ)).coerceAtLeast(0.4f)
+                    nativeCanvas.drawRect(0f, 0f, projWidth, projHeight, overlayScratch.paperMarginPaint)
+                    nativeCanvas.restore()
 
                     // 1px crisp Pixel Grid overlay when deeply zoomed in (>= 9 screen px per project pixel)
                     val screenPxPerProjPxGrid = canvasScaleX * zoom
@@ -3525,26 +3921,28 @@ fun CanvasView(
                         val startPy = min(min(c0.y, c1.y), min(c2.y, c3.y)).toInt().coerceIn(0, project.resolution.height)
                         val endPy = (max(max(c0.y, c1.y), max(c2.y, c3.y)).toInt() + 1).coerceIn(0, project.resolution.height)
                         if ((endPx - startPx) <= 200 && (endPy - startPy) <= 200) {
-                            val topY = startPy * canvasScaleY
-                            val bottomY = endPy * canvasScaleY
-                            val leftX = startPx * canvasScaleX
-                            val rightX = endPx * canvasScaleX
+                            val topY = startPy.toFloat()
+                            val bottomY = endPy.toFloat()
+                            val leftX = startPx.toFloat()
+                            val rightX = endPx.toFloat()
                             overlayScratch.pixelGridPaint.alpha =
                                 ((screenPxPerProjPxGrid - 9.0f) / 14.0f).coerceIn(0.25f, 1.0f).let { (it * 72f).roundToInt() }
+                            nativeCanvas.save()
+                            nativeCanvas.concat(liveMat)
                             for (px in startPx..endPx) {
-                                val lx = px * canvasScaleX
+                                val lx = px.toFloat()
                                 nativeCanvas.drawLine(lx, topY, lx, bottomY, overlayScratch.pixelGridPaint)
                             }
                             for (py in startPy..endPy) {
-                                val ly = py * canvasScaleY
+                                val ly = py.toFloat()
                                 nativeCanvas.drawLine(leftX, ly, rightX, ly, overlayScratch.pixelGridPaint)
                             }
+                            nativeCanvas.restore()
                         }
                     }
                     @Suppress("UNUSED_EXPRESSION")
                     trigger
                 }
-            }
             } // end else (!isCameraSideView3D)
 
             // 5. Tablet Virtual Cursor Overlay (Custom .cur/.ani/.png scaled cleanly with exact hotspot)
@@ -3691,9 +4089,13 @@ fun CanvasView(
             }
         }
 
-        // Above-canvas unclipped Camera Capture Frame & Post-Effects overlay when Camera Mode is active (shows full view beyond canvas boundaries!)
-        if (!isCameraSideView3D && isCameraModeActive && (camSettings.isEnabled || camSettings.postEffects.hasAnyEffect())) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
+        // Above-canvas unclipped Camera Capture Frame & Post-Effects overlay in BOTH normal Canvas mode & Camera Mode!
+        if (!isCameraSideView3D && (camSettings.isEnabled || camSettings.postEffects.hasAnyEffect())) {
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("camera_sample_unclipped_overlay")
+            ) {
                 val nativeCanvas = drawContext.canvas.nativeCanvas
                 nativeCanvas.save()
                 nativeCanvas.translate(size.width * 0.5f + panX, size.height * 0.5f + panY)
@@ -4097,7 +4499,8 @@ private fun drawPerspectiveRulerCanvas(
     settings: PerspectiveRulerSettings,
     activeSnapOrigin: Offset?,
     lockedSnapVpIdx: Int,
-    scratch: CanvasOverlayScratch
+    scratch: CanvasOverlayScratch,
+    applyScale: Boolean = true
 ) {
     val perspOp = settings.opacity.coerceIn(0.10f, 1.0f)
     val horizonColor = settings.vp1Color.toInt()
@@ -4117,7 +4520,7 @@ private fun drawPerspectiveRulerCanvas(
     val edgePad = (16f * pxPerDpInProj).coerceIn(10f, projWidth * 0.12f)
 
     nativeCanvas.save()
-    nativeCanvas.scale(canvasScaleX, canvasScaleY)
+    if (applyScale) nativeCanvas.scale(canvasScaleX, canvasScaleY)
 
     // Horizon line connecting VP1 & VP2 (or horizontal through VP1 when 1-point)
     val vp1x = settings.vp1XRatio * projWidth
@@ -4246,7 +4649,8 @@ private fun drawGridRulerCanvas(
     screenDensity: Float,
     zoom: Float,
     settings: GridRulerSettings,
-    scratch: CanvasOverlayScratch
+    scratch: CanvasOverlayScratch,
+    applyScale: Boolean = true
 ) {
     val cellPx = settings.cellSizePx.coerceIn(12f, 256f)
     val baseCol = settings.color.toInt()
@@ -4262,7 +4666,7 @@ private fun drawGridRulerCanvas(
     val baseThicknessDp = settings.lineThicknessDp.coerceIn(0.4f, 6.0f)
 
     nativeCanvas.save()
-    nativeCanvas.scale(canvasScaleX, canvasScaleY)
+    if (applyScale) nativeCanvas.scale(canvasScaleX, canvasScaleY)
     if (settings.useLineCount) {
         val countX = settings.lineCountX.coerceIn(1, 128)
         val countY = settings.lineCountY.coerceIn(1, 128)

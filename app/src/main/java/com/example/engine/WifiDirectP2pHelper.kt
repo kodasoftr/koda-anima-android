@@ -114,6 +114,18 @@ class WifiDirectP2pHelper(
             ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
             isRegistered = true
         }
+        try {
+            if (PermissionHelper.hasWifiDirectPermission(context)) {
+                channel?.let { ch ->
+                    mgr.requestConnectionInfo(ch) { info ->
+                        val ownerIp = info?.groupOwnerAddress?.hostAddress
+                        if (info?.groupFormed == true && !ownerIp.isNullOrBlank()) {
+                            onP2pConnected(info.isGroupOwner, ownerIp)
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     @SuppressLint("MissingPermission")

@@ -10,7 +10,10 @@ import com.example.engine.FileImportExportManager
 import com.example.engine.KodanimaGraphicsEngine
 import com.example.engine.KritaBrushImporter
 import com.example.engine.Mesh3DImporter
+import com.example.engine.MultiplayerStudioEngine
 import com.example.engine.PreferencesStorageManager
+import com.example.engine.SelectionGeometryHelper
+import com.example.engine.Studio3DPaintEngine
 import com.example.engine.TimelineTrackEngine
 import com.example.model.AnimationProject
 import com.example.model.BucketFillConfig
@@ -32,6 +35,7 @@ import com.example.model.CanvasBackgroundStyle
 import com.example.model.CanvasTexturePattern
 import com.example.model.ColorPaletteConfig
 import com.example.model.DrawingStroke
+import com.example.model.Estudio3DPaintTool
 import com.example.viewmodel.EditorDialog
 import com.example.model.Frame
 import com.example.model.GestureAction
@@ -41,10 +45,16 @@ import com.example.model.KritaBrushEngineKind
 import com.example.model.Layer
 import com.example.model.LayerBlendEffect
 import com.example.model.MultiFingerGesture
+import com.example.model.ObjectLightSettings
+import com.example.model.ObjectOutlineSettings
+import com.example.model.ObjectShaderMode
+import com.example.model.ObjectTexturePaintLayer
 import com.example.model.ObjectTransformKeyframe
+import com.example.model.ObjectUVMapSlot
 import com.example.model.PerspectiveRulerSettings
 import com.example.model.ProjectResolution
 import com.example.model.SceneObject3D
+import com.example.model.ShaderNodeGraph
 import com.example.model.ShortcutAction
 import com.example.model.ShortcutRegistry
 import com.example.model.SkyBackdropMode
@@ -53,6 +63,7 @@ import com.example.model.StageTargetType
 import com.example.model.StrokePoint
 import com.example.model.ToolType
 import com.example.model.TouchGestureRegistry
+import com.example.model.UvUnwrapProjection
 import com.example.ui.components.computeStage3DZPositions
 import com.example.viewmodel.KodanimaViewModel
 import org.junit.Assert.assertEquals
@@ -2030,9 +2041,311 @@ class StudioUpgradesTest {
         bmpHeadOn.recycle()
         bmpEnabled.recycle()
     }
+
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Test
+    fun `off-canvas negative coordinates viewport matrix renders and roundtrips cleanly with undo redo and studio3d shortcuts`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("ForaDoCanvas", ProjectResolution.PRESETS[0], 24)
+
+        // 1. Stroke drawn strictly outside canvas top-left (negative canvas coordinates)
+        val offCanvasStroke = SelectionGeometryHelper.withRecomputedBounds(
+            DrawingStroke(
+                tool = ToolType.BRUSH,
+                color = 0xFF00E676L,
+                brushSize = 18f,
+                opacity = 1.0f,
+                points = listOf(
+                    StrokePoint(-120f, -80f, 1.0f),
+                    StrokePoint(-40f, -80f, 1.0f)
+                )
+            )
+        )
+        assertTrue("minX must preserve negative off-canvas coordinates", offCanvasStroke.minX < -100f)
+        assertTrue("maxX must be negative (no -Float.MAX_VALUE overflow)", offCanvasStroke.maxX < 0f)
+
+        // Render via screen-resolution viewportMatrix shifted so (-80, -80) maps to screen (80, 80)
+        val vpBmp = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
+        vpBmp.eraseColor(android.graphics.Color.TRANSPARENT)
+        val vpMat = android.graphics.Matrix().apply { setTranslate(160f, 160f) }
+        val layerWithOffCanvas = Layer(name = "Camada Livre", strokes = listOf(offCanvasStroke))
+        KodanimaGraphicsEngine.drawLayersStackToCanvas(
+            layers = listOf(layerWithOffCanvas),
+            canvas = android.graphics.Canvas(vpBmp),
+            targetWidth = 1280,
+            targetHeight = 720,
+            visibleBounds = android.graphics.RectF(-200f, -200f, 100f, 100f),
+            viewportMatrix = vpMat,
+            viewportWidth = 200,
+            viewportHeight = 200
+        )
+        // (-80 + 160, -80 + 160) = (80, 80) must contain green off-canvas stroke pixels
+        val px = vpBmp.getPixel(80, 80)
+        assertTrue("Off-canvas stroke must render inside viewport bitmap", ((px ushr 24) and 0xFF) > 200)
+        assertTrue("Rendered pixel must retain green stroke color", android.graphics.Color.green(px) > 180)
+        vpBmp.recycle()
+
+        // 2. Ctrl+Z Undo & Ctrl+Y / Ctrl+Shift+Z Redo keyboard shortcuts
+        vm.addStrokeToCurrentLayer(offCanvasStroke)
+        val countAfterDraw = vm.uiState.value.project.frames[0].layers[1].strokes.size
+        assertTrue(countAfterDraw >= 1)
+
+        val ctrlZ = KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_Z, 0, KeyEvent.META_CTRL_ON)
+        assertTrue(vm.handlePhysicalKeyEvent(ctrlZ, context))
+        assertEquals(countAfterDraw - 1, vm.uiState.value.project.frames[0].layers[1].strokes.size)
+
+        val ctrlY = KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_Y, 0, KeyEvent.META_CTRL_ON)
+        assertTrue(vm.handlePhysicalKeyEvent(ctrlY, context))
+        assertEquals(countAfterDraw, vm.uiState.value.project.frames[0].layers[1].strokes.size)
+
+        assertTrue(vm.handlePhysicalKeyEvent(ctrlZ, context))
+        assertEquals(countAfterDraw - 1, vm.uiState.value.project.frames[0].layers[1].strokes.size)
+
+        val ctrlShiftZ = KeyEvent(
+            0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_Z, 0,
+            KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON
+        )
+        assertTrue(vm.handlePhysicalKeyEvent(ctrlShiftZ, context))
+        assertEquals(countAfterDraw, vm.uiState.value.project.frames[0].layers[1].strokes.size)
+
+        // 3. Estúdio 3D Blender-style shortcuts (G, X, R, S, Shift+N)
+        vm.toggleCameraTimeline()
+        vm.toggleCameraSideView3D()
+        assertTrue(vm.uiState.value.isCameraSideView3D)
+
+        assertTrue(vm.handlePhysicalKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_G), context))
+        assertEquals(1, vm.uiState.value.studio3DTransformShortcutMode)
+        assertTrue(vm.handlePhysicalKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_X), context))
+        assertEquals(1, vm.uiState.value.studio3DActiveAxisLock)
+        assertTrue(vm.handlePhysicalKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_R), context))
+        assertEquals(2, vm.uiState.value.studio3DTransformShortcutMode)
+        assertTrue(vm.handlePhysicalKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_S), context))
+        assertEquals(3, vm.uiState.value.studio3DTransformShortcutMode)
+        val shiftN = KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_N, 0, KeyEvent.META_SHIFT_ON)
+        assertTrue(vm.handlePhysicalKeyEvent(shiftN, context))
+        assertTrue(vm.uiState.value.isStudio3DSplitNodesOpen)
+    }
+
+    @Test
+    fun `fbx ascii and 3ds binary 3d parsers import geometry and UVs cleanly`() {
+        // 1. Minimal ASCII FBX with 3 vertices, 1 triangle, and LayerElementUV
+        val fbxAscii = """
+            ; FBX 7.4.0 project file
+            FBXHeaderExtension:  {
+                FBXHeaderVersion: 1003
+            }
+            Objects:  {
+                Geometry: 1001, "Geometry::Plane", "Mesh" {
+                    Vertices: *9 {
+                        a: -1.0,-1.0,0.0,1.0,-1.0,0.0,0.0,1.0,0.0
+                    }
+                    PolygonVertexIndex: *3 {
+                        a: 0,1,-3
+                    }
+                    LayerElementUV: 0 {
+                        MappingInformationType: "ByPolygonVertex"
+                        ReferenceInformationType: "Direct"
+                        UV: *6 {
+                            a: 0.0,0.0,1.0,0.0,0.5,1.0
+                        }
+                    }
+                }
+            }
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+
+        val fbxScene = Mesh3DImporter.parseSceneBytesForTest(fbxAscii, "plane_test.fbx")
+        assertNotNull("ASCII .fbx must parse cleanly", fbxScene)
+        assertEquals(1, fbxScene!!.totalTriangles)
+        assertTrue("FBX submesh must retain non-zero UVs", fbxScene.subMeshes.first().uvs.any { it != 0f })
+
+        // 2. Minimal Binary .3DS (0x4D4D -> 0x3D3D -> 0x4000 -> 0x4100 -> 0x4110 + 0x4120 + 0x4140)
+        fun chunk(id: Int, payload: ByteArray): ByteArray {
+            val buf = ByteBuffer.allocate(6 + payload.size).order(ByteOrder.LITTLE_ENDIAN)
+            buf.putShort(id.toShort())
+            buf.putInt(6 + payload.size)
+            buf.put(payload)
+            return buf.array()
+        }
+        val vertsPayload = ByteBuffer.allocate(2 + 3 * 12).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(3)
+            .putFloat(-1f).putFloat(0f).putFloat(-1f)
+            .putFloat(1f).putFloat(0f).putFloat(-1f)
+            .putFloat(0f).putFloat(0f).putFloat(1f)
+            .array()
+        val facesPayload = ByteBuffer.allocate(2 + 8).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(1)
+            .putShort(0).putShort(1).putShort(2).putShort(7)
+            .array()
+        val uvsPayload = ByteBuffer.allocate(2 + 3 * 8).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(3)
+            .putFloat(0f).putFloat(0f)
+            .putFloat(1f).putFloat(0f)
+            .putFloat(0.5f).putFloat(1f)
+            .array()
+        val triMeshPayload = chunk(0x4110, vertsPayload) + chunk(0x4120, facesPayload) + chunk(0x4140, uvsPayload)
+        val objName = "Tri3DS\u0000".toByteArray(Charsets.US_ASCII)
+        val namedObjPayload = objName + chunk(0x4100, triMeshPayload)
+        val tdsBytes = chunk(0x4D4D, chunk(0x3D3D, chunk(0x4000, namedObjPayload)))
+
+        val tdsScene = Mesh3DImporter.parseSceneBytesForTest(tdsBytes, "prop_test.3ds")
+        assertNotNull("Binary .3ds must parse cleanly", tdsScene)
+        assertEquals(1, tdsScene!!.totalTriangles)
+        assertEquals(6, tdsScene.subMeshes.first().uvs.size)
+    }
+
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Test
+    fun `studio 3d painting layers, wet smudge molhador, uv projections, merge, shader outline and coop sync work`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val (cubeUri, _) = Mesh3DImporter.createBuiltInSceneAsset(BuiltIn3DPrimitive.CUBE)
+        val cubeMesh = Mesh3DImporter.getOrLoadMesh(cubeUri)!!
+        val verts = cubeMesh.subMeshes.first().vertices
+
+        // 1. UV Projection unwrapping modes
+        for (proj in listOf(UvUnwrapProjection.PLANAR, UvUnwrapProjection.BOX, UvUnwrapProjection.ESFERICO, UvUnwrapProjection.CILINDRICO)) {
+            val gen = Studio3DPaintEngine.generateUVsForProjection(
+                vertices = verts,
+                existingUvs = cubeMesh.subMeshes.first().uvs,
+                slot = ObjectUVMapSlot(projection = proj, scaleU = 1f, scaleV = 1f)
+            )
+            assertEquals((verts.size / 3) * 2, gen.size)
+            assertTrue("Projection $proj must produce valid UV range", gen.any { it in 0.01f..0.99f })
+        }
+
+        // 2. Surface ray-triangle picking + Pincel + Molhador + Layer Merge into 1 UV
+        val sceneObj = SceneObject3D(
+            id = "painted_cube",
+            name = "Cubo Pintado",
+            meshAssetPath = cubeUri,
+            shaderMode = ObjectShaderMode.CARTOON_BRUSH,
+            outline = ObjectOutlineSettings(enabled = true, width = 3f, colorArgb = 0xFF00FF00L),
+            light = ObjectLightSettings(azimuthDeg = 45f, elevationDeg = 60f, intensity = 1.2f, emissiveGlow = 0.2f),
+            nodeGraph = ShaderNodeGraph(enabled = true)
+        )
+        val pick = Studio3DPaintEngine.pickObjectTriangleUV(
+            obj = sceneObj,
+            frameIndex = 0,
+            autoInterpolate = true,
+            screenX = 80f,
+            screenY = 60f,
+            camYawDeg = 0f,
+            camPitchDeg = 0f,
+            camRollDeg = 0f,
+            camPanX = 0f,
+            camPanY = 0f,
+            focalPx = 320f,
+            vpCx = 80f,
+            vpCy = 60f,
+            worldUnitScale = 1.0f
+        )
+        assertNotNull("Center ray must hit 3D cube triangle and yield UV", pick)
+        assertTrue(pick!!.u in 0f..1f && pick.v in 0f..1f)
+
+        // Paint bright red stroke on Layer 1
+        val baseLayer = ObjectTexturePaintLayer(id = "pl_1", name = "Cor Base", texWidth = 128, texHeight = 128)
+        val paintedLayer = Studio3DPaintEngine.paintStrokeSegmentOnLayer(
+            layer = baseLayer,
+            u0 = 0.15f, v0 = 0.5f,
+            u1 = 0.85f, v1 = 0.5f,
+            tool = Estudio3DPaintTool.PINCEL,
+            colorArgb = 0xFFFF1122L,
+            brushSizePx = 16f,
+            opacity = 1.0f,
+            brushPresetId = 1
+        )
+        assertFalse(paintedLayer.pixelsBase64.isNullOrBlank())
+
+        // Apply Molhador (wet smudge) drag across the stroke
+        val smudgedLayer = Studio3DPaintEngine.paintStrokeSegmentOnLayer(
+            layer = paintedLayer,
+            u0 = 0.45f, v0 = 0.5f,
+            u1 = 0.45f, v1 = 0.72f,
+            tool = Estudio3DPaintTool.MOLHADOR,
+            colorArgb = 0xFFFF1122L,
+            brushSizePx = 18f,
+            opacity = 0.9f
+        )
+        val smudgedBuf = Studio3DPaintEngine.decodePixelsFromBase64(smudgedLayer.pixelsBase64)!!
+        val draggedAlpha = (smudgedBuf.pixels[(128 * 0.60f).toInt() * 128 + 58] ushr 24) and 0xFF
+        assertTrue("Molhador must pull pigment downward into previously transparent region (alpha=$draggedAlpha)", draggedAlpha > 15)
+
+        // Merge paint layers into single flattened UV
+        val objWithLayers = sceneObj.copy(paintLayers = listOf(smudgedLayer))
+        val mergedUvB64 = Studio3DPaintEngine.mergePaintLayersIntoSingleUv(objWithLayers, cubeMesh.subMeshes.first(), texSize = 128)
+        assertTrue("Merged UV Base64 must not be blank", mergedUvB64.length > 50)
+
+        val bakedObj = objWithLayers.copy(
+            uvSlots = listOf(ObjectUVMapSlot(name = "UV Mesclado", textureBase64 = mergedUvB64)),
+            paintLayers = emptyList(),
+            bakedTextureBase64 = mergedUvB64
+        )
+        val composite = Studio3DPaintEngine.resolveCompositeObjectTexture(bakedObj, null, 0, 0, 0xFFFFFFFF.toInt())
+        assertNotNull("Composite baked texture must resolve cleanly", composite)
+
+        // Render object with CARTOON_BRUSH + ShaderNodeGraph + green silhouette Contorno
+        val renderRes = Camera3DEngine.renderSceneObjectsSoftware3D(
+            outW = 160,
+            outH = 120,
+            sceneObjects = listOf(bakedObj),
+            frameIndex = 0,
+            autoInterpolate = true,
+            camYawDeg = 22f,
+            camPitchDeg = 14f,
+            camRollDeg = 0f,
+            camPanX = 0f,
+            camPanY = 0f,
+            focalPx = 320f,
+            vpCx = 80f,
+            vpCy = 60f,
+            worldUnitScale = 1.0f
+        )
+        assertNotNull(renderRes)
+        val outBmp = renderRes!!.first
+        val outPx = IntArray(160 * 120)
+        outBmp.getPixels(outPx, 0, 160, 0, 0, 160, 120)
+        val greenOutlineCount = outPx.count { px ->
+            ((px ushr 24) and 0xFF) > 200 &&
+                android.graphics.Color.green(px) > 220 &&
+                android.graphics.Color.red(px) < 30 &&
+                android.graphics.Color.blue(px) < 30
+        }
+        assertTrue("Green Contorno silhouette pass must draw border pixels (count=$greenOutlineCount)", greenOutlineCount > 20)
+        outBmp.recycle()
+
+        // 3. Multiplayer GZ1 Framing + Camera3D JSON sync roundtrip preserving shaders, outline, lights, nodes & baked UV
+        val camSettings = Camera3DSettings(
+            isEnabled = true,
+            cameraMode = CameraMode.MODE_3D,
+            scene3DObjects = listOf(bakedObj)
+        )
+        val serializedCam = FileImportExportManager.camera3DToJson(camSettings, includeTextures = true).toString()
+        assertTrue("Payload > 768 bytes should trigger GZ1 line compression", serializedCam.length > 768)
+        val framed = MultiplayerStudioEngine.encodeFrameLine(serializedCam)
+        assertTrue("encodeFrameLine must apply GZ1: compression for large payloads", framed.startsWith("GZ1:"))
+        assertEquals(framed, MultiplayerStudioEngine.encodeFrameLine(framed)) // idempotent
+        assertEquals(serializedCam, MultiplayerStudioEngine.decodeFrameLine(framed))
+
+        val parsedCam = FileImportExportManager.jsonToCamera3D(org.json.JSONObject(serializedCam), 1280, 720)
+        val parsedObj = parsedCam.scene3DObjects.first()
+        assertEquals(ObjectShaderMode.CARTOON_BRUSH, parsedObj.shaderMode)
+        assertTrue(parsedObj.outline.enabled)
+        assertTrue(parsedObj.nodeGraph.enabled)
+        assertEquals(mergedUvB64, parsedObj.bakedTextureBase64)
+
+        // 4. Negative off-canvas stroke multiplayer JSON roundtrip
+        val negStroke = DrawingStroke(
+            tool = ToolType.BRUSH,
+            color = 0xFF112233L,
+            brushSize = 12f,
+            opacity = 0.85f,
+            points = listOf(StrokePoint(-320f, -150f, 0.7f), StrokePoint(-10f, 20f, 0.9f))
+        )
+        val engine = MultiplayerStudioEngine(kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined))
+        val parsedStroke = engine.parseStrokeFromJson(engine.strokeToJson(negStroke))
+        assertEquals(-320f, parsedStroke.points[0].x, 0.5f)
+        assertEquals(-150f, parsedStroke.points[0].y, 0.5f)
+        assertNotNull(context)
+    }
 }
-
-
-
-
-

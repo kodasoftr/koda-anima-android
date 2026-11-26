@@ -34,6 +34,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Close
@@ -44,9 +45,11 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderSpecial
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.ShowChart
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
@@ -54,6 +57,7 @@ import androidx.compose.material.icons.filled.ViewInAr
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Wallpaper
+import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
@@ -493,198 +497,348 @@ fun CameraTimelinePanel(
 
                 @Composable
                 fun TargetTransformControlsContent(compactForSplit: Boolean) {
-                    if (isCameraTarget) {
-                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text("Câmera:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
-                                if (is3DMode) {
-                                    CamPill("Focar", false, CyanAccent, textColor, Icons.Default.CenterFocusStrong, testTag = "transform_focus_btn") {
-                                        onFocusStageTarget()
-                                    }
-                                }
-                                CamPill("←", false, CyanAccent, textColor) { onNudgeCameraPan(-24f, 0f) }
-                                CamPill("↑", false, CyanAccent, textColor) { onNudgeCameraPan(0f, -24f) }
-                                CamPill("↓", false, CyanAccent, textColor) { onNudgeCameraPan(0f, 24f) }
-                                CamPill("→", false, CyanAccent, textColor) { onNudgeCameraPan(24f, 0f) }
-                                CamPill("Zoom -", false, accentColor, textColor) { onZoomCameraBy(0.9f) }
-                                CamPill("Zoom +", false, accentColor, textColor) { onZoomCameraBy(1.1f) }
-                                CamPill("↺ 15°", false, secondaryColor, textColor) { onRotateCameraBy(-15f) }
-                                CamPill("↻ 15°", false, secondaryColor, textColor) { onRotateCameraBy(15f) }
-                                if (is3DMode) {
-                                    CamPill("Yaw-", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(-5f, 0f) }
-                                    CamPill("Yaw+", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(5f, 0f) }
-                                    CamPill("Pitch-", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(0f, -5f) }
-                                    CamPill("Pitch+", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(0f, 5f) }
-                                }
-                                CamPill("Zerar T${currentTimelineTick + 1}", false, CyanAccent, textColor, Icons.Default.RestartAlt) {
-                                    onResetCurrentKeyframe()
-                                }
-                                if (!compactForSplit) {
-                                    CamPill("Zerar Tudo", false, NeonPink, NeonPink, Icons.Default.RestartAlt) {
-                                        onResetKeyframes()
-                                    }
-                                }
-                            }
+                    // Minimalist 4-in-1 grouped Estúdio 3D transform bar (0=Posição, 1=Rotação, 2=Zoom/Escala, 3=Ajustes/Res.)
+                    var activeTransformGroup by remember { mutableIntStateOf(1) }
 
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CamSlider("Zoom", "${((evaluatedKf.zoom * 100).roundToInt())}%", evaluatedKf.zoom, 0.2f..4.5f, accentColor, textColor, Modifier.weight(1f)) { z ->
-                                    onUpdateCurrentCamera { it.copy(zoom = z) }
-                                }
-                                CamSlider("Giro Z", "${evaluatedKf.rotationZ.roundToInt()}°", evaluatedKf.rotationZ, -180f..180f, accentColor, textColor, Modifier.weight(1f)) { rz ->
-                                    onUpdateCurrentCamera { it.copy(rotationZ = rz) }
-                                }
-                            }
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CamSlider("Pan X", "${evaluatedKf.x.roundToInt()}", evaluatedKf.x, -1200f..1200f, secondaryColor, textColor, Modifier.weight(1f)) { px ->
-                                    onUpdateCurrentCamera { it.copy(x = px) }
-                                }
-                                CamSlider("Pan Y", "${evaluatedKf.y.roundToInt()}", evaluatedKf.y, -1200f..1200f, secondaryColor, textColor, Modifier.weight(1f)) { py ->
-                                    onUpdateCurrentCamera { it.copy(y = py) }
-                                }
-                            }
-
-                            CamSlider(
-                                label = "Lente FOV",
-                                valueText = "${evaluatedKf.fovDegrees.roundToInt()}°",
-                                value = evaluatedKf.fovDegrees,
-                                range = 18f..120f,
-                                accentColor = CyanAccent,
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        // Top Compact 4-Icon Group Bar + Quick Focar/Chave
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            CamPill(
+                                label = "Posição",
+                                active = activeTransformGroup == 0,
+                                activeColor = CyanAccent,
                                 textColor = textColor,
-                                modifier = Modifier.fillMaxWidth()
-                            ) { fov ->
-                                onSetCameraFov(fov)
-                            }
+                                icon = Icons.Default.OpenWith,
+                                testTag = "tf_group_pos"
+                            ) { activeTransformGroup = 0 }
 
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text("Lentes:", fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.72f))
-                                listOf(
-                                    "24mm (84°)" to 84f,
-                                    "35mm (63°)" to 63f,
-                                    "50mm (46°)" to 46f,
-                                    "85mm (28°)" to 28f
-                                ).forEach { (lensLabel, fovVal) ->
-                                    val isSel = kotlin.math.abs(evaluatedKf.fovDegrees - fovVal) < 2f
-                                    CamPill(lensLabel, isSel, CyanAccent, textColor) {
-                                        onSetCameraFov(fovVal)
-                                    }
-                                }
-                            }
+                            CamPill(
+                                label = "Rotação",
+                                active = activeTransformGroup == 1,
+                                activeColor = OrangeAccent,
+                                textColor = textColor,
+                                icon = Icons.Default.RotateRight,
+                                testTag = "tf_group_rot"
+                            ) { activeTransformGroup = 1 }
 
-                            if (is3DMode) {
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    CamSlider("Incl. X", "${evaluatedKf.pitchX.roundToInt()}°", evaluatedKf.pitchX, -45f..45f, OrangeAccent, textColor, Modifier.weight(1f)) { px ->
-                                        onUpdateCurrentCamera { it.copy(pitchX = px) }
-                                    }
-                                    CamSlider("Órbita Y", "${evaluatedKf.yawY.roundToInt()}°", evaluatedKf.yawY, -60f..60f, OrangeAccent, textColor, Modifier.weight(1f)) { yy ->
-                                        onUpdateCurrentCamera { it.copy(yawY = yy) }
-                                    }
-                                }
-                                CamSlider("Prof. Z", "${cameraSettings.layerDepthSpacing.roundToInt()}", cameraSettings.layerDepthSpacing, 0f..140f, NeonGreen, textColor, Modifier.fillMaxWidth()) { d ->
-                                    onSetLayerDepthSpacing(d)
-                                }
-                            }
+                            CamPill(
+                                label = if (isCameraTarget) "Lente & Zoom" else "Escala & Opac.",
+                                active = activeTransformGroup == 2,
+                                activeColor = accentColor,
+                                textColor = textColor,
+                                icon = Icons.Default.ZoomIn,
+                                testTag = "tf_group_zoom"
+                            ) { activeTransformGroup = 2 }
 
-                            if (!compactForSplit) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState()),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
-                                ) {
-                                    Text("Res. Câmera:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
-                                    listOf(1280 to 720, 1920 to 1080, 1080 to 1080, 1080 to 1920).forEach { (w, h) ->
-                                        val isSel = cameraSettings.captureWidth == w && cameraSettings.captureHeight == h
-                                        CamPill("${w}×${h}", isSel, accentColor, textColor) {
-                                            onSetCameraResolution(w, h)
-                                        }
-                                    }
-                                    OutlinedTextField(
-                                        value = customResW,
-                                        onValueChange = { customResW = it.filter { ch -> ch.isDigit() }.take(4) },
-                                        singleLine = true,
-                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                        modifier = Modifier.width(62.dp).height(42.dp)
-                                    )
-                                    Text("×", color = textColor, fontSize = 11.sp)
-                                    OutlinedTextField(
-                                        value = customResH,
-                                        onValueChange = { customResH = it.filter { ch -> ch.isDigit() }.take(4) },
-                                        singleLine = true,
-                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                        modifier = Modifier.width(62.dp).height(42.dp)
-                                    )
-                                    CamPill("Aplicar", false, NeonGreen, textColor) {
-                                        val w = customResW.toIntOrNull() ?: cameraSettings.captureWidth
-                                        val h = customResH.toIntOrNull() ?: cameraSettings.captureHeight
-                                        onSetCameraResolution(w, h)
-                                    }
-                                }
+                            CamPill(
+                                label = if (isCameraTarget) "Res. & Reset" else "Chave & Reset",
+                                active = activeTransformGroup == 3,
+                                activeColor = NeonGreen,
+                                textColor = textColor,
+                                icon = Icons.Default.AspectRatio,
+                                testTag = "tf_group_meta"
+                            ) { activeTransformGroup = 3 }
+
+                            if (is3DMode || !isCameraTarget) {
+                                CamPill(
+                                    label = "Focar",
+                                    active = false,
+                                    activeColor = CyanAccent,
+                                    textColor = textColor,
+                                    icon = Icons.Default.CenterFocusStrong,
+                                    testTag = "transform_focus_btn"
+                                ) { onFocusStageTarget() }
                             }
                         }
-                    } else {
-                        // Layer / 3D Object Transform Inspector
-                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Row(
+
+                        Surface(
+                            color = bgColor.copy(alpha = 0.56f),
+                            shape = RoundedCornerShape(10.dp),
+                            border = androidx.compose.foundation.BorderStroke(0.8.dp, textColor.copy(alpha = 0.16f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
-                                Text(targetDisplayName, fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = OrangeAccent)
-                                CamPill("Focar", false, CyanAccent, textColor, Icons.Default.CenterFocusStrong, testTag = "transform_focus_btn") {
-                                    onFocusStageTarget()
-                                }
-                                CamPill(if (hasKeyAtCurrent) "Atualizar ◆" else "+ ◆ T${currentTimelineTick + 1}", hasKeyAtCurrent, OrangeAccent, textColor, Icons.Default.Add) {
-                                    onAddOrUpdateSelectedKeyframe(null)
-                                }
-                                CamPill("Zerar T${currentTimelineTick + 1}", false, NeonPink, NeonPink, Icons.Default.RestartAlt) {
-                                    onResetSelectedTarget()
-                                }
-                            }
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CamSlider("Pos X", "${evaluatedObjKf.x.roundToInt()}", evaluatedObjKf.x, -1200f..1200f, CyanAccent, textColor, Modifier.weight(1f)) { nx ->
-                                    onUpdateSelectedObjectTransform { it.copy(x = nx) }
-                                }
-                                CamSlider("Pos Y", "${evaluatedObjKf.y.roundToInt()}", evaluatedObjKf.y, -1200f..1200f, CyanAccent, textColor, Modifier.weight(1f)) { ny ->
-                                    onUpdateSelectedObjectTransform { it.copy(y = ny) }
-                                }
-                            }
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CamSlider("Pos Z", "${evaluatedObjKf.z.roundToInt()}", evaluatedObjKf.z, -800f..800f, NeonGreen, textColor, Modifier.weight(1f)) { nz ->
-                                    onUpdateSelectedObjectTransform { it.copy(z = nz) }
-                                }
-                                CamSlider("Escala", "${(evaluatedObjKf.scaleX * 100).roundToInt()}%", evaluatedObjKf.scaleX, 0.1f..5.0f, OrangeAccent, textColor, Modifier.weight(1f)) { sc ->
-                                    onUpdateSelectedObjectTransform { it.copy(scaleX = sc, scaleY = sc, scaleZ = sc) }
-                                }
-                            }
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CamSlider("Rot X", "${evaluatedObjKf.rotX.roundToInt()}°", evaluatedObjKf.rotX, -180f..180f, secondaryColor, textColor, Modifier.weight(1f)) { rx ->
-                                    onUpdateSelectedObjectTransform { it.copy(rotX = rx) }
-                                }
-                                CamSlider("Rot Y", "${evaluatedObjKf.rotY.roundToInt()}°", evaluatedObjKf.rotY, -180f..180f, secondaryColor, textColor, Modifier.weight(1f)) { ry ->
-                                    onUpdateSelectedObjectTransform { it.copy(rotY = ry) }
-                                }
-                            }
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CamSlider("Rot Z", "${evaluatedObjKf.rotZ.roundToInt()}°", evaluatedObjKf.rotZ, -180f..180f, accentColor, textColor, Modifier.weight(1f)) { rz ->
-                                    onUpdateSelectedObjectTransform { it.copy(rotZ = rz) }
-                                }
-                                CamSlider("Opac.", "${(evaluatedObjKf.opacity * 100).roundToInt()}%", evaluatedObjKf.opacity, 0f..1f, NeonPink, textColor, Modifier.weight(1f)) { op ->
-                                    onUpdateSelectedObjectTransform { it.copy(opacity = op) }
+                                if (isCameraTarget) {
+                                    when (activeTransformGroup) {
+                                        0 -> {
+                                            // Group 1 (4-in-1): Posição Pan X / Pan Y + 4 direções
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                CamPill("←", false, CyanAccent, textColor) { onNudgeCameraPan(-24f, 0f) }
+                                                CamPill("↑", false, CyanAccent, textColor) { onNudgeCameraPan(0f, -24f) }
+                                                CamPill("↓", false, CyanAccent, textColor) { onNudgeCameraPan(0f, 24f) }
+                                                CamPill("→", false, CyanAccent, textColor) { onNudgeCameraPan(24f, 0f) }
+                                                Spacer(Modifier.weight(1f))
+                                                Text(
+                                                    "X:${evaluatedKf.x.roundToInt()}  Y:${evaluatedKf.y.roundToInt()}",
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = CyanAccent
+                                                )
+                                            }
+                                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                CamSlider("Pan X", "${evaluatedKf.x.roundToInt()}", evaluatedKf.x, -1200f..1200f, secondaryColor, textColor, Modifier.weight(1f)) { px ->
+                                                    onUpdateCurrentCamera { it.copy(x = px) }
+                                                }
+                                                CamSlider("Pan Y", "${evaluatedKf.y.roundToInt()}", evaluatedKf.y, -1200f..1200f, secondaryColor, textColor, Modifier.weight(1f)) { py ->
+                                                    onUpdateCurrentCamera { it.copy(y = py) }
+                                                }
+                                            }
+                                        }
+                                        1 -> {
+                                            // Group 2 (4-in-1): Smooth Interactive Rotation Dial + Giro Z / Incl. X / Órbita Y
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                TransformRotationDial(
+                                                    angleDeg = evaluatedKf.rotationZ,
+                                                    accentColor = OrangeAccent,
+                                                    textColor = textColor,
+                                                    testTag = "camera_rot_dial"
+                                                ) { newRot ->
+                                                    onUpdateCurrentCamera { it.copy(rotationZ = newRot) }
+                                                }
+                                                Column(
+                                                    modifier = Modifier.weight(1f),
+                                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                                ) {
+                                                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                                        CamPill("↺ 15°", false, secondaryColor, textColor) { onRotateCameraBy(-15f) }
+                                                        CamPill("↻ 15°", false, secondaryColor, textColor) { onRotateCameraBy(15f) }
+                                                        CamPill("0°", false, CyanAccent, textColor) {
+                                                            onUpdateCurrentCamera { it.copy(rotationZ = 0f, pitchX = 0f, yawY = 0f) }
+                                                        }
+                                                    }
+                                                    CamSlider("Giro Z", "${evaluatedKf.rotationZ.roundToInt()}°", evaluatedKf.rotationZ, -180f..180f, accentColor, textColor) { rz ->
+                                                        onUpdateCurrentCamera { it.copy(rotationZ = rz) }
+                                                    }
+                                                    if (is3DMode) {
+                                                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                            CamSlider("Incl. X", "${evaluatedKf.pitchX.roundToInt()}°", evaluatedKf.pitchX, -45f..45f, OrangeAccent, textColor, Modifier.weight(1f)) { px ->
+                                                                onUpdateCurrentCamera { it.copy(pitchX = px) }
+                                                            }
+                                                            CamSlider("Órbita Y", "${evaluatedKf.yawY.roundToInt()}°", evaluatedKf.yawY, -60f..60f, OrangeAccent, textColor, Modifier.weight(1f)) { yy ->
+                                                                onUpdateCurrentCamera { it.copy(yawY = yy) }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        2 -> {
+                                            // Group 3 (4-in-1): Zoom + 4 Lentes (24/35/50/85mm) + FOV + Profundidade Z
+                                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                CamPill("Zoom -", false, accentColor, textColor) { onZoomCameraBy(0.9f) }
+                                                CamPill("Zoom +", false, accentColor, textColor) { onZoomCameraBy(1.1f) }
+                                                CamSlider("Zoom", "${((evaluatedKf.zoom * 100).roundToInt())}%", evaluatedKf.zoom, 0.2f..4.5f, accentColor, textColor, Modifier.weight(1f)) { z ->
+                                                    onUpdateCurrentCamera { it.copy(zoom = z) }
+                                                }
+                                            }
+                                            CamSlider("Lente FOV", "${evaluatedKf.fovDegrees.roundToInt()}°", evaluatedKf.fovDegrees, 18f..120f, CyanAccent, textColor, Modifier.fillMaxWidth()) { fov ->
+                                                onSetCameraFov(fov)
+                                            }
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .horizontalScroll(rememberScrollState()),
+                                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                listOf("24mm" to 84f, "35mm" to 63f, "50mm" to 46f, "85mm" to 28f).forEach { (lbl, fv) ->
+                                                    CamPill(lbl, kotlin.math.abs(evaluatedKf.fovDegrees - fv) < 2f, CyanAccent, textColor) { onSetCameraFov(fv) }
+                                                }
+                                                if (is3DMode) {
+                                                    CamPill("Prof. Z ${cameraSettings.layerDepthSpacing.roundToInt()}", false, NeonGreen, textColor) {
+                                                        val nextD = if (cameraSettings.layerDepthSpacing >= 90f) 24f else cameraSettings.layerDepthSpacing + 18f
+                                                        onSetLayerDepthSpacing(nextD)
+                                                    }
+                                                }
+                                            }
+                                            if (is3DMode) {
+                                                CamSlider("Prof. Z", "${cameraSettings.layerDepthSpacing.roundToInt()}", cameraSettings.layerDepthSpacing, 0f..140f, NeonGreen, textColor, Modifier.fillMaxWidth()) { d ->
+                                                    onSetLayerDepthSpacing(d)
+                                                }
+                                            }
+                                        }
+                                        else -> {
+                                            // Group 4 (4-in-1): Reset Quadro / Reset Tudo / Resolução presets & Custom
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .horizontalScroll(rememberScrollState()),
+                                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                CamPill("Zerar T${currentTimelineTick + 1}", false, CyanAccent, textColor, Icons.Default.RestartAlt) {
+                                                    onResetCurrentKeyframe()
+                                                }
+                                                if (!compactForSplit) {
+                                                    CamPill("Zerar Tudo", false, NeonPink, NeonPink, Icons.Default.RestartAlt) {
+                                                        onResetKeyframes()
+                                                    }
+                                                }
+                                                if (is3DMode) {
+                                                    CamPill("Yaw-", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(-5f, 0f) }
+                                                    CamPill("Yaw+", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(5f, 0f) }
+                                                    CamPill("Pitch-", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(0f, -5f) }
+                                                    CamPill("Pitch+", false, OrangeAccent, textColor) { onTiltOrbitCameraBy(0f, 5f) }
+                                                }
+                                            }
+                                            if (!compactForSplit) {
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .horizontalScroll(rememberScrollState()),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                                ) {
+                                                    Text("Res:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
+                                                    listOf(1280 to 720, 1920 to 1080, 1080 to 1080, 1080 to 1920).forEach { (w, h) ->
+                                                        val isSel = cameraSettings.captureWidth == w && cameraSettings.captureHeight == h
+                                                        CamPill("${w}×${h}", isSel, accentColor, textColor) { onSetCameraResolution(w, h) }
+                                                    }
+                                                    OutlinedTextField(
+                                                        value = customResW,
+                                                        onValueChange = { customResW = it.filter { ch -> ch.isDigit() }.take(4) },
+                                                        singleLine = true,
+                                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                                        modifier = Modifier.width(60.dp).height(40.dp)
+                                                    )
+                                                    Text("×", color = textColor, fontSize = 11.sp)
+                                                    OutlinedTextField(
+                                                        value = customResH,
+                                                        onValueChange = { customResH = it.filter { ch -> ch.isDigit() }.take(4) },
+                                                        singleLine = true,
+                                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                                        modifier = Modifier.width(60.dp).height(40.dp)
+                                                    )
+                                                    CamPill("Aplicar", false, NeonGreen, textColor) {
+                                                        val w = customResW.toIntOrNull() ?: cameraSettings.captureWidth
+                                                        val h = customResH.toIntOrNull() ?: cameraSettings.captureHeight
+                                                        onSetCameraResolution(w, h)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Layer / 3D Object Minimalist 4-in-1 Transform Inspector
+                                    when (activeTransformGroup) {
+                                        0 -> {
+                                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                CamSlider("Pos X", "${evaluatedObjKf.x.roundToInt()}", evaluatedObjKf.x, -1200f..1200f, CyanAccent, textColor, Modifier.weight(1f)) { nx ->
+                                                    onUpdateSelectedObjectTransform { it.copy(x = nx) }
+                                                }
+                                                CamSlider("Pos Y", "${evaluatedObjKf.y.roundToInt()}", evaluatedObjKf.y, -1200f..1200f, CyanAccent, textColor, Modifier.weight(1f)) { ny ->
+                                                    onUpdateSelectedObjectTransform { it.copy(y = ny) }
+                                                }
+                                            }
+                                            CamSlider("Pos Z", "${evaluatedObjKf.z.roundToInt()}", evaluatedObjKf.z, -800f..800f, NeonGreen, textColor, Modifier.fillMaxWidth()) { nz ->
+                                                onUpdateSelectedObjectTransform { it.copy(z = nz) }
+                                            }
+                                        }
+                                        1 -> {
+                                            // Intuitive Rotation Dial + Eixos X/Y/Z
+                                            var rotDialAxis by remember { mutableIntStateOf(2) } // 0=X, 1=Y, 2=Z
+                                            val currentAxisAngle = when (rotDialAxis) {
+                                                0 -> evaluatedObjKf.rotX
+                                                1 -> evaluatedObjKf.rotY
+                                                else -> evaluatedObjKf.rotZ
+                                            }
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                TransformRotationDial(
+                                                    angleDeg = currentAxisAngle,
+                                                    accentColor = when (rotDialAxis) {
+                                                        0 -> NeonPink
+                                                        1 -> NeonGreen
+                                                        else -> CyanAccent
+                                                    },
+                                                    textColor = textColor,
+                                                    testTag = "object_rot_dial"
+                                                ) { deg ->
+                                                    onUpdateSelectedObjectTransform {
+                                                        when (rotDialAxis) {
+                                                            0 -> it.copy(rotX = deg)
+                                                            1 -> it.copy(rotY = deg)
+                                                            else -> it.copy(rotZ = deg)
+                                                        }
+                                                    }
+                                                }
+                                                Column(
+                                                    modifier = Modifier.weight(1f),
+                                                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                                                ) {
+                                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                        Text("Eixo:", fontSize = 8.5.sp, color = textColor.copy(alpha = 0.72f))
+                                                        CamPill("X", rotDialAxis == 0, NeonPink, textColor) { rotDialAxis = 0 }
+                                                        CamPill("Y", rotDialAxis == 1, NeonGreen, textColor) { rotDialAxis = 1 }
+                                                        CamPill("Z", rotDialAxis == 2, CyanAccent, textColor) { rotDialAxis = 2 }
+                                                        CamPill("0°", false, OrangeAccent, textColor) {
+                                                            onUpdateSelectedObjectTransform { it.copy(rotX = 0f, rotY = 0f, rotZ = 0f) }
+                                                        }
+                                                    }
+                                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                        CamSlider("Rot X", "${evaluatedObjKf.rotX.roundToInt()}°", evaluatedObjKf.rotX, -180f..180f, NeonPink, textColor, Modifier.weight(1f)) { rx ->
+                                                            onUpdateSelectedObjectTransform { it.copy(rotX = rx) }
+                                                        }
+                                                        CamSlider("Rot Y", "${evaluatedObjKf.rotY.roundToInt()}°", evaluatedObjKf.rotY, -180f..180f, NeonGreen, textColor, Modifier.weight(1f)) { ry ->
+                                                            onUpdateSelectedObjectTransform { it.copy(rotY = ry) }
+                                                        }
+                                                    }
+                                                    CamSlider("Rot Z", "${evaluatedObjKf.rotZ.roundToInt()}°", evaluatedObjKf.rotZ, -180f..180f, CyanAccent, textColor, Modifier.fillMaxWidth()) { rz ->
+                                                        onUpdateSelectedObjectTransform { it.copy(rotZ = rz) }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        2 -> {
+                                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                CamSlider("Escala", "${(evaluatedObjKf.scaleX * 100).roundToInt()}%", evaluatedObjKf.scaleX, 0.1f..5.0f, OrangeAccent, textColor, Modifier.weight(1f)) { sc ->
+                                                    onUpdateSelectedObjectTransform { it.copy(scaleX = sc, scaleY = sc, scaleZ = sc) }
+                                                }
+                                                CamSlider("Opac.", "${(evaluatedObjKf.opacity * 100).roundToInt()}%", evaluatedObjKf.opacity, 0f..1f, NeonPink, textColor, Modifier.weight(1f)) { op ->
+                                                    onUpdateSelectedObjectTransform { it.copy(opacity = op) }
+                                                }
+                                            }
+                                        }
+                                        else -> {
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .horizontalScroll(rememberScrollState()),
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(targetDisplayName, fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = OrangeAccent)
+                                                CamPill(if (hasKeyAtCurrent) "Atualizar ◆" else "+ ◆ T${currentTimelineTick + 1}", hasKeyAtCurrent, OrangeAccent, textColor, Icons.Default.Add) {
+                                                    onAddOrUpdateSelectedKeyframe(null)
+                                                }
+                                                CamPill("Zerar T${currentTimelineTick + 1}", false, NeonPink, NeonPink, Icons.Default.RestartAlt) {
+                                                    onResetSelectedTarget()
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1905,7 +2059,7 @@ fun CameraTimelinePanel(
                                     ) {
                                         Icon(Icons.Default.FolderOpen, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(15.dp))
                                         Text(
-                                            text = "Importar Cena 3D (.glb/.gltf/.obj/.zip + UV)",
+                                            text = "Importar Cena 3D (.glb/.gltf/.obj/.fbx/.max/.3ds)",
                                             fontSize = 10.sp,
                                             fontWeight = FontWeight.Bold,
                                             color = textColor,
@@ -3097,3 +3251,64 @@ private fun BgColorSwatchRow(
         }
     }
 }
+
+@Composable
+private fun TransformRotationDial(
+    angleDeg: Float,
+    accentColor: Color,
+    textColor: Color,
+    testTag: String,
+    onAngleChange: (Float) -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(64.dp)
+            .clip(CircleShape)
+            .background(textColor.copy(alpha = 0.06f))
+            .border(1.3.dp, accentColor.copy(alpha = 0.55f), CircleShape)
+            .testTag(testTag)
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    fun emit(pos: Offset) {
+                        var deg = Math.toDegrees(atan2((pos.y - cy).toDouble(), (pos.x - cx).toDouble())).toFloat() + 90f
+                        while (deg > 180f) deg -= 360f
+                        while (deg < -180f) deg += 360f
+                        onAngleChange(deg.coerceIn(-180f, 180f))
+                    }
+                    down.consume()
+                    emit(down.position)
+                    while (true) {
+                        val ev = awaitPointerEvent()
+                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                        if (!ch.pressed) break
+                        ch.consume()
+                        emit(ch.position)
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val c = Offset(size.width / 2f, size.height / 2f)
+            val r = size.width * 0.40f
+            val rad = Math.toRadians((angleDeg - 90f).toDouble())
+            val tip = Offset(c.x + (r * cos(rad)).toFloat(), c.y + (r * sin(rad)).toFloat())
+            drawCircle(accentColor.copy(alpha = 0.25f), radius = r, center = c, style = Stroke(2f))
+            drawLine(accentColor, c, tip, strokeWidth = 2.6f)
+            drawCircle(accentColor, radius = 5f, center = tip)
+        }
+        Text(
+            text = "${angleDeg.roundToInt()}°",
+            fontSize = 9.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = textColor,
+            modifier = Modifier
+                .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(4.dp))
+                .padding(horizontal = 4.dp, vertical = 1.dp)
+        )
+    }
+}
+

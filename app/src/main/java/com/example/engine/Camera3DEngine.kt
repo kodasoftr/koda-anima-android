@@ -25,8 +25,11 @@ import com.example.model.CanvasBackgroundStyle
 import com.example.model.Frame
 import com.example.model.GradientColorStop
 import com.example.model.LayerTransformTrack
+import com.example.model.ObjectShaderMode
 import com.example.model.ObjectTransformKeyframe
+import com.example.model.ObjectUVMapSlot
 import com.example.model.SceneObject3D
+import com.example.model.ShaderNodeKind
 import com.example.model.SkyBackdropMode
 import java.util.Arrays
 import kotlin.math.PI
@@ -68,6 +71,7 @@ object Camera3DEngine {
     private class Raster3DScratch {
         var pixels = IntArray(0)
         var zBuf = FloatArray(0)
+        var ownerBuf = IntArray(0)
         var fxWorkPixels = IntArray(0)
 
         var projX = FloatArray(0)
@@ -76,6 +80,7 @@ object Camera3DEngine {
         var clipZ = FloatArray(0)
         var worldZ = FloatArray(0)
         var shade = FloatArray(0)
+        var rimArr = FloatArray(0)
 
         val drawBitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
         val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
@@ -88,9 +93,11 @@ object Camera3DEngine {
             if (pixels.size < totalPx) {
                 pixels = IntArray(totalPx)
                 zBuf = FloatArray(totalPx)
+                ownerBuf = IntArray(totalPx)
             }
             Arrays.fill(pixels, 0, totalPx, 0)
             Arrays.fill(zBuf, 0, totalPx, Float.MAX_VALUE)
+            Arrays.fill(ownerBuf, 0, totalPx, 0)
         }
 
         fun ensureVertexCapacity(vCount: Int) {
@@ -102,6 +109,7 @@ object Camera3DEngine {
                 clipZ = FloatArray(nextCap)
                 worldZ = FloatArray(nextCap)
                 shade = FloatArray(nextCap)
+                rimArr = FloatArray(nextCap)
             }
         }
 
@@ -461,6 +469,7 @@ object Camera3DEngine {
         scratch.ensureFrameCapacity(totalPx)
         val pixels = scratch.pixels
         val zBuf = scratch.zBuf
+        val ownerBuf = scratch.ownerBuf
         val boundsMap = HashMap<String, ProjectedObjectBounds>(visibleObjs.size)
 
         val yawRad = Math.toRadians(camYawDeg.toDouble())
@@ -476,11 +485,76 @@ object Camera3DEngine {
         val maxXBound = outW - 1
         val maxYBound = outH - 1
 
+        data class PendingOutlinePass(
+            val ownerTag: Int,
+            val widthPx: Int,
+            val outlineColor: Int,
+            val minPx: Int,
+            val minPy: Int,
+            val maxPx: Int,
+            val maxPy: Int
+        )
+        val pendingOutlines = ArrayList<PendingOutlinePass>(visibleObjs.size)
+
         // Precompute transformed vertices cleanly using reusable ThreadLocal primitive buffers
-        for (obj in visibleObjs) {
+        for ((objIdx, obj) in visibleObjs.withIndex()) {
+            val ownerTag = objIdx + 1
             val meshData = Mesh3DImporter.getOrLoadMesh(obj.meshAssetPath) ?: continue
             val objTf = evaluateObjectTransformAtTick(obj.keyframes, tickFloat, autoInterpolate)
             if (objTf.opacity <= 0.01f) continue
+
+            // Resolve ShaderNodeGraph overrides when active
+            val ng = obj.nodeGraph
+            val ngNodes = if (ng.enabled) ng.nodes else emptyList()
+            fun findNode(k: ShaderNodeKind) = ngNodes.firstOrNull { it.kind == k }
+            val uvNode = findNode(ShaderNodeKind.UV_COORD)
+            val lightNode = findNode(ShaderNodeKind.LUZ_OBJETO)
+            val celNode = findNode(ShaderNodeKind.CEL_RAMP)
+            val brushNode = findNode(ShaderNodeKind.BRUSH_GRAIN)
+            val outlineNode = findNode(ShaderNodeKind.CONTORNO)
+
+            val effShader = if (ng.enabled) {
+                when {
+                    brushNode != null && brushNode.paramA > 0.08f -> ObjectShaderMode.CARTOON_BRUSH
+                    celNode != null -> ObjectShaderMode.ANIME_CEL
+                    else -> obj.shaderMode
+                }
+            } else obj.shaderMode
+
+            val celSteps = (celNode?.paramA?.roundToInt() ?: 3).coerceIn(2, 6)
+            val brushStrength = (brushNode?.paramA ?: if (effShader == ObjectShaderMode.CARTOON_BRUSH) 0.42f else 0f).coerceIn(0f, 1f)
+            val brushDensity = (brushNode?.paramB ?: 0.55f).coerceIn(0.15f, 1f)
+            val nodeUvScaleMul = (uvNode?.paramA ?: 1f).coerceIn(0.25f, 6f)
+            val nodeUvOffsetShift = (uvNode?.paramB ?: 0f) - if (uvNode != null) 0f else 0f
+
+            val effLightIntensity = (obj.light.intensity * (if (lightNode != null) lightNode.paramA * 1.4f else 1f)).coerceIn(0.1f, 3f)
+            val effAmbient = (obj.light.ambient + (lightNode?.paramB?.let { (it - 0.3f) * 0.6f } ?: 0f)).coerceIn(0.05f, 0.9f)
+            val effRim = (obj.light.rimStrength + (celNode?.paramB?.let { it * 0.45f } ?: 0f)).coerceIn(0f, 1.2f)
+            val effEmissive = obj.light.emissiveGlow.coerceIn(0f, 1f)
+
+            val lAzRad = Math.toRadians(obj.light.azimuthDeg.toDouble())
+            val lElRad = Math.toRadians(obj.light.elevationDeg.toDouble())
+            val lHoriz = cos(lElRad).toFloat()
+            val lightDirX = (sin(lAzRad) * lHoriz).toFloat()
+            val lightDirY = (-sin(lElRad)).toFloat()
+            val lightDirZ = (-cos(lAzRad) * lHoriz).toFloat()
+            val lightR = ((obj.light.lightColorArgb ushr 16) and 0xFF) / 255f
+            val lightG = ((obj.light.lightColorArgb ushr 8) and 0xFF) / 255f
+            val lightB = (obj.light.lightColorArgb and 0xFF) / 255f
+
+            val baseSlot = obj.uvSlots.getOrNull(obj.activeUvSlotIndex) ?: obj.uvSlots.firstOrNull() ?: ObjectUVMapSlot()
+            val effSlot = if (ng.enabled && uvNode != null) {
+                baseSlot.copy(
+                    scaleU = baseSlot.scaleU * nodeUvScaleMul,
+                    scaleV = baseSlot.scaleV * nodeUvScaleMul,
+                    offsetU = baseSlot.offsetU + nodeUvOffsetShift * 0.1f,
+                    offsetV = baseSlot.offsetV + nodeUvOffsetShift * 0.1f
+                )
+            } else baseSlot
+
+            val effOutlineEnabled = if (ng.enabled && outlineNode != null) outlineNode.paramB > 0.15f else obj.outline.enabled
+            val effOutlineWidth = if (ng.enabled && outlineNode != null) outlineNode.paramA else obj.outline.width
+            val effOutlineColor = if (ng.enabled && outlineNode != null) outlineNode.colorArgb.toInt() else obj.outline.colorArgb.toInt()
 
             val oxRad = Math.toRadians(objTf.rotX.toDouble())
             val oyRad = Math.toRadians(objTf.rotY.toDouble())
@@ -517,6 +591,7 @@ object Camera3DEngine {
                 val clipZArr = scratch.clipZ
                 val worldZArr = scratch.worldZ
                 val shadeArr = scratch.shade
+                val rimArr = scratch.rimArr
                 val verts = sm.vertices
                 val norms = sm.normals
                 val hasNorms = norms.size >= vCount * 3
@@ -527,7 +602,6 @@ object Camera3DEngine {
                     val vy0 = verts[vOff + 1] * sy
                     val vz0 = verts[vOff + 2] * sz
 
-                    // Object local Euler XYZ
                     val vy1 = vy0 * cox - vz0 * sox
                     val vz1 = vy0 * sox + vz0 * cox
                     val vx2 = vx0 * coy + vz1 * soy
@@ -540,7 +614,6 @@ object Camera3DEngine {
                     val wz = vz2 + posZ
                     worldZArr[vi] = wz
 
-                    // Transform normal for 3-point + hemisphere studio lighting
                     val nx0 = if (hasNorms) norms[vOff] else 0f
                     val ny0 = if (hasNorms) norms[vOff + 1] else -1f
                     val nz0 = if (hasNorms) norms[vOff + 2] else 0f
@@ -550,12 +623,17 @@ object Camera3DEngine {
                     val nz2 = -nx0 * soy + nz1 * coy
                     val nx3 = nx2 * coz - ny1 * soz
                     val ny3 = nx2 * soz + ny1 * coz
-                    val dotKey = nx3 * 0.42f + (-ny3) * 0.72f + (-nz2) * 0.55f
-                    val dotRim = (-nx3) * 0.45f + (-ny3) * 0.30f + nz2 * 0.84f
-                    val hemi = ((-ny3) * 0.5f + 0.5f).coerceIn(0f, 1f)
-                    shadeArr[vi] = (0.28f + hemi * 0.18f + max(0f, dotKey) * 0.52f + max(0f, dotRim) * 0.16f).coerceIn(0.24f, 1.05f)
 
-                    // View orbit/camera rotation
+                    val dotKey = nx3 * lightDirX + ny3 * lightDirY + nz2 * lightDirZ
+                    // View-space facing for rim highlight
+                    val viewRz = nx3 * sinY + nz2 * cosY
+                    val viewNz = (ny3 * sinP + viewRz * cosP).coerceIn(-1f, 1f)
+                    val rimVal = (1f - abs(viewNz)).coerceIn(0f, 1f).pow(2.2f) * effRim
+                    val hemi = ((-ny3) * 0.5f + 0.5f).coerceIn(0f, 1f)
+                    shadeArr[vi] = (effAmbient + hemi * 0.14f + max(0f, dotKey) * 0.62f * effLightIntensity + effEmissive * 0.55f)
+                        .coerceIn(0.12f, 1.35f)
+                    rimArr[vi] = rimVal
+
                     val rx = wx * cosY - wz * sinY
                     val rz = wx * sinY + wz * cosY
                     val ry = wy * cosP - rz * sinP
@@ -582,26 +660,36 @@ object Camera3DEngine {
                     }
                 }
 
-                val texPix = sm.texturePixels
-                val texW = sm.textureWidth
-                val texH = sm.textureHeight
+                // Resolve effective UVs + live composited paint texture (cached in Studio3DPaintEngine)
+                val uvs = Studio3DPaintEngine.generateUVsForProjection(verts, sm.uvs, effSlot)
+                val compTex = Studio3DPaintEngine.resolveCompositeObjectTexture(
+                    obj = obj,
+                    basePixels = sm.texturePixels,
+                    baseW = sm.textureWidth,
+                    baseH = sm.textureHeight,
+                    baseColorArgb = sm.baseColorArgb
+                )
+                val texPix = compTex?.pixels ?: sm.texturePixels
+                val texW = compTex?.width ?: sm.textureWidth
+                val texH = compTex?.height ?: sm.textureHeight
                 val hasTex = texPix != null && texW > 0 && texH > 0
                 val texWMax = texW - 1
                 val texHMax = texH - 1
+
                 val baseR = ((sm.baseColorArgb ushr 16) and 0xFF) / 255f
                 val baseG = ((sm.baseColorArgb ushr 8) and 0xFF) / 255f
                 val baseB = (sm.baseColorArgb and 0xFF) / 255f
-                val solidR255 = baseR * tintR * 255f
-                val solidG255 = baseG * tintG * 255f
-                val solidB255 = baseB * tintB * 255f
-                val tintRInv255 = tintR / 255f
-                val tintGInv255 = tintG / 255f
-                val tintBInv255 = tintB / 255f
+                val solidR255 = baseR * tintR * lightR * 255f
+                val solidG255 = baseG * tintG * lightG * 255f
+                val solidB255 = baseB * tintB * lightB * 255f
+                val tintRInv255 = (tintR * lightR) / 255f
+                val tintGInv255 = (tintG * lightG) / 255f
+                val tintBInv255 = (tintB * lightB) / 255f
                 val alphaByteSolid = (tintA * 255f + 0.5f).toInt().coerceIn(0, 255)
-                val uvs = sm.uvs
                 val uvsSize = uvs.size
                 val indices = sm.indices
                 val indicesLimit = indices.size
+                val brushStepPx = max(3.5f, 11f - brushDensity * 7f)
 
                 var tri = 0
                 while (tri + 2 < indicesLimit) {
@@ -610,8 +698,6 @@ object Camera3DEngine {
                     val i2 = indices[tri + 2]
                     tri += 3
                     if (i0 < 0 || i0 >= vCount || i1 < 0 || i1 >= vCount || i2 < 0 || i2 >= vCount) continue
-
-                    // Near-plane rejection avoids inverted behind-camera triangle explosions
                     if (clipZArr[i0] < 24f || clipZArr[i1] < 24f || clipZArr[i2] < 24f) continue
 
                     val avgWorldZ = (worldZArr[i0] + worldZArr[i1] + worldZArr[i2]) * (1f / 3f)
@@ -640,6 +726,9 @@ object Camera3DEngine {
                     val sz0 = shadeArr[i0] * iz0
                     val sz1 = shadeArr[i1] * iz1
                     val sz2 = shadeArr[i2] * iz2
+                    val rz0 = rimArr[i0] * iz0
+                    val rz1 = rimArr[i1] * iz1
+                    val rz2 = rimArr[i2] * iz2
 
                     val uvOff0 = i0 * 2
                     val uvOff1 = i1 * 2
@@ -651,7 +740,6 @@ object Camera3DEngine {
                     val uz2 = (if (uvOff2 < uvsSize) uvs[uvOff2] else 0f) * iz2
                     val vz2 = (if (uvOff2 + 1 < uvsSize) uvs[uvOff2 + 1] else 0f) * iz2
 
-                    // Pineda incremental edge stepping setup (zero inner-loop edge multiplications)
                     val startX = minPx + 0.5f
                     val startY = minPy + 0.5f
                     val dw0x = (y1 - y2) * sgn; val dw0y = (x2 - x1) * sgn
@@ -679,8 +767,28 @@ object Camera3DEngine {
                                     val depth = 1f / interpIz
                                     val pixIdx = rowOff + px
                                     if (depth < zBuf[pixIdx]) {
-                                        val shade = ((b0 * sz0 + b1 * sz1 + b2 * sz2) * depth).coerceIn(0.24f, 1.05f)
-                                        if (hasTex) {
+                                        val rawShade = (b0 * sz0 + b1 * sz1 + b2 * sz2) * depth
+                                        val rim = (b0 * rz0 + b1 * rz1 + b2 * rz2) * depth
+                                        var shadeVal = when (effShader) {
+                                            ObjectShaderMode.SEM_LUZ -> 1.0f
+                                            ObjectShaderMode.ARAMADO -> (rawShade * 0.35f + 0.15f).coerceIn(0.15f, 0.55f)
+                                            ObjectShaderMode.ANIME_CEL -> {
+                                                val q = floor(rawShade.coerceIn(0f, 1.15f) * celSteps) / celSteps.toFloat()
+                                                (0.32f + q * 0.72f + if (rim > 0.32f) 0.24f else 0f).coerceIn(0.28f, 1.25f)
+                                            }
+                                            ObjectShaderMode.CARTOON_BRUSH -> {
+                                                val q = floor(rawShade.coerceIn(0f, 1.15f) * celSteps) / celSteps.toFloat()
+                                                val diag = (px + py * 0.65f) / brushStepPx
+                                                val strokeWave = abs(diag - floor(diag) - 0.5f) * 2f
+                                                val shadowBoost = if (q < 0.55f) (1f - strokeWave * brushStrength * 0.52f) else (1f - strokeWave * brushStrength * 0.12f)
+                                                ((0.34f + q * 0.72f) * shadowBoost + if (rim > 0.30f) 0.22f else 0f).coerceIn(0.22f, 1.25f)
+                                            }
+                                            ObjectShaderMode.PADRAO -> (rawShade + rim * 0.35f).coerceIn(0.18f, 1.25f)
+                                        }
+
+                                        val isWireEdge = effShader == ObjectShaderMode.ARAMADO && (b0 < 0.045f || b1 < 0.045f || b2 < 0.045f)
+
+                                        if (hasTex && !isWireEdge) {
                                             val rawU = (b0 * uz0 + b1 * uz1 + b2 * uz2) * depth
                                             val rawV = (b0 * vz0 + b1 * vz1 + b2 * vz2) * depth
                                             var u = rawU - floor(rawU)
@@ -693,12 +801,18 @@ object Camera3DEngine {
                                             val tcAlpha = (tc ushr 24) and 0xFF
                                             if (tcAlpha > 5) {
                                                 zBuf[pixIdx] = depth
-                                                var rF = ((tc ushr 16) and 0xFF) * tintRInv255 * shade
-                                                var gF = ((tc ushr 8) and 0xFF) * tintGInv255 * shade
-                                                var bF = (tc and 0xFF) * tintBInv255 * shade
+                                                ownerBuf[pixIdx] = ownerTag
+                                                var rF = ((tc ushr 16) and 0xFF) * tintRInv255 * shadeVal
+                                                var gF = ((tc ushr 8) and 0xFF) * tintGInv255 * shadeVal
+                                                var bF = (tc and 0xFF) * tintBInv255 * shadeVal
+                                                if (effEmissive > 0.02f) {
+                                                    rF += ((tc ushr 16) and 0xFF) / 255f * effEmissive * 0.45f
+                                                    gF += ((tc ushr 8) and 0xFF) / 255f * effEmissive * 0.45f
+                                                    bF += (tc and 0xFF) / 255f * effEmissive * 0.45f
+                                                }
                                                 if (isSel) {
-                                                    rF = rF * 0.85f + 0.15f
-                                                    gF = gF * 0.85f + 0.10f
+                                                    rF = rF * 0.88f + 0.12f
+                                                    gF = gF * 0.88f + 0.08f
                                                 }
                                                 val aOut = (tintA * tcAlpha + 0.5f).toInt().coerceIn(0, 255)
                                                 val rOut = (rF * 255f + 0.5f).toInt().coerceIn(0, 255)
@@ -706,14 +820,19 @@ object Camera3DEngine {
                                                 val bOut = (bF * 255f + 0.5f).toInt().coerceIn(0, 255)
                                                 pixels[pixIdx] = (aOut shl 24) or (rOut shl 16) or (gOut shl 8) or bOut
                                             }
+                                        } else if (isWireEdge) {
+                                            zBuf[pixIdx] = depth
+                                            ownerBuf[pixIdx] = ownerTag
+                                            pixels[pixIdx] = (alphaByteSolid shl 24) or 0x0000E5FF
                                         } else {
                                             zBuf[pixIdx] = depth
-                                            var rOut = (solidR255 * shade + 0.5f).toInt()
-                                            var gOut = (solidG255 * shade + 0.5f).toInt()
-                                            var bOut = (solidB255 * shade + 0.5f).toInt()
+                                            ownerBuf[pixIdx] = ownerTag
+                                            var rOut = (solidR255 * shadeVal + 0.5f).toInt()
+                                            var gOut = (solidG255 * shadeVal + 0.5f).toInt()
+                                            var bOut = (solidB255 * shadeVal + 0.5f).toInt()
                                             if (isSel) {
-                                                rOut = (rOut * 0.85f + 38.25f).toInt()
-                                                gOut = (gOut * 0.85f + 25.5f).toInt()
+                                                rOut = (rOut * 0.88f + 30f).toInt()
+                                                gOut = (gOut * 0.88f + 20f).toInt()
                                             }
                                             pixels[pixIdx] = (alphaByteSolid shl 24) or
                                                 (rOut.coerceIn(0, 255) shl 16) or
@@ -747,6 +866,51 @@ object Camera3DEngine {
                     maxY = bMaxY,
                     avgDepth = depthSum / depthCount.toFloat()
                 )
+                if (effOutlineEnabled && effOutlineWidth >= 0.5f) {
+                    val rad = effOutlineWidth.roundToInt().coerceIn(1, 5)
+                    pendingOutlines.add(
+                        PendingOutlinePass(
+                            ownerTag = ownerTag,
+                            widthPx = rad,
+                            outlineColor = (alphaByteOutline(objTf.opacity) shl 24) or (effOutlineColor and 0x00FFFFFF),
+                            minPx = max(rad, floor(bMinX).toInt() - rad),
+                            minPy = max(rad, floor(bMinY).toInt() - rad),
+                            maxPx = min(outW - 1 - rad, ceil(bMaxX).toInt() + rad),
+                            maxPy = min(outH - 1 - rad, ceil(bMaxY).toInt() + rad)
+                        )
+                    )
+                }
+            }
+        }
+
+        // Screen-space silhouette Contorno (Outline) dilation pass per object
+        for (op in pendingOutlines) {
+            val r = op.widthPx
+            val tag = op.ownerTag
+            val col = op.outlineColor
+            for (py in op.minPy..op.maxPy) {
+                val rowOff = py * outW
+                for (px in op.minPx..op.maxPx) {
+                    val idx = rowOff + px
+                    if (ownerBuf[idx] == tag) continue
+                    var touchesObj = false
+                    var oy = -r
+                    while (oy <= r && !touchesObj) {
+                        val nRow = (py + oy) * outW
+                        var ox = -r
+                        while (ox <= r) {
+                            if (ox * ox + oy * oy <= r * r + 1 && ownerBuf[nRow + px + ox] == tag) {
+                                touchesObj = true
+                                break
+                            }
+                            ox++
+                        }
+                        oy++
+                    }
+                    if (touchesObj && ownerBuf[idx] == 0) {
+                        pixels[idx] = col
+                    }
+                }
             }
         }
 
@@ -759,6 +923,59 @@ object Camera3DEngine {
         }
         outBmp.setPixels(pixels, 0, outW, 0, 0, outW, outH)
         return outBmp to boundsMap
+    }
+
+    private fun alphaByteOutline(opacity: Float): Int = (opacity.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(24, 255)
+
+    /**
+     * Exact ray-triangle screen picking across all visible 3D objects, returning the front-most hit object ID.
+     */
+    fun pickStageObject3DAtScreenPoint(
+        sceneObjects: List<SceneObject3D>,
+        frameIndex: Int,
+        autoInterpolate: Boolean,
+        screenX: Float,
+        screenY: Float,
+        camYawDeg: Float,
+        camPitchDeg: Float,
+        camRollDeg: Float,
+        camPanX: Float,
+        camPanY: Float,
+        focalPx: Float,
+        vpCx: Float,
+        vpCy: Float,
+        worldUnitScale: Float,
+        tickFloat: Float = frameIndex.toFloat(),
+        animTimeSec: Float = 0f
+    ): String? {
+        var bestId: String? = null
+        var bestDepth = Float.MAX_VALUE
+        for (obj in sceneObjects) {
+            if (!obj.isVisible || obj.meshAssetPath.isBlank()) continue
+            val hit = Studio3DPaintEngine.pickObjectTriangleUV(
+                obj = obj,
+                frameIndex = frameIndex,
+                autoInterpolate = autoInterpolate,
+                screenX = screenX,
+                screenY = screenY,
+                camYawDeg = camYawDeg,
+                camPitchDeg = camPitchDeg,
+                camRollDeg = camRollDeg,
+                camPanX = camPanX,
+                camPanY = camPanY,
+                focalPx = focalPx,
+                vpCx = vpCx,
+                vpCy = vpCy,
+                worldUnitScale = worldUnitScale,
+                tickFloat = tickFloat,
+                animTimeSec = animTimeSec
+            )
+            if (hit != null && hit.depth < bestDepth) {
+                bestDepth = hit.depth
+                bestId = obj.id
+            }
+        }
+        return bestId
     }
 
     private fun drawStudio3DFloorGridToCanvas(

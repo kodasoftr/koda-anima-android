@@ -165,8 +165,16 @@ class BluetoothCoopManager(
             try {
                 try { if (bt.isDiscovering) bt.cancelDiscovery() } catch (_: Exception) {}
                 val device = bt.getRemoteDevice(address)
-                socket = device.createRfcommSocketToServiceRecord(KODANIMA_BT_UUID)
-                socket.connect()
+                socket = try {
+                    device.createRfcommSocketToServiceRecord(KODANIMA_BT_UUID).apply { connect() }
+                } catch (primaryErr: Exception) {
+                    try { socket?.close() } catch (_: Exception) {}
+                    // Fallback via RFCOMM channel 1 for Android OEM stacks with strict SDP caching
+                    val m = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                    val fallbackSock = m.invoke(device, 1) as BluetoothSocket
+                    fallbackSock.connect()
+                    fallbackSock
+                }
                 val remoteName = try { device.name ?: address } catch (_: SecurityException) { address }
                 onClientConnectedToHost(
                     socket.inputStream,

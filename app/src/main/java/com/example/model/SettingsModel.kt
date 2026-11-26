@@ -160,7 +160,18 @@ enum class ShortcutAction(
     CAMERA_ZOOM_OUT("Afastar Câmera (Zoom -)", "Câmera 2D & 3D", KeyEvent.KEYCODE_MINUS),
     CAMERA_FOV_WIDE("Aumentar FOV / Lente Aberta", "Câmera 2D & 3D", KeyEvent.KEYCODE_1),
     CAMERA_FOV_TELE("Reduzir FOV / Teleobjetiva", "Câmera 2D & 3D", KeyEvent.KEYCODE_2),
-    CAMERA_RESET("Zerar Posição da Câmera", "Câmera 2D & 3D", KeyEvent.KEYCODE_R)
+    CAMERA_RESET("Zerar Posição da Câmera", "Câmera 2D & 3D", KeyEvent.KEYCODE_R),
+
+    STUDIO3D_GRAB("Mover Selecionado 3D (G)", "Estúdio 3D", KeyEvent.KEYCODE_G),
+    STUDIO3D_ROTATE("Girar Selecionado 3D (R)", "Estúdio 3D", KeyEvent.KEYCODE_R),
+    STUDIO3D_SCALE("Escalar Selecionado 3D (S)", "Estúdio 3D", KeyEvent.KEYCODE_S),
+    STUDIO3D_AXIS_X("Travar Eixo X", "Estúdio 3D", KeyEvent.KEYCODE_X),
+    STUDIO3D_AXIS_Y("Travar Eixo Y", "Estúdio 3D", KeyEvent.KEYCODE_Y),
+    STUDIO3D_AXIS_Z("Travar Eixo Z", "Estúdio 3D", KeyEvent.KEYCODE_Z),
+    STUDIO3D_FOCUS("Focar Alvo Selecionado", "Estúdio 3D", KeyEvent.KEYCODE_F),
+    STUDIO3D_CAMERA_POV("Visão da Câmera (0)", "Estúdio 3D", KeyEvent.KEYCODE_0),
+    STUDIO3D_INSERT_KEY("Inserir Keyframe no Alvo (I)", "Estúdio 3D", KeyEvent.KEYCODE_I),
+    STUDIO3D_TOGGLE_NODES("Alternar Tela Dividida Nodes", "Estúdio 3D", KeyEvent.KEYCODE_N, defaultShift = true)
 }
 
 data class KeyboardShortcutBinding(

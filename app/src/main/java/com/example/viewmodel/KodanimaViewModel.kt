@@ -61,10 +61,12 @@ import com.example.engine.PreferencesStorageManager
 import com.example.engine.ProjectCompressionManager
 import com.example.engine.SavedProjectEntry
 import com.example.engine.SelectionGeometryHelper
+import com.example.engine.Studio3DPaintEngine
 import com.example.engine.TimelineTrackEngine
 import com.example.engine.WifiDirectP2pHelper
 import com.example.engine.WifiDirectPeerItem
 import com.example.model.BezierNode
+import com.example.model.BrushDynamicParams
 import com.example.model.BrushPreset
 import com.example.model.AppScreen
 import com.example.model.BucketFillConfig
@@ -89,17 +91,25 @@ import com.example.model.KeyboardShortcutBinding
 import com.example.model.LayerTransformTrack
 import com.example.model.MultiFingerGesture
 import com.example.model.NetworkTransportMode
+import com.example.model.ObjectLightSettings
+import com.example.model.ObjectOutlineSettings
+import com.example.model.ObjectShaderMode
+import com.example.model.ObjectTexturePaintLayer
 import com.example.model.ObjectTransformKeyframe
+import com.example.model.ObjectUVMapSlot
 import com.example.model.SceneObject3D
+import com.example.model.ShaderNodeGraph
 import com.example.model.StageSelection
 import com.example.model.StageTargetType
-import kotlinx.coroutines.withContext
+import com.example.model.Estudio3DPaintTool
+import com.example.model.UvUnwrapProjection
 import com.example.model.PerspectiveRulerSettings
 import com.example.model.RemoteLiveStroke
 import com.example.model.ShortcutAction
 import com.example.model.ShortcutRegistry
 import com.example.model.TouchGestureRegistry
 import com.example.model.sampleCubicBezierNodesToStrokePoints
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -208,7 +218,17 @@ data class EditorUiState(
     val exportCameraCropOnly: Boolean = true,
     val cameraViewportNavTarget: CameraViewportNavTarget = CameraViewportNavTarget.CAMERA,
     val stageSelection: StageSelection = StageSelection(StageTargetType.CAMERA, "camera"),
-    val stageFocusRequestNonce: Int = 0
+    val stageFocusRequestNonce: Int = 0,
+    val isStudio3DThreeWheelsOpen: Boolean = false,
+    val isStudio3DSplitNodesOpen: Boolean = false,
+    val isStudio3DUVUnfoldOpen: Boolean = false,
+    val studio3DPaintEnabled: Boolean = false,
+    val studio3DPaintTool: Estudio3DPaintTool = Estudio3DPaintTool.PINCEL,
+    val studio3DPaintSize: Float = 14f,
+    val studio3DPaintOpacity: Float = 1.0f,
+    val studio3DActiveAxisLock: Int = 0,          // 0=Livre, 1=X, 2=Y, 3=Z
+    val studio3DTransformShortcutMode: Int = 0,  // 0=Livre, 1=Mover(G), 2=Girar(R), 3=Escalar(S)
+    val studio3DMeshRevision: Int = 0
 )
 
 class KodanimaViewModel : ViewModel() {
@@ -265,6 +285,8 @@ class KodanimaViewModel : ViewModel() {
 
     private var playbackJob: Job? = null
     private var debouncedHostSaveJob: Job? = null
+    private var debouncedCamera3DSyncJob: Job? = null
+    private var debouncedObjTexSyncJob: Job? = null
     private var appContext: Context? = null
     private var clipboardStrokes: List<DrawingStroke> = emptyList()
     private var isContextInitialized = false
@@ -295,6 +317,8 @@ class KodanimaViewModel : ViewModel() {
         LocalServerBridge.onStopCallback = null
         playbackJob?.cancel()
         debouncedHostSaveJob?.cancel()
+        debouncedCamera3DSyncJob?.cancel()
+        debouncedObjTexSyncJob?.cancel()
         MediaAssetManager.releaseAll()
         wifiDirectHelper?.stop()
         bluetoothCoopManager?.stopAll()
@@ -419,6 +443,132 @@ class KodanimaViewModel : ViewModel() {
         }
         multiplayerEngine.onBrushDefinitionReceived = { senderId, senderName, preset ->
             handleIncomingBrushDefinition(senderId, senderName, preset)
+        }
+        multiplayerEngine.onCamera3DSyncReceived = { senderId, remoteCam ->
+            val myId = _uiState.value.userAccount.id
+            if (senderId.isBlank() || senderId != myId) {
+                var hostProjToSave: AnimationProject? = null
+                _uiState.update { state ->
+                    val existingMap = state.project.camera3D.scene3DObjects.associateBy { it.id }
+                    val mergedObjects = remoteCam.scene3DObjects.map { incomingObj ->
+                        val prev = existingMap[incomingObj.id]
+                        if (prev == null) {
+                            incomingObj
+                        } else {
+                            // Preserve heavy local textures when incoming sync omits them for low latency
+                            val mergedSlots = incomingObj.uvSlots.mapIndexed { sIdx, slot ->
+                                val prevSlot = prev.uvSlots.getOrNull(sIdx)
+                                if (slot.textureBase64.isNullOrBlank() && prevSlot != null && !prevSlot.textureBase64.isNullOrBlank()) {
+                                    slot.copy(textureBase64 = prevSlot.textureBase64)
+                                } else slot
+                            }
+                            val mergedPaint = incomingObj.paintLayers.map { pl ->
+                                val prevPl = prev.paintLayers.firstOrNull { it.id == pl.id }
+                                if (pl.pixelsBase64.isNullOrBlank() && prevPl != null && !prevPl.pixelsBase64.isNullOrBlank()) {
+                                    pl.copy(pixelsBase64 = prevPl.pixelsBase64)
+                                } else pl
+                            }
+                            val localAssetPath = if (
+                                prev.meshAssetPath.isNotBlank() &&
+                                !prev.meshAssetPath.startsWith("builtin://") &&
+                                java.io.File(prev.meshAssetPath).exists() &&
+                                !java.io.File(incomingObj.meshAssetPath).exists()
+                            ) {
+                                prev.meshAssetPath
+                            } else incomingObj.meshAssetPath
+                            incomingObj.copy(
+                                meshAssetPath = localAssetPath,
+                                uvSlots = mergedSlots,
+                                paintLayers = mergedPaint,
+                                bakedTextureBase64 = incomingObj.bakedTextureBase64 ?: prev.bakedTextureBase64
+                            )
+                        }
+                    }
+                    val mergedCam = remoteCam.copy(scene3DObjects = mergedObjects)
+                    val updatedProj = state.project.copy(
+                        camera3D = mergedCam,
+                        updatedAt = System.currentTimeMillis()
+                    )
+                    multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+                    if (state.multiplayerRole == com.example.model.MultiplayerRole.HOST) {
+                        hostProjToSave = updatedProj
+                    }
+                    state.copy(
+                        project = updatedProj,
+                        studio3DMeshRevision = state.studio3DMeshRevision + 1
+                    )
+                }
+                hostProjToSave?.let { proj ->
+                    appContext?.let { ctx -> scheduleDebouncedHostSave(ctx, proj) }
+                }
+            }
+        }
+        multiplayerEngine.onObject3DTexSyncReceived = { senderId, objectId, uvSlots, activeUvIdx, paintLayers, activePaintIdx, bakedB64 ->
+            val myId = _uiState.value.userAccount.id
+            if (senderId.isBlank() || senderId != myId) {
+                var hostProjToSave: AnimationProject? = null
+                _uiState.update { state ->
+                    val cam = state.project.camera3D
+                    val objs = cam.scene3DObjects.map { obj ->
+                        if (obj.id != objectId) obj
+                        else obj.copy(
+                            uvSlots = uvSlots,
+                            activeUvSlotIndex = activeUvIdx.coerceIn(0, (uvSlots.size - 1).coerceAtLeast(0)),
+                            paintLayers = paintLayers,
+                            activePaintLayerIndex = activePaintIdx.coerceIn(0, (paintLayers.size - 1).coerceAtLeast(0)),
+                            bakedTextureBase64 = bakedB64
+                        )
+                    }
+                    val updatedProj = state.project.copy(
+                        camera3D = cam.copy(scene3DObjects = objs),
+                        updatedAt = System.currentTimeMillis()
+                    )
+                    multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+                    if (state.multiplayerRole == com.example.model.MultiplayerRole.HOST) {
+                        hostProjToSave = updatedProj
+                    }
+                    state.copy(
+                        project = updatedProj,
+                        studio3DMeshRevision = state.studio3DMeshRevision + 1
+                    )
+                }
+                hostProjToSave?.let { proj ->
+                    appContext?.let { ctx -> scheduleDebouncedHostSave(ctx, proj) }
+                }
+            }
+        }
+        multiplayerEngine.onScene3DAssetReceived = { senderId, objectId, fileName, bytesB64 ->
+            val myId = _uiState.value.userAccount.id
+            val ctx = appContext
+            if (ctx != null && (senderId.isBlank() || senderId != myId)) {
+                viewModelScope.launch(KodanimaDispatchers.networkIo) {
+                    runCatching {
+                        val rawBytes = android.util.Base64.decode(bytesB64, android.util.Base64.DEFAULT)
+                        val dir = java.io.File(ctx.cacheDir, "shared_3d").apply { mkdirs() }
+                        val safeName = fileName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                        val outFile = java.io.File(dir, "${objectId}_$safeName")
+                        outFile.writeBytes(rawBytes)
+                        Mesh3DImporter.getOrLoadMesh(outFile.absolutePath)
+                        withContext(Dispatchers.Main) {
+                            _uiState.update { state ->
+                                val cam = state.project.camera3D
+                                val objs = cam.scene3DObjects.map { o ->
+                                    if (o.id == objectId) o.copy(meshAssetPath = outFile.absolutePath) else o
+                                }
+                                val updatedProj = state.project.copy(
+                                    camera3D = cam.copy(scene3DObjects = objs),
+                                    updatedAt = System.currentTimeMillis()
+                                )
+                                multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+                                state.copy(
+                                    project = updatedProj,
+                                    studio3DMeshRevision = state.studio3DMeshRevision + 1
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
         multiplayerEngine.onProjectSynced = { syncedProj ->
             perFrameUndoOps.clear()
@@ -1860,6 +2010,89 @@ class KodanimaViewModel : ViewModel() {
             ShortcutAction.CAMERA_FOV_WIDE -> adjustCameraFov(5f)
             ShortcutAction.CAMERA_FOV_TELE -> adjustCameraFov(-5f)
             ShortcutAction.CAMERA_RESET -> resetCameraAtCurrentFrame()
+            ShortcutAction.STUDIO3D_GRAB -> {
+                if (!_uiState.value.isCameraSideView3D) return false
+                _uiState.update {
+                    val nextMode = if (it.studio3DTransformShortcutMode == 1) 0 else 1
+                    it.copy(
+                        studio3DTransformShortcutMode = nextMode,
+                        cameraToolAction = CameraToolAction.PAN_2D,
+                        statusMessage = if (nextMode == 1) "Estúdio 3D: Mover (G) • Pressione X, Y ou Z para travar eixo" else "Estúdio 3D: Livre"
+                    )
+                }
+            }
+            ShortcutAction.STUDIO3D_ROTATE -> {
+                if (!_uiState.value.isCameraSideView3D) return false
+                _uiState.update {
+                    val nextMode = if (it.studio3DTransformShortcutMode == 2) 0 else 2
+                    it.copy(
+                        studio3DTransformShortcutMode = nextMode,
+                        cameraToolAction = CameraToolAction.ROTATE_Z,
+                        statusMessage = if (nextMode == 2) "Estúdio 3D: Girar (R) • Pressione X, Y ou Z para travar eixo" else "Estúdio 3D: Livre"
+                    )
+                }
+            }
+            ShortcutAction.STUDIO3D_SCALE -> {
+                if (!_uiState.value.isCameraSideView3D) return false
+                _uiState.update {
+                    val nextMode = if (it.studio3DTransformShortcutMode == 3) 0 else 3
+                    it.copy(
+                        studio3DTransformShortcutMode = nextMode,
+                        cameraToolAction = CameraToolAction.ZOOM,
+                        statusMessage = if (nextMode == 3) "Estúdio 3D: Escalar (S) • Use +/- ou setas" else "Estúdio 3D: Livre"
+                    )
+                }
+            }
+            ShortcutAction.STUDIO3D_AXIS_X -> {
+                if (!_uiState.value.isCameraSideView3D) return false
+                _uiState.update {
+                    val nextAxis = if (it.studio3DActiveAxisLock == 1) 0 else 1
+                    it.copy(
+                        studio3DActiveAxisLock = nextAxis,
+                        statusMessage = if (nextAxis == 1) "Eixo X travado" else "Eixo livre"
+                    )
+                }
+            }
+            ShortcutAction.STUDIO3D_AXIS_Y -> {
+                if (!_uiState.value.isCameraSideView3D) return false
+                _uiState.update {
+                    val nextAxis = if (it.studio3DActiveAxisLock == 2) 0 else 2
+                    it.copy(
+                        studio3DActiveAxisLock = nextAxis,
+                        statusMessage = if (nextAxis == 2) "Eixo Y travado" else "Eixo livre"
+                    )
+                }
+            }
+            ShortcutAction.STUDIO3D_AXIS_Z -> {
+                if (!_uiState.value.isCameraSideView3D) return false
+                _uiState.update {
+                    val nextAxis = if (it.studio3DActiveAxisLock == 3) 0 else 3
+                    it.copy(
+                        studio3DActiveAxisLock = nextAxis,
+                        statusMessage = if (nextAxis == 3) "Eixo Z travado" else "Eixo livre"
+                    )
+                }
+            }
+            ShortcutAction.STUDIO3D_FOCUS -> {
+                if (!_uiState.value.isCameraSideView3D) return false
+                focusSelectedStageTarget()
+            }
+            ShortcutAction.STUDIO3D_CAMERA_POV -> {
+                if (!_uiState.value.isCameraTimelineOpen) {
+                    toggleCameraTimeline()
+                }
+                toggleCameraSideView3D()
+            }
+            ShortcutAction.STUDIO3D_INSERT_KEY -> {
+                if (!_uiState.value.isCameraSideView3D && !_uiState.value.isCameraTimelineOpen) return false
+                addOrUpdateSelectedTargetKeyframe()
+            }
+            ShortcutAction.STUDIO3D_TOGGLE_NODES -> {
+                if (!_uiState.value.isCameraTimelineOpen) {
+                    toggleCameraTimeline()
+                }
+                toggleStudio3DSplitNodes()
+            }
         }
         return true
     }
@@ -1872,6 +2105,16 @@ class KodanimaViewModel : ViewModel() {
         val isCtrl = event.isCtrlPressed
         val isShift = event.isShiftPressed
         val normKey = normalizeShortcutKeyCode(event.keyCode)
+
+        // Always support standard Ctrl+Z (Undo) and Ctrl+Y / Ctrl+Shift+Z (Redo)
+        if (isCtrl && normKey == KeyEvent.KEYCODE_Z) {
+            if (isShift) redo() else undo()
+            return true
+        }
+        if (isCtrl && !isShift && normKey == KeyEvent.KEYCODE_Y) {
+            redo()
+            return true
+        }
 
         // Video Transform Mode physical keyboard shortcuts (Arrows move, +/- scale, [/] rotate, R reset, Enter/Esc exit)
         if (state.isVideoTransformMode) {
@@ -1892,6 +2135,67 @@ class KodanimaViewModel : ViewModel() {
             }
         }
 
+        // Estúdio 3D modal transform nudging when Grab(G) / Rotate(R) / Scale(S) is active
+        if (state.isCameraSideView3D && state.studio3DTransformShortcutMode != 0) {
+            val dir = when (normKey) {
+                KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_EQUALS -> 1f
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_MINUS -> -1f
+                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_ESCAPE -> {
+                    _uiState.update { it.copy(studio3DTransformShortcutMode = 0, studio3DActiveAxisLock = 0, statusMessage = "Transformação confirmada.") }
+                    return true
+                }
+                else -> 0f
+            }
+            if (dir != 0f) {
+                val axis = state.studio3DActiveAxisLock
+                when (state.studio3DTransformShortcutMode) {
+                    1 -> { // Grab
+                        val step = 16f * dir
+                        if (state.stageSelection.type == StageTargetType.CAMERA) {
+                            when (axis) {
+                                2 -> nudgeCameraPan(0f, step)
+                                3 -> zoomCameraBy(if (dir > 0f) 1.08f else 0.92f)
+                                else -> nudgeCameraPan(step, 0f)
+                            }
+                        } else {
+                            applySelectedStageObjectDelta(
+                                dx = if (axis == 0 || axis == 1) step else 0f,
+                                dy = if (axis == 2) step else 0f,
+                                dz = if (axis == 3) step else 0f
+                            )
+                        }
+                        return true
+                    }
+                    2 -> { // Rotate
+                        val deg = 10f * dir
+                        if (state.stageSelection.type == StageTargetType.CAMERA) {
+                            when (axis) {
+                                1 -> tiltOrbitCameraBy(0f, deg)
+                                2 -> tiltOrbitCameraBy(deg, 0f)
+                                else -> rotateCameraBy(deg)
+                            }
+                        } else {
+                            applySelectedStageObjectDelta(
+                                dRotX = if (axis == 1) deg else 0f,
+                                dRotY = if (axis == 0 || axis == 2) deg else 0f,
+                                dRotZ = if (axis == 3) deg else 0f
+                            )
+                        }
+                        return true
+                    }
+                    3 -> { // Scale
+                        val sf = if (dir > 0f) 1.1f else 0.9f
+                        if (state.stageSelection.type == StageTargetType.CAMERA) {
+                            zoomCameraBy(sf)
+                        } else {
+                            applySelectedStageObjectDelta(scaleFactor = sf)
+                        }
+                        return true
+                    }
+                }
+            }
+        }
+
         val bindings = state.preferences.keyboardShortcuts.ifEmpty { ShortcutRegistry.defaultMap() }
 
         // Always allow Enter to confirm an active Caneta Vetorial (Bézier) curve first
@@ -1907,8 +2211,27 @@ class KodanimaViewModel : ViewModel() {
             }
         }
 
-        // Dispatch user-configurable shortcut table (exact Ctrl + Shift + Key match first)
+        // Priority 1 in Estúdio 3D: dispatch STUDIO3D_* actions before 2D drawing tools
+        if (state.isCameraSideView3D) {
+            for (action in ShortcutAction.entries) {
+                if (!action.name.startsWith("STUDIO3D_")) continue
+                val binding = bindings[action] ?: continue
+                if (normalizeShortcutKeyCode(binding.keyCode) == normKey &&
+                    binding.ctrl == isCtrl &&
+                    binding.shift == isShift
+                ) {
+                    if (executeShortcutAction(action, context)) {
+                        return true
+                    }
+                }
+            }
+        }
+
+        // Dispatch remaining user-configurable shortcut table (exact Ctrl + Shift + Key match)
         for (action in ShortcutAction.entries) {
+            if (action.name.startsWith("STUDIO3D_") && action != ShortcutAction.STUDIO3D_TOGGLE_NODES && action != ShortcutAction.STUDIO3D_CAMERA_POV) {
+                continue
+            }
             val binding = bindings[action] ?: continue
             if (normalizeShortcutKeyCode(binding.keyCode) == normKey &&
                 binding.ctrl == isCtrl &&
@@ -6255,6 +6578,7 @@ class KodanimaViewModel : ViewModel() {
                 )
             )
         }
+        scheduleCamera3DSyncIfCoop()
     }
 
     fun addOrUpdateCameraKeyframeAtCurrentFrame(easing: CameraEasingCurve? = null) {
@@ -6444,6 +6768,7 @@ class KodanimaViewModel : ViewModel() {
                 statusMessage = msg
             )
         }
+        scheduleCamera3DSyncIfCoop()
     }
 
     fun addSelectedTargetKeyframeAtTick(tick: Int, easing: CameraEasingCurve? = null) {
@@ -6979,6 +7304,7 @@ class KodanimaViewModel : ViewModel() {
                 )
             )
         }
+        scheduleCamera3DSyncIfCoop()
     }
 
     fun applySelectedStageObjectDelta(
@@ -7092,6 +7418,7 @@ class KodanimaViewModel : ViewModel() {
                 statusMessage = "${sceneData.name} adicionado à cena 3D!"
             )
         }
+        scheduleCamera3DSyncIfCoop()
     }
 
     fun import3DSceneFromUri(context: Context, uri: Uri) {
@@ -7102,7 +7429,7 @@ class KodanimaViewModel : ViewModel() {
             }
             if (imported == null) {
                 _uiState.update {
-                    it.copy(statusMessage = "Não foi possível ler a cena 3D. Use .glb, .gltf, .obj, .zip (com .mtl/.png), .stl ou .ply.")
+                    it.copy(statusMessage = "Não foi possível ler a cena 3D. Use .glb, .gltf, .obj, .fbx, .max, .3ds ou .zip.")
                 }
                 return@launch
             }
@@ -7137,6 +7464,22 @@ class KodanimaViewModel : ViewModel() {
                     }
                 )
             }
+            scheduleCamera3DSyncIfCoop(includeTextures = true)
+            if (_uiState.value.multiplayerRole != com.example.model.MultiplayerRole.NONE) {
+                withContext(KodanimaDispatchers.networkIo) {
+                    runCatching {
+                        val f = java.io.File(assetPath)
+                        if (f.exists() && f.length() in 1L..(6L * 1024L * 1024L)) {
+                            multiplayerEngine.sendScene3DAsset(
+                                senderId = _uiState.value.userAccount.id,
+                                objectId = newObj.id,
+                                fileName = f.name,
+                                rawBytes = f.readBytes()
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -7151,6 +7494,7 @@ class KodanimaViewModel : ViewModel() {
                 )
             )
         }
+        scheduleCamera3DSyncIfCoop()
     }
 
     fun deleteSceneObject3D(objectId: String) {
@@ -7169,6 +7513,7 @@ class KodanimaViewModel : ViewModel() {
                 statusMessage = "Objeto 3D removido da cena."
             )
         }
+        scheduleCamera3DSyncIfCoop()
     }
 
     fun setSceneObject3DTint(objectId: String, colorArgb: Long) {
@@ -7181,6 +7526,279 @@ class KodanimaViewModel : ViewModel() {
                     updatedAt = System.currentTimeMillis()
                 )
             )
+        }
+        scheduleCamera3DSyncIfCoop()
+    }
+
+    // --- Estúdio 3D: 3 Rodas (UVs, Shader, Iluminação, Nodes & Pintura 3D) ---
+
+    fun toggleStudio3DThreeWheels() {
+        _uiState.update { state ->
+            val nextOpen = !state.isStudio3DThreeWheelsOpen
+            val fallbackObjId = state.project.camera3D.scene3DObjects.firstOrNull()?.id
+            val nextSel = if (nextOpen && state.stageSelection.type != StageTargetType.OBJECT_3D && fallbackObjId != null) {
+                StageSelection(StageTargetType.OBJECT_3D, fallbackObjId)
+            } else state.stageSelection
+            state.copy(
+                isStudio3DThreeWheelsOpen = nextOpen,
+                stageSelection = nextSel
+            )
+        }
+    }
+
+    fun closeStudio3DThreeWheels() {
+        _uiState.update { it.copy(isStudio3DThreeWheelsOpen = false) }
+    }
+
+    fun toggleStudio3DSplitNodes() {
+        _uiState.update { state ->
+            val nextOpen = !state.isStudio3DSplitNodesOpen
+            val fallbackObjId = state.project.camera3D.scene3DObjects.firstOrNull()?.id
+            val nextSel = if (nextOpen && state.stageSelection.type != StageTargetType.OBJECT_3D && fallbackObjId != null) {
+                StageSelection(StageTargetType.OBJECT_3D, fallbackObjId)
+            } else state.stageSelection
+            state.copy(
+                isStudio3DSplitNodesOpen = nextOpen,
+                isCameraSideView3D = if (nextOpen) true else state.isCameraSideView3D,
+                stageSelection = nextSel
+            )
+        }
+    }
+
+    fun closeStudio3DSplitNodes() {
+        _uiState.update { it.copy(isStudio3DSplitNodesOpen = false) }
+    }
+
+    fun toggleStudio3DUVUnfold() {
+        _uiState.update { it.copy(isStudio3DUVUnfoldOpen = !it.isStudio3DUVUnfoldOpen) }
+    }
+
+    fun setStudio3DPaintEnabled(enabled: Boolean) {
+        _uiState.update { state ->
+            val fallbackObjId = state.project.camera3D.scene3DObjects.firstOrNull()?.id
+            val nextSel = if (enabled && state.stageSelection.type != StageTargetType.OBJECT_3D && fallbackObjId != null) {
+                StageSelection(StageTargetType.OBJECT_3D, fallbackObjId)
+            } else state.stageSelection
+            state.copy(
+                studio3DPaintEnabled = enabled,
+                stageSelection = nextSel,
+                statusMessage = if (enabled) "Pintura 3D ativada — toque no objeto ou no UV!" else "Pintura 3D pausada"
+            )
+        }
+    }
+
+    fun setStudio3DPaintTool(tool: Estudio3DPaintTool) {
+        _uiState.update { it.copy(studio3DPaintTool = tool) }
+    }
+
+    fun setStudio3DPaintSize(size: Float) {
+        _uiState.update { it.copy(studio3DPaintSize = size.coerceIn(2f, 96f)) }
+    }
+
+    fun setStudio3DPaintOpacity(opacity: Float) {
+        _uiState.update { it.copy(studio3DPaintOpacity = opacity.coerceIn(0.05f, 1f)) }
+    }
+
+    fun updateSceneObject3D(objectId: String, bumpRevision: Boolean = true, transform: (SceneObject3D) -> SceneObject3D) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val objs = cam.scene3DObjects.map { if (it.id == objectId) transform(it) else it }
+            state.copy(
+                studio3DMeshRevision = if (bumpRevision) state.studio3DMeshRevision + 1 else state.studio3DMeshRevision,
+                project = state.project.copy(
+                    camera3D = cam.copy(scene3DObjects = objs),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+        scheduleCamera3DSyncIfCoop()
+    }
+
+    fun paintSceneObjectSurfaceSegment(
+        objectId: String,
+        u0: Float,
+        v0: Float,
+        u1: Float,
+        v1: Float
+    ) {
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val preset = state.activeBrushPreset
+            val customParams = if (preset.id !in 1..12 || preset.dynamicParams != BrushDynamicParams()) {
+                preset.dynamicParams.toCompactJson()
+            } else null
+            val objs = cam.scene3DObjects.map { obj ->
+                if (obj.id != objectId) obj
+                else {
+                    val baseLayers = obj.paintLayers.ifEmpty {
+                        listOf(ObjectTexturePaintLayer(name = "Camada 1"))
+                    }
+                    val targetIdx = obj.activePaintLayerIndex.coerceIn(0, baseLayers.lastIndex)
+                    val updatedLayer = Studio3DPaintEngine.paintStrokeSegmentOnLayer(
+                        layer = baseLayers[targetIdx],
+                        u0 = u0,
+                        v0 = v0,
+                        u1 = u1,
+                        v1 = v1,
+                        tool = state.studio3DPaintTool,
+                        colorArgb = state.currentColor,
+                        brushSizePx = state.studio3DPaintSize,
+                        opacity = state.studio3DPaintOpacity,
+                        brushPresetId = preset.id,
+                        customBrushParams = customParams
+                    )
+                    val nextLayers = baseLayers.toMutableList().apply { set(targetIdx, updatedLayer) }
+                    obj.copy(
+                        paintLayers = nextLayers,
+                        activePaintLayerIndex = targetIdx
+                    )
+                }
+            }
+            val updatedProj = state.project.copy(
+                camera3D = cam.copy(scene3DObjects = objs),
+                updatedAt = System.currentTimeMillis()
+            )
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(
+                studio3DMeshRevision = state.studio3DMeshRevision + 1,
+                project = updatedProj
+            )
+        }
+        scheduleObject3DTexSyncIfCoop(objectId)
+    }
+
+    fun mergeSceneObjectPaintLayers(objectId: String) {
+        var syncedObj: SceneObject3D? = null
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val objs = cam.scene3DObjects.map { obj ->
+                if (obj.id != objectId) obj
+                else {
+                    val firstSm = Mesh3DImporter.getOrLoadMesh(obj.meshAssetPath)?.subMeshes?.firstOrNull()
+                    val mergedB64 = Studio3DPaintEngine.mergePaintLayersIntoSingleUv(obj, firstSm, texSize = 512)
+                    val activeSlot = obj.uvSlots.getOrNull(obj.activeUvSlotIndex) ?: obj.uvSlots.firstOrNull() ?: ObjectUVMapSlot()
+                    val mergedSlot = activeSlot.copy(
+                        name = "UV Mesclado",
+                        textureBase64 = mergedB64
+                    )
+                    val nextObj = obj.copy(
+                        uvSlots = listOf(mergedSlot),
+                        activeUvSlotIndex = 0,
+                        paintLayers = emptyList(),
+                        activePaintLayerIndex = 0,
+                        bakedTextureBase64 = mergedB64
+                    )
+                    syncedObj = nextObj
+                    nextObj
+                }
+            }
+            val updatedProj = state.project.copy(
+                camera3D = cam.copy(scene3DObjects = objs),
+                updatedAt = System.currentTimeMillis()
+            )
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(
+                studio3DMeshRevision = state.studio3DMeshRevision + 1,
+                project = updatedProj,
+                statusMessage = "Camadas mescladas em 1 UV só!"
+            )
+        }
+        syncedObj?.let { obj ->
+            if (_uiState.value.multiplayerRole != com.example.model.MultiplayerRole.NONE) {
+                multiplayerEngine.sendObject3DTextureSync(_uiState.value.userAccount.id, obj)
+            }
+        }
+    }
+
+    fun applySceneObjectSlotTextureUri(context: Context, objectId: String, slotIndex: Int, uri: Uri) {
+        viewModelScope.launch {
+            val encodedB64 = withContext(KodanimaDispatchers.networkIo) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                        val decoded = android.graphics.BitmapFactory.decodeStream(stream) ?: return@use null
+                        val maxDim = 512
+                        val w = decoded.width.coerceAtLeast(1)
+                        val h = decoded.height.coerceAtLeast(1)
+                        val scaled = if (w > maxDim || h > maxDim) {
+                            val ratio = maxDim.toFloat() / max(w, h).toFloat()
+                            val tw = (w * ratio).roundToInt().coerceAtLeast(1)
+                            val th = (h * ratio).roundToInt().coerceAtLeast(1)
+                            android.graphics.Bitmap.createScaledBitmap(decoded, tw, th, true).also {
+                                if (it !== decoded && !decoded.isRecycled) decoded.recycle()
+                            }
+                        } else decoded
+                        val b64 = Studio3DPaintEngine.encodeBitmapToPngBase64(scaled)
+                        if (!scaled.isRecycled) scaled.recycle()
+                        b64
+                    }
+                }.getOrNull()
+            }
+            if (encodedB64.isNullOrBlank()) {
+                _uiState.update { it.copy(statusMessage = "Não foi possível carregar a textura selecionada.") }
+                return@launch
+            }
+            var syncedObj: SceneObject3D? = null
+            _uiState.update { state ->
+                val cam = state.project.camera3D
+                val objs = cam.scene3DObjects.map { obj ->
+                    if (obj.id != objectId) obj
+                    else {
+                        val slots = obj.uvSlots.ifEmpty { listOf(ObjectUVMapSlot()) }.toMutableList()
+                        val idx = slotIndex.coerceIn(0, slots.lastIndex)
+                        slots[idx] = slots[idx].copy(textureBase64 = encodedB64, textureUri = uri.toString())
+                        val nextObj = obj.copy(
+                            uvSlots = slots,
+                            activeUvSlotIndex = idx,
+                            bakedTextureBase64 = null
+                        )
+                        syncedObj = nextObj
+                        nextObj
+                    }
+                }
+                val updatedProj = state.project.copy(
+                    camera3D = cam.copy(scene3DObjects = objs),
+                    updatedAt = System.currentTimeMillis()
+                )
+                multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+                state.copy(
+                    studio3DMeshRevision = state.studio3DMeshRevision + 1,
+                    project = updatedProj,
+                    statusMessage = "Textura aplicada ao UVMap!"
+                )
+            }
+            syncedObj?.let { obj ->
+                if (_uiState.value.multiplayerRole != com.example.model.MultiplayerRole.NONE) {
+                    multiplayerEngine.sendObject3DTextureSync(_uiState.value.userAccount.id, obj)
+                }
+            }
+        }
+    }
+
+    private fun scheduleCamera3DSyncIfCoop(includeTextures: Boolean = false) {
+        val role = _uiState.value.multiplayerRole
+        if (role == com.example.model.MultiplayerRole.NONE) return
+        multiplayerEngine.updateHostedProjectSnapshot(_uiState.value.project)
+        debouncedCamera3DSyncJob?.cancel()
+        debouncedCamera3DSyncJob = viewModelScope.launch(KodanimaDispatchers.networkIo) {
+            delay(90L)
+            val snap = _uiState.value
+            if (snap.multiplayerRole != com.example.model.MultiplayerRole.NONE) {
+                multiplayerEngine.sendCamera3DSync(snap.userAccount.id, snap.project.camera3D, includeTextures = includeTextures)
+            }
+        }
+    }
+
+    private fun scheduleObject3DTexSyncIfCoop(objectId: String) {
+        val role = _uiState.value.multiplayerRole
+        if (role == com.example.model.MultiplayerRole.NONE) return
+        debouncedObjTexSyncJob?.cancel()
+        debouncedObjTexSyncJob = viewModelScope.launch(KodanimaDispatchers.networkIo) {
+            delay(180L)
+            val snap = _uiState.value
+            val obj = snap.project.camera3D.scene3DObjects.firstOrNull { it.id == objectId } ?: return@launch
+            if (snap.multiplayerRole != com.example.model.MultiplayerRole.NONE) {
+                multiplayerEngine.sendObject3DTextureSync(snap.userAccount.id, obj)
+            }
         }
     }
 }
