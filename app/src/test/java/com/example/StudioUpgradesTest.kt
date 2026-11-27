@@ -2212,14 +2212,17 @@ class StudioUpgradesTest {
         val cubeMesh = Mesh3DImporter.getOrLoadMesh(cubeUri)!!
         val verts = cubeMesh.subMeshes.first().vertices
 
-        // 1. UV Projection unwrapping modes
+        // 1. UV Projection unwrapping modes (CUBE vertices lie on bbox corners so PLANAR/BOX map to 0f/1f; SPHERE has interior UVs)
+        val (_, sphereUri) = Pair(cubeUri, Mesh3DImporter.createBuiltInSceneAsset(BuiltIn3DPrimitive.SPHERE).first)
+        val sphereVerts = Mesh3DImporter.getOrLoadMesh(sphereUri)!!.subMeshes.first().vertices
         for (proj in listOf(UvUnwrapProjection.PLANAR, UvUnwrapProjection.BOX, UvUnwrapProjection.ESFERICO, UvUnwrapProjection.CILINDRICO)) {
+            val targetVerts = if (proj == UvUnwrapProjection.PLANAR || proj == UvUnwrapProjection.BOX) sphereVerts else verts
             val gen = Studio3DPaintEngine.generateUVsForProjection(
-                vertices = verts,
-                existingUvs = cubeMesh.subMeshes.first().uvs,
+                vertices = targetVerts,
+                existingUvs = FloatArray((targetVerts.size / 3) * 2),
                 slot = ObjectUVMapSlot(projection = proj, scaleU = 1f, scaleV = 1f)
             )
-            assertEquals((verts.size / 3) * 2, gen.size)
+            assertEquals((targetVerts.size / 3) * 2, gen.size)
             assertTrue("Projection $proj must produce valid UV range", gen.any { it in 0.01f..0.99f })
         }
 
@@ -2572,6 +2575,7 @@ class StudioUpgradesTest {
         assertTrue(vm.uiState.value.customShaderNodePresets.isEmpty())
     }
 
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
     @Test
     fun testGifLzwQuality_nonCropped3DRender_mtlQuotedImport_andUvVertexEditor() {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -2791,9 +2795,10 @@ class StudioUpgradesTest {
         assertFalse(vm.uiState.value.isStudio3DUvEditorOpen)
     }
 
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
     @Test
     fun `viewport overscan adds 4px+ margin, bucket gap-closing prevents leaks, and frame local layers toggle below or above frame strokes`() {
-        val context = RuntimeEnvironment.getApplication()
+        val context = ApplicationProvider.getApplicationContext<Context>()
 
         // 1. Viewport cache overscan margin >= 4px beyond screen resolution
         val dims = KodanimaGraphicsEngine.computeViewportCacheDimensions(

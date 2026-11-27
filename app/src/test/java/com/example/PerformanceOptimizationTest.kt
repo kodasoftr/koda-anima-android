@@ -795,8 +795,8 @@ class PerformanceOptimizationTest {
     }
 
     @Test
-    fun `app version config matches 2_5 release metadata`() {
-        assertEquals("2.5", BuildConfig.VERSION_NAME)
-        assertEquals(25, BuildConfig.VERSION_CODE)
+    fun `app version config matches 3_0 release metadata`() {
+        assertEquals("3.0", BuildConfig.VERSION_NAME)
+        assertEquals(30, BuildConfig.VERSION_CODE)
     }
 }
