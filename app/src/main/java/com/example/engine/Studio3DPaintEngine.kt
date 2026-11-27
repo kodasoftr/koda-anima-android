@@ -100,15 +100,20 @@ object Studio3DPaintEngine {
     }
 
     /**
-     * Generates effective UV coordinates for a submesh given an ObjectUVMapSlot projection & tiling.
+     * Generates effective UV coordinates for a submesh given an ObjectUVMapSlot projection, tiling, or custom edited UVs.
      */
     fun generateUVsForProjection(
         vertices: FloatArray,
         existingUvs: FloatArray,
-        slot: ObjectUVMapSlot
+        slot: ObjectUVMapSlot,
+        vertexOffset: Int = 0
     ): FloatArray {
         val vCount = vertices.size / 3
         if (vCount <= 0) return FloatArray(0)
+        val startFlat = vertexOffset.coerceAtLeast(0) * 2
+        if (slot.customUvs.size >= startFlat + vCount * 2) {
+            return FloatArray(vCount * 2) { idx -> slot.customUvs[startFlat + idx] }
+        }
         val out = FloatArray(vCount * 2)
 
         if (slot.projection == UvUnwrapProjection.ORIGINAL) {
@@ -249,11 +254,15 @@ object Studio3DPaintEngine {
 
         var bestDepth = Float.MAX_VALUE
         var bestResult: TrianglePickResult? = null
+        var vertOffset = 0
 
         for (smIdx in activeSubMeshes.indices) {
             val sm = activeSubMeshes[smIdx]
             val vCount = sm.vertices.size / 3
-            if (vCount < 3 || sm.indices.size < 3) continue
+            if (vCount < 3 || sm.indices.size < 3) {
+                vertOffset += vCount
+                continue
+            }
             val verts = sm.vertices
             val projX = FloatArray(vCount)
             val projY = FloatArray(vCount)
@@ -294,7 +303,8 @@ object Studio3DPaintEngine {
                 invZ[vi] = iz
             }
 
-            val effUvs = generateUVsForProjection(verts, sm.uvs, activeSlot)
+            val effUvs = generateUVsForProjection(verts, sm.uvs, activeSlot, vertOffset)
+            vertOffset += vCount
             val indices = sm.indices
             var tri = 0
             while (tri + 2 < indices.size) {
@@ -623,8 +633,8 @@ object Studio3DPaintEngine {
         val bakedBuf = decodePixelsFromBase64(obj.bakedTextureBase64)
         val outW = bakedBuf?.width ?: slotBuf?.width ?: (if (basePixels != null && baseW > 0) baseW else 256)
         val outH = bakedBuf?.height ?: slotBuf?.height ?: (if (basePixels != null && baseH > 0) baseH else 256)
-        val targetW = outW.coerceIn(64, 512)
-        val targetH = outH.coerceIn(64, 512)
+        val targetW = outW.coerceIn(64, 1024)
+        val targetH = outH.coerceIn(64, 1024)
 
         val compBmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(compBmp)

@@ -112,6 +112,18 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.roundToInt
 
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Grain
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Save
+import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import com.example.model.CustomShaderNodePreset
+import com.example.model.StageShadingMode
+
 private val STUDIO_3D_SWATCHES = listOf(
     0xFF10131CL, 0xFFFFFFFFL, 0xFF00E5FFL, 0xFFFF3366L,
     0xFFFF9100L, 0xFF39FF14L, 0xFFFFD54FL, 0xFF8E44ADL
@@ -119,9 +131,10 @@ private val STUDIO_3D_SWATCHES = listOf(
 
 /**
  * Estúdio 3D "3 Rodas" Sheet:
+ * - Controles globais do Palco 3D: Importar 3D (.glb/.gltf/.obj/.fbx/.max/.3ds/.zip/.rar), 4 Modos de Visualização, Ocultar/Mostrar Grade do Chão
  * - Tab 0: Textura & UV (UVMaps, projeções Planar/Box/Esférico/Cilíndrico, escala/offset, importar textura, Janela UV Desdobrado)
  * - Tab 1: Shader & Luz (PBR / Cel Anime / Cartoon Brush / Sem Luz / Aramado, Contorno, Iluminação própria)
- * - Tab 2: Pintura 3D (Pintar no objeto 3D com Pincel nativo/importado, Borracha, Molhador, Camadas & Mesclar em 1 UV só)
+ * - Tab 2: Pintura UV (abre tela cheia dedicada "Pintura UV" + Exportar Objeto 3D + Mesclar Camadas)
  */
 @Composable
 fun Studio3DThreeWheelsSheet(
@@ -132,7 +145,15 @@ fun Studio3DThreeWheelsSheet(
     onPickTextureImage: (String, Int) -> Unit,
     isUvUnfoldOpen: Boolean,
     onToggleUvUnfold: () -> Unit,
+    onOpenUvVertexEditor: () -> Unit = {},
     onOpenSplitNodes: () -> Unit,
+    onOpenFullscreenUvPaint: () -> Unit = {},
+    onRequestImport3D: () -> Unit = {},
+    onExportObjectZip: (SceneObject3D) -> Unit = {},
+    shadingMode: StageShadingMode = StageShadingMode.RENDERED,
+    onSelectShadingMode: (StageShadingMode) -> Unit = {},
+    showFloorGrid: Boolean = true,
+    onToggleFloorGrid: () -> Unit = {},
     studio3DPaintEnabled: Boolean,
     onToggleStudio3DPaint: (Boolean) -> Unit,
     paintTool: Estudio3DPaintTool,
@@ -193,8 +214,17 @@ fun Studio3DThreeWheelsSheet(
                 }
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
+                    StudioPill(
+                        label = "Importar 3D",
+                        selected = false,
+                        accent = CyanAccent,
+                        textColor = textColor,
+                        icon = Icons.Default.FolderOpen,
+                        testTag = "wheels_import_3d_btn"
+                    ) { onRequestImport3D() }
+
                     StudioPill(
                         label = "Nodes",
                         selected = false,
@@ -207,7 +237,8 @@ fun Studio3DThreeWheelsSheet(
                     IconButton(
                         onClick = onClose,
                         modifier = Modifier
-                            .size(32.dp)
+                            .size(36.dp)
+                            .minimumInteractiveComponentSize()
                             .testTag("wheels_close_btn")
                     ) {
                         Icon(Icons.Default.Close, contentDescription = "Fechar 3 Rodas", tint = textColor, modifier = Modifier.size(18.dp))
@@ -215,13 +246,57 @@ fun Studio3DThreeWheelsSheet(
                 }
             }
 
+            // 4 Modos de Visualização do Blender + Ocultar Grade do Chão
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Visão:", fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.78f))
+                StageShadingMode.entries.forEach { mode ->
+                    StudioPill(
+                        label = mode.labelPt,
+                        selected = shadingMode == mode,
+                        accent = OrangeAccent,
+                        textColor = textColor,
+                        testTag = "wheels_shading_${mode.name}"
+                    ) { onSelectShadingMode(mode) }
+                }
+                StudioPill(
+                    label = if (showFloorGrid) "Grade: ON" else "Grade: OFF",
+                    selected = showFloorGrid,
+                    accent = if (showFloorGrid) NeonGreen else NeonPink,
+                    textColor = textColor,
+                    icon = if (showFloorGrid) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                    testTag = "wheels_floor_grid_toggle"
+                ) { onToggleFloorGrid() }
+            }
+
             if (sceneObjects.isEmpty() || selectedObj == null) {
-                Text(
-                    text = "Adicione ou importe um objeto 3D (OBJ, GLB, FBX, MAX ou 3DS) no palco para configurar UV, Shader, Nodes e Pintura 3D.",
-                    fontSize = 11.sp,
-                    color = textColor.copy(alpha = 0.78f),
-                    modifier = Modifier.padding(vertical = 12.dp)
-                )
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Importe modelos 3D (OBJ, GLB, GLTF, FBX, MAX, 3DS, ZIP ou RAR — com UVs, texturas e ossos automáticos) ou adicione uma primitiva em Cenas 3D.",
+                        fontSize = 11.sp,
+                        color = textColor.copy(alpha = 0.8f)
+                    )
+                    Button(
+                        onClick = onRequestImport3D,
+                        modifier = Modifier.fillMaxWidth().height(40.dp).testTag("wheels_empty_import_btn"),
+                        colors = ButtonDefaults.buttonColors(containerColor = CyanAccent),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, tint = Color.Black, modifier = Modifier.size(17.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Importar Arquivo 3D / ZIP / RAR", fontSize = 11.sp, fontWeight = FontWeight.ExtraBold, color = Color.Black)
+                    }
+                }
                 return@Column
             }
 
@@ -271,7 +346,7 @@ fun Studio3DThreeWheelsSheet(
                 ) { activeTab = 1 }
 
                 StudioPill(
-                    label = "Pintura 3D",
+                    label = "Pintura UV",
                     selected = activeTab == 2,
                     accent = NeonPink,
                     textColor = textColor,
@@ -358,7 +433,7 @@ fun Studio3DThreeWheelsSheet(
                                         val updated = cur.uvSlots.toMutableList()
                                         if (updated.isEmpty()) updated.add(ObjectUVMapSlot())
                                         val i = cur.activeUvSlotIndex.coerceIn(0, updated.lastIndex)
-                                        updated[i] = updated[i].copy(projection = proj)
+                                        updated[i] = updated[i].copy(projection = proj, customUvs = emptyList())
                                         cur.copy(uvSlots = updated)
                                     }
                                 }
@@ -439,20 +514,20 @@ fun Studio3DThreeWheelsSheet(
                                 onClick = { onPickTextureImage(selectedObj.id, activeIdx) },
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(38.dp)
+                                    .heightIn(min = 42.dp)
                                     .testTag("uv_pick_texture_btn"),
                                 colors = ButtonDefaults.buttonColors(containerColor = OrangeAccent),
                                 shape = RoundedCornerShape(10.dp)
                             ) {
                                 Icon(Icons.Default.Image, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.Black)
                                 Spacer(Modifier.width(5.dp))
-                                Text("Carregar Textura", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                                Text("Carregar Textura", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Black, maxLines = 1)
                             }
                             Button(
                                 onClick = onToggleUvUnfold,
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(38.dp)
+                                    .heightIn(min = 42.dp)
                                     .testTag("uv_unfold_window_btn"),
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = if (isUvUnfoldOpen) CyanAccent else Color(0xFF283044)
@@ -470,9 +545,31 @@ fun Studio3DThreeWheelsSheet(
                                     "Janela UV",
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = if (isUvUnfoldOpen) Color.Black else textColor
+                                    color = if (isUvUnfoldOpen) Color.Black else textColor,
+                                    maxLines = 1
                                 )
                             }
+                        }
+
+                        Button(
+                            onClick = onOpenUvVertexEditor,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 44.dp)
+                                .testTag("uv_open_vertex_editor_btn"),
+                            colors = ButtonDefaults.buttonColors(containerColor = CyanAccent.copy(alpha = 0.22f)),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, CyanAccent),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Grain, contentDescription = null, modifier = Modifier.size(17.dp), tint = CyanAccent)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "Editar Pontos UV (Malha Plana)",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = CyanAccent,
+                                maxLines = 1
+                            )
                         }
                     }
 
@@ -628,231 +725,95 @@ fun Studio3DThreeWheelsSheet(
                     }
 
                     // =====================================================
-                    // TAB 2: PINTURA 3D (PINCEL / BORRACHA / MOLHADOR + CAMADAS + MESCLAR UV)
+                    // TAB 2: PINTURA UV (TELA CHEIA DEDICADA + EXPORTAR OBJETO)
                     // =====================================================
                     else -> {
+                        Text(
+                            text = "Pintura UV dedicada em tela cheia para '${selectedObj.name}', com barra de ferramentas, pincéis 2D, camadas, gestos de órbita/zoom e exportação.",
+                            fontSize = 10.5.sp,
+                            color = textColor.copy(alpha = 0.82f)
+                        )
+
+                        Button(
+                            onClick = onOpenFullscreenUvPaint,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp)
+                                .testTag("wheels_open_uv_paint_screen_btn"),
+                            colors = ButtonDefaults.buttonColors(containerColor = NeonPink),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.Brush, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(7.dp))
+                            Text(
+                                "Abrir Pintura UV (Tela Cheia)",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color.White
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = { onMergePaintLayers(selectedObj.id) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(38.dp)
+                                    .testTag("paint3d_merge_uv_btn"),
+                                colors = ButtonDefaults.buttonColors(containerColor = NeonGreen),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.MergeType, contentDescription = null, tint = Color.Black, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(5.dp))
+                                Text(
+                                    "Mesclar 1 UV (${selectedObj.paintLayers.size})",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color.Black,
+                                    maxLines = 1
+                                )
+                            }
+
+                            Button(
+                                onClick = { onExportObjectZip(selectedObj) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(38.dp)
+                                    .testTag("wheels_export_obj_btn"),
+                                colors = ButtonDefaults.buttonColors(containerColor = CyanAccent),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.Download, contentDescription = null, tint = Color.Black, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(5.dp))
+                                Text(
+                                    "Exportar Objeto",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color.Black,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column {
-                                Text("Pintar Direto no Objeto 3D", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = NeonPink)
-                                Text(
-                                    "Arraste sobre a malha 3D ou na Janela UV",
-                                    fontSize = 9.sp,
-                                    color = textColor.copy(alpha = 0.7f)
-                                )
-                            }
+                            Text(
+                                text = "Pintura rápida no Palco 3D",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = textColor.copy(alpha = 0.8f)
+                            )
                             Switch(
                                 checked = studio3DPaintEnabled,
                                 onCheckedChange = onToggleStudio3DPaint,
                                 modifier = Modifier.testTag("studio3d_paint_toggle"),
                                 colors = SwitchDefaults.colors(checkedThumbColor = NeonPink)
-                            )
-                        }
-
-                        // Tool Selector: Pincel, Borracha, Molhador
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Estudio3DPaintTool.entries.forEach { t ->
-                                val ic = when (t) {
-                                    Estudio3DPaintTool.PINCEL -> Icons.Default.Brush
-                                    Estudio3DPaintTool.BORRACHA -> Icons.Default.DeleteOutline
-                                    Estudio3DPaintTool.MOLHADOR -> Icons.Default.WaterDrop
-                                }
-                                StudioPill(
-                                    label = t.labelPt,
-                                    selected = paintTool == t,
-                                    accent = when (t) {
-                                        Estudio3DPaintTool.PINCEL -> NeonPink
-                                        Estudio3DPaintTool.BORRACHA -> OrangeAccent
-                                        Estudio3DPaintTool.MOLHADOR -> CyanAccent
-                                    },
-                                    textColor = textColor,
-                                    icon = ic,
-                                    testTag = "paint3d_tool_${t.name}",
-                                    modifier = Modifier.weight(1f)
-                                ) { onSelectPaintTool(t) }
-                            }
-                        }
-
-                        // Active Brushes Strip (12 Native + Imported)
-                        Text("Pincéis Nativos & Importados:", fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = textColor.copy(alpha = 0.8f))
-                        val allBrushes = remember(importedBrushes) {
-                            BrushPreset.ALL_12_PRESETS + importedBrushes
-                        }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp)
-                        ) {
-                            allBrushes.forEach { preset ->
-                                StudioPill(
-                                    label = preset.namePt,
-                                    selected = activeBrushId == preset.id,
-                                    accent = NeonPink,
-                                    textColor = textColor,
-                                    testTag = "paint3d_brush_${preset.id}"
-                                ) { onSelectBrushPreset(preset) }
-                            }
-                        }
-
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            StudioSlider(
-                                label = "Tamanho",
-                                valueText = "${paintSize.roundToInt()}px",
-                                value = paintSize,
-                                range = 3f..64f,
-                                accent = NeonPink,
-                                textColor = textColor,
-                                modifier = Modifier.weight(1f)
-                            ) { onChangePaintSize(it) }
-                            StudioSlider(
-                                label = "Opacidad.",
-                                valueText = "${(paintOpacity * 100).roundToInt()}%",
-                                value = paintOpacity,
-                                range = 0.08f..1f,
-                                accent = CyanAccent,
-                                textColor = textColor,
-                                modifier = Modifier.weight(1f)
-                            ) { onChangePaintOpacity(it) }
-                        }
-
-                        // Paint Layers & Merge into 1 UV
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Icon(Icons.Default.Layers, contentDescription = null, tint = OrangeAccent, modifier = Modifier.size(14.dp))
-                                Text("Camadas de Pintura (${selectedObj.paintLayers.size})", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
-                            }
-                            StudioPill(
-                                label = "+ Camada",
-                                selected = false,
-                                accent = NeonGreen,
-                                textColor = textColor,
-                                icon = Icons.Default.Add,
-                                testTag = "paint3d_add_layer_btn"
-                            ) {
-                                onUpdateObject(selectedObj.id, true) { cur ->
-                                    val newLayer = ObjectTexturePaintLayer(
-                                        name = "Camada ${cur.paintLayers.size + 1}"
-                                    )
-                                    val nextList = cur.paintLayers + newLayer
-                                    cur.copy(paintLayers = nextList, activePaintLayerIndex = nextList.lastIndex)
-                                }
-                            }
-                        }
-
-                        selectedObj.paintLayers.forEachIndexed { idx, pLayer ->
-                            val isActiveLayer = idx == selectedObj.activePaintLayerIndex
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(if (isActiveLayer) NeonPink.copy(alpha = 0.16f) else textColor.copy(alpha = 0.07f))
-                                    .border(
-                                        width = if (isActiveLayer) 1.dp else 0.5.dp,
-                                        color = if (isActiveLayer) NeonPink else textColor.copy(alpha = 0.16f),
-                                        shape = RoundedCornerShape(8.dp)
-                                    )
-                                    .clickable {
-                                        onUpdateObject(selectedObj.id, true) { it.copy(activePaintLayerIndex = idx) }
-                                    }
-                                    .padding(horizontal = 8.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                IconButton(
-                                    onClick = {
-                                        onUpdateObject(selectedObj.id, true) { cur ->
-                                            val list = cur.paintLayers.toMutableList()
-                                            list[idx] = list[idx].copy(isVisible = !list[idx].isVisible)
-                                            cur.copy(paintLayers = list)
-                                        }
-                                    },
-                                    modifier = Modifier.size(26.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = if (pLayer.isVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                        contentDescription = "Visibilidade camada",
-                                        tint = if (pLayer.isVisible) CyanAccent else textColor.copy(alpha = 0.4f),
-                                        modifier = Modifier.size(15.dp)
-                                    )
-                                }
-                                Text(
-                                    text = pLayer.name,
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = textColor,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                // Blend effect cycler
-                                Surface(
-                                    color = CyanAccent.copy(alpha = 0.18f),
-                                    shape = RoundedCornerShape(6.dp),
-                                    modifier = Modifier.clickable {
-                                        val entries = LayerBlendEffect.entries
-                                        val nextBlend = entries[(pLayer.blendEffect.ordinal + 1) % entries.size]
-                                        onUpdateObject(selectedObj.id, true) { cur ->
-                                            val list = cur.paintLayers.toMutableList()
-                                            list[idx] = list[idx].copy(blendEffect = nextBlend)
-                                            cur.copy(paintLayers = list)
-                                        }
-                                    }
-                                ) {
-                                    Text(
-                                        text = pLayer.blendEffect.labelPt,
-                                        fontSize = 8.5.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = CyanAccent,
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                                    )
-                                }
-                                IconButton(
-                                    onClick = {
-                                        onUpdateObject(selectedObj.id, true) { cur ->
-                                            val list = cur.paintLayers.filterIndexed { i, _ -> i != idx }
-                                            cur.copy(
-                                                paintLayers = list,
-                                                activePaintLayerIndex = cur.activePaintLayerIndex.coerceIn(0, (list.size - 1).coerceAtLeast(0))
-                                            )
-                                        }
-                                    },
-                                    modifier = Modifier.size(26.dp)
-                                ) {
-                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Remover camada", tint = NeonPink, modifier = Modifier.size(15.dp))
-                                }
-                            }
-                        }
-
-                        Button(
-                            onClick = { onMergePaintLayers(selectedObj.id) },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(38.dp)
-                                .testTag("paint3d_merge_uv_btn"),
-                            colors = ButtonDefaults.buttonColors(containerColor = NeonGreen),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Icon(Icons.Default.MergeType, contentDescription = null, tint = Color.Black, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(5.dp))
-                            Text(
-                                "Mesclar Camadas em 1 UV só",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                color = Color.Black
                             )
                         }
                     }
@@ -876,6 +837,7 @@ fun UvUnfoldWindowOverlay(
     activeBrushParamsJson: String?,
     currentColorArgb: Long,
     onPaintUVSegment: (String, Float, Float, Float, Float) -> Unit,
+    onOpenUvVertexEditor: () -> Unit = {},
     onClose: () -> Unit,
     bgColor: Color,
     textColor: Color,
@@ -919,9 +881,11 @@ fun UvUnfoldWindowOverlay(
 
             // Build normalized [0..1] wireframe segments from submeshes (cap at 1800 tris for snappy UI)
             val linesList = ArrayList<Float>()
+            var subMeshVertOffset = 0
             mesh?.subMeshes?.forEach { sm ->
-                val effUvs = Studio3DPaintEngine.generateUVsForProjection(sm.vertices, sm.uvs, activeSlot)
+                val effUvs = Studio3DPaintEngine.generateUVsForProjection(sm.vertices, sm.uvs, activeSlot, subMeshVertOffset)
                 val vCount = sm.vertices.size / 3
+                subMeshVertOffset += vCount
                 var t = 0
                 val maxIdx = minOf(sm.indices.size, 5400)
                 while (t + 2 < maxIdx) {
@@ -966,13 +930,35 @@ fun UvUnfoldWindowOverlay(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Janela UV Desdobrado • ${activeSlot.name}",
+                    text = "Janela UV • ${activeSlot.name}",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.ExtraBold,
-                    color = CyanAccent
+                    color = CyanAccent,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
-                IconButton(onClick = onClose, modifier = Modifier.size(28.dp)) {
-                    Icon(Icons.Default.Close, contentDescription = "Fechar Janela UV", tint = textColor, modifier = Modifier.size(16.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    StudioPill(
+                        label = "Pontos UV",
+                        selected = false,
+                        accent = OrangeAccent,
+                        textColor = textColor,
+                        icon = Icons.Default.Grain,
+                        testTag = "uv_unfold_open_vertex_editor_btn"
+                    ) { onOpenUvVertexEditor() }
+                    IconButton(
+                        onClick = onClose,
+                        modifier = Modifier
+                            .size(32.dp)
+                            .minimumInteractiveComponentSize()
+                            .testTag("uv_unfold_close_btn")
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Fechar Janela UV", tint = textColor, modifier = Modifier.size(16.dp))
+                    }
                 }
             }
 
@@ -1051,17 +1037,22 @@ fun UvUnfoldWindowOverlay(
 }
 
 /**
- * Split-Screen Shader Node Editor Overlay:
- * - Top 50%: Live Interactive 3D Object Preview (1-finger orbits OR paints when Pintura 3D is active)
- * - Bottom 50%: Interactive Node Graph Editor with Bezier links, draggable nodes & 1-tap studio shader presets
+ * Split-Screen Blender-Style Shader Node Editor Overlay:
+ * - Top 50%: Live Interactive 3D Object Preview (1-finger orbits around the object — zero paint clutter)
+ * - Bottom 50%: Node Graph Editor with + Adicionar Node (Principled BSDF, Fresnel, Mix RGB, Ruído, Emissão, etc.),
+ *               Link/Unlink nodes, Delete node, Blender Parameter sliders, and "Nodes Próprios" custom presets!
  */
 @Composable
 fun Studio3DSplitNodesOverlay(
     selectedObject: SceneObject3D?,
-    studio3DPaintEnabled: Boolean,
-    onToggleStudio3DPaint: (Boolean) -> Unit,
-    onPaintObjectUV: (String, Float, Float, Float, Float) -> Unit,
+    studio3DPaintEnabled: Boolean = false,
+    onToggleStudio3DPaint: (Boolean) -> Unit = {},
+    onPaintObjectUV: (String, Float, Float, Float, Float) -> Unit = { _, _, _, _, _ -> },
     onUpdateObject: (String, Boolean, (SceneObject3D) -> SceneObject3D) -> Unit,
+    customPresets: List<CustomShaderNodePreset> = emptyList(),
+    onSaveCustomPreset: (String, ShaderNodeGraph) -> Unit = { _, _ -> },
+    onApplyCustomPreset: (String, CustomShaderNodePreset) -> Unit = { _, _ -> },
+    onDeleteCustomPreset: (String) -> Unit = {},
     onClose: () -> Unit,
     bgColor: Color,
     textColor: Color,
@@ -1070,6 +1061,10 @@ fun Studio3DSplitNodesOverlay(
     var previewYaw by remember { mutableFloatStateOf(28f) }
     var previewPitch by remember { mutableFloatStateOf(-18f) }
     var selectedNodeId by remember { mutableStateOf<String?>("ramp") }
+    var showAddNodeStrip by remember { mutableStateOf(false) }
+    var linkingFromNodeId by remember { mutableStateOf<String?>(null) }
+    var showCustomSaveRow by remember { mutableStateOf(false) }
+    var customPresetName by remember { mutableStateOf("") }
     var previewBmp by remember { mutableStateOf<Bitmap?>(null) }
 
     val curObj = selectedObject
@@ -1114,11 +1109,11 @@ fun Studio3DSplitNodesOverlay(
             .navigationBarsPadding()
             .testTag("studio3d_split_nodes_overlay")
     ) {
-        // TOP 50%: Live 3D Shader Preview
+        // TOP 50%: Live 3D Shader Preview (Orbit only — Paint lives on Pintura UV screen)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f)
+                .weight(0.92f)
                 .background(Color(0xFF151926))
         ) {
             previewBmp?.let { bmp ->
@@ -1130,82 +1125,30 @@ fun Studio3DSplitNodesOverlay(
                 )
             }
 
-            // Orbit or Direct Paint gesture in preview
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .pointerInput(curObj?.id, studio3DPaintEnabled, previewYaw, previewPitch) {
-                        var lastUv: Pair<Float, Float>? = null
+                    .pointerInput(curObj?.id) {
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
                             down.consume()
                             var prevPos = down.position
-                            if (studio3DPaintEnabled && curObj != null) {
-                                val sx = down.position.x * (480f / size.width.coerceAtLeast(1))
-                                val sy = down.position.y * (320f / size.height.coerceAtLeast(1))
-                                val pick = Studio3DPaintEngine.pickObjectTriangleUV(
-                                    obj = curObj,
-                                    frameIndex = 0,
-                                    autoInterpolate = true,
-                                    screenX = sx,
-                                    screenY = sy,
-                                    camYawDeg = previewYaw,
-                                    camPitchDeg = previewPitch,
-                                    camRollDeg = 0f,
-                                    camPanX = 0f,
-                                    camPanY = 0f,
-                                    focalPx = 360f,
-                                    vpCx = 240f,
-                                    vpCy = 160f,
-                                    worldUnitScale = 0.72f
-                                )
-                                if (pick != null) {
-                                    lastUv = pick.u to pick.v
-                                    onPaintObjectUV(curObj.id, pick.u, pick.v, pick.u, pick.v)
-                                }
-                            }
                             while (true) {
                                 val ev = awaitPointerEvent()
                                 val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
                                 if (!ch.pressed) break
                                 ch.consume()
-                                if (studio3DPaintEnabled && curObj != null) {
-                                    val sx = ch.position.x * (480f / size.width.coerceAtLeast(1))
-                                    val sy = ch.position.y * (320f / size.height.coerceAtLeast(1))
-                                    val pick = Studio3DPaintEngine.pickObjectTriangleUV(
-                                        obj = curObj,
-                                        frameIndex = 0,
-                                        autoInterpolate = true,
-                                        screenX = sx,
-                                        screenY = sy,
-                                        camYawDeg = previewYaw,
-                                        camPitchDeg = previewPitch,
-                                        camRollDeg = 0f,
-                                        camPanX = 0f,
-                                        camPanY = 0f,
-                                        focalPx = 360f,
-                                        vpCx = 240f,
-                                        vpCy = 160f,
-                                        worldUnitScale = 0.72f
-                                    )
-                                    if (pick != null) {
-                                        val prev = lastUv ?: (pick.u to pick.v)
-                                        onPaintObjectUV(curObj.id, prev.first, prev.second, pick.u, pick.v)
-                                        lastUv = pick.u to pick.v
-                                    }
-                                } else {
-                                    val dx = ch.position.x - prevPos.x
-                                    val dy = ch.position.y - prevPos.y
-                                    previewYaw += dx * 0.45f
-                                    previewPitch = (previewPitch + dy * 0.45f).coerceIn(-80f, 80f)
-                                }
+                                val dx = ch.position.x - prevPos.x
+                                val dy = ch.position.y - prevPos.y
+                                previewYaw += dx * 0.45f
+                                previewPitch = (previewPitch + dy * 0.45f).coerceIn(-80f, 80f)
                                 prevPos = ch.position
                             }
                         }
                     }
             )
 
-            // Top Preview HUD Bar
+            // Top Preview HUD Bar (minimal — only Node header & close)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1227,29 +1170,15 @@ fun Studio3DSplitNodesOverlay(
                     )
                 }
 
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                IconButton(
+                    onClick = onClose,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(bgColor.copy(alpha = 0.85f))
+                        .testTag("nodes_close_btn")
                 ) {
-                    StudioPill(
-                        label = if (studio3DPaintEnabled) "Pintura ON" else "Orbitar",
-                        selected = studio3DPaintEnabled,
-                        accent = NeonPink,
-                        textColor = Color.White,
-                        icon = Icons.Default.Brush,
-                        testTag = "nodes_paint_mode_btn"
-                    ) { onToggleStudio3DPaint(!studio3DPaintEnabled) }
-
-                    IconButton(
-                        onClick = onClose,
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(bgColor.copy(alpha = 0.85f))
-                            .testTag("nodes_close_btn")
-                    ) {
-                        Icon(Icons.Default.Close, contentDescription = "Fechar Nodes", tint = Color.White)
-                    }
+                    Icon(Icons.Default.Close, contentDescription = "Fechar Nodes", tint = Color.White)
                 }
             }
         }
@@ -1262,12 +1191,12 @@ fun Studio3DSplitNodesOverlay(
                 .background(CyanAccent.copy(alpha = 0.6f))
         )
 
-        // BOTTOM 50%: Shader Node Graph Editor
+        // BOTTOM 50%: Blender Shader Node Graph Editor
         if (curObj == null) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f),
+                    .weight(1.08f),
                 contentAlignment = Alignment.Center
             ) {
                 Text("Selecione ou adicione um objeto 3D para editar os Nodes.", color = textColor)
@@ -1279,21 +1208,21 @@ fun Studio3DSplitNodesOverlay(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f)
+                    .weight(1.08f)
                     .background(bgColor.copy(alpha = 0.98f))
                     .padding(10.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                verticalArrangement = Arrangement.spacedBy(5.dp)
             ) {
-                // Presets + Enable Toggle
+                // Toolbar: Active Switch + Add Node + Custom Nodes + Built-in Presets + Saved Custom Presets
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Ativo:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = textColor)
+                        Text("Ativo:", fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = textColor)
                         Switch(
                             checked = graph.enabled,
                             onCheckedChange = { on ->
@@ -1305,6 +1234,25 @@ fun Studio3DSplitNodesOverlay(
                             colors = SwitchDefaults.colors(checkedThumbColor = NeonGreen)
                         )
                     }
+
+                    StudioPill(
+                        label = "+ Node",
+                        selected = showAddNodeStrip,
+                        accent = NeonGreen,
+                        textColor = textColor,
+                        icon = Icons.Default.Add,
+                        testTag = "nodes_add_node_toggle"
+                    ) { showAddNodeStrip = !showAddNodeStrip }
+
+                    StudioPill(
+                        label = "Salvar Próprio",
+                        selected = showCustomSaveRow,
+                        accent = OrangeAccent,
+                        textColor = textColor,
+                        icon = Icons.Default.Save,
+                        testTag = "nodes_save_custom_toggle"
+                    ) { showCustomSaveRow = !showCustomSaveRow }
+
                     StudioPill("Cartoon Studio", graph.presetName == "Cartoon Studio" && graph.enabled, OrangeAccent, textColor) {
                         onUpdateObject(curObj.id, true) {
                             it.copy(
@@ -1336,21 +1284,156 @@ fun Studio3DSplitNodesOverlay(
                             )
                         }
                     }
-                    StudioPill("Brush Traço", graph.presetName == "Brush Traço" && graph.enabled, NeonPink, textColor) {
-                        val brushNodes = ShaderNodeGraph.defaultNodes().map { n ->
-                            when (n.kind) {
-                                ShaderNodeKind.BRUSH_GRAIN -> n.copy(paramA = 0.85f, paramB = 0.75f)
-                                ShaderNodeKind.CEL_RAMP -> n.copy(paramA = 4f, paramB = 0.4f)
-                                ShaderNodeKind.CONTORNO -> n.copy(paramA = 3.0f, paramB = 1f)
-                                else -> n
-                            }
-                        }
+                    StudioPill("Principled PBR", graph.presetName == "Principled PBR" && graph.enabled, Color(0xFF3498DBL), textColor) {
+                        val pbrNodes = listOf(
+                            ShaderNode("uv", ShaderNodeKind.UV_COORD, 40f, 110f, paramA = 1f, paramB = 1f),
+                            ShaderNode("tex", ShaderNodeKind.TEXTURA_UV, 190f, 60f, paramA = 1f, paramB = 0f),
+                            ShaderNode("pbr", ShaderNodeKind.PRINCIPLED_BSDF, 360f, 110f, paramA = 0.25f, paramB = 0.35f),
+                            ShaderNode("fresnel", ShaderNodeKind.FRESNEL, 360f, 230f, paramA = 0.45f, paramB = 0.6f),
+                            ShaderNode("out", ShaderNodeKind.SAIDA_MATERIAL, 560f, 120f, paramA = 1f, paramB = 0f)
+                        )
+                        val pbrLinks = listOf(
+                            ShaderNodeLink("p1", "uv", "tex"),
+                            ShaderNodeLink("p2", "tex", "pbr"),
+                            ShaderNodeLink("p3", "pbr", "out"),
+                            ShaderNodeLink("p4", "fresnel", "out")
+                        )
                         onUpdateObject(curObj.id, true) {
                             it.copy(
-                                shaderMode = ObjectShaderMode.CARTOON_BRUSH,
-                                outline = it.outline.copy(enabled = true, width = 3f),
-                                nodeGraph = ShaderNodeGraph(enabled = true, presetName = "Brush Traço", nodes = brushNodes, links = ShaderNodeGraph.defaultLinks())
+                                shaderMode = ObjectShaderMode.PADRAO,
+                                nodeGraph = ShaderNodeGraph(enabled = true, presetName = "Principled PBR", nodes = pbrNodes, links = pbrLinks)
                             )
+                        }
+                    }
+
+                    // User's Custom Saved Presets ("Nodes Próprios")
+                    customPresets.forEach { preset ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(NeonPink.copy(alpha = 0.16f))
+                                .border(1.dp, NeonPink.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+                                .clickable { onApplyCustomPreset(curObj.id, preset) }
+                                .padding(start = 7.dp, end = 2.dp, top = 3.dp, bottom = 3.dp)
+                                .testTag("custom_node_preset_${preset.id}")
+                        ) {
+                            Text(preset.name, fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = textColor, maxLines = 1)
+                            IconButton(
+                                onClick = { onDeleteCustomPreset(preset.id) },
+                                modifier = Modifier.size(20.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Remover preset", tint = NeonPink, modifier = Modifier.size(11.dp))
+                            }
+                        }
+                    }
+                }
+
+                // Expandable Add Blender Node Strip
+                if (showAddNodeStrip) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Adicionar:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = NeonGreen)
+                        ShaderNodeKind.entries.forEach { kind ->
+                            StudioPill(
+                                label = "+ ${kind.labelPt}",
+                                selected = false,
+                                accent = Color(kind.accentArgb),
+                                textColor = textColor,
+                                testTag = "add_node_kind_${kind.name}"
+                            ) {
+                                val newId = "n_${UUID.randomUUID().toString().take(6)}"
+                                val offsetIdx = (graph.nodes.size % 5)
+                                val newNode = ShaderNode(
+                                    id = newId,
+                                    kind = kind,
+                                    x = 120f + offsetIdx * 95f,
+                                    y = 65f + ((graph.nodes.size / 5) % 3) * 75f,
+                                    paramA = if (kind == ShaderNodeKind.CEL_RAMP) 3f else 0.6f,
+                                    paramB = 0.5f
+                                )
+                                val outNode = graph.nodes.firstOrNull { it.kind == ShaderNodeKind.SAIDA_MATERIAL }
+                                val autoLink = if (outNode != null && kind != ShaderNodeKind.SAIDA_MATERIAL) {
+                                    listOf(ShaderNodeLink(fromNodeId = newId, toNodeId = outNode.id))
+                                } else emptyList()
+                                onUpdateObject(curObj.id, true) { cur ->
+                                    cur.copy(
+                                        nodeGraph = cur.nodeGraph.copy(
+                                            enabled = true,
+                                            nodes = cur.nodeGraph.nodes + newNode,
+                                            links = cur.nodeGraph.links + autoLink
+                                        )
+                                    )
+                                }
+                                selectedNodeId = newId
+                                showAddNodeStrip = false
+                            }
+                        }
+                    }
+                }
+
+                // Expandable Save Custom Node Preset Row ("Nodes Próprios")
+                if (showCustomSaveRow) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            color = Color(0xFF1A2030),
+                            shape = RoundedCornerShape(9.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, CyanAccent.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 40.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 9.dp),
+                                contentAlignment = Alignment.CenterStart
+                            ) {
+                                if (customPresetName.isEmpty()) {
+                                    Text(
+                                        text = "Nome do Node Próprio...",
+                                        fontSize = 11.sp,
+                                        color = textColor.copy(alpha = 0.48f)
+                                    )
+                                }
+                                BasicTextField(
+                                    value = customPresetName,
+                                    onValueChange = { customPresetName = it },
+                                    singleLine = true,
+                                    textStyle = TextStyle(
+                                        color = textColor,
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.Medium
+                                    ),
+                                    cursorBrush = SolidColor(CyanAccent),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("nodes_custom_name_input")
+                                )
+                            }
+                        }
+                        Button(
+                            onClick = {
+                                onSaveCustomPreset(customPresetName, graph)
+                                customPresetName = ""
+                                showCustomSaveRow = false
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = OrangeAccent),
+                            shape = RoundedCornerShape(9.dp),
+                            modifier = Modifier
+                                .heightIn(min = 40.dp)
+                                .testTag("nodes_confirm_save_custom_btn")
+                        ) {
+                            Text("Salvar", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Black)
                         }
                     }
                 }
@@ -1365,7 +1448,7 @@ fun Studio3DSplitNodesOverlay(
                         .border(1.dp, textColor.copy(alpha = 0.2f), RoundedCornerShape(12.dp))
                 ) {
                     val density = LocalDensity.current
-                    val nodeW = 92.dp
+                    val nodeW = 94.dp
                     val nodeH = 44.dp
                     val nodeWPx = with(density) { nodeW.toPx() }
                     val nodeHPx = with(density) { nodeH.toPx() }
@@ -1406,12 +1489,13 @@ fun Studio3DSplitNodesOverlay(
                         }
                     }
 
-                    // Draggable Node Cards
+                    // Draggable Node Cards (Tap to select or connect when linking mode active)
                     graph.nodes.forEach { node ->
                         val px = ((node.x / 700f) * boxWPx).roundToInt().coerceIn(0, max(0, (boxWPx - nodeWPx).roundToInt()))
                         val py = ((node.y / 320f) * boxHPx).roundToInt().coerceIn(0, max(0, (boxHPx - nodeHPx).roundToInt()))
                         val accent = Color(node.kind.accentArgb)
                         val isSel = activeNode?.id == node.id
+                        val isLinkSource = linkingFromNodeId == node.id
 
                         Surface(
                             modifier = Modifier
@@ -1435,13 +1519,30 @@ fun Studio3DSplitNodesOverlay(
                                         }
                                     }
                                 }
-                                .clickable { selectedNodeId = node.id }
+                                .clickable {
+                                    val src = linkingFromNodeId
+                                    if (src != null && src != node.id) {
+                                        onUpdateObject(curObj.id, true) { cur ->
+                                            val exists = cur.nodeGraph.links.any { it.fromNodeId == src && it.toNodeId == node.id }
+                                            val nextLinks = if (exists) {
+                                                cur.nodeGraph.links.filterNot { it.fromNodeId == src && it.toNodeId == node.id }
+                                            } else {
+                                                cur.nodeGraph.links + ShaderNodeLink(fromNodeId = src, toNodeId = node.id)
+                                            }
+                                            cur.copy(nodeGraph = cur.nodeGraph.copy(enabled = true, links = nextLinks))
+                                        }
+                                        linkingFromNodeId = null
+                                        selectedNodeId = node.id
+                                    } else {
+                                        selectedNodeId = node.id
+                                    }
+                                }
                                 .testTag("shader_node_${node.id}"),
                             color = Color(0xFF1F2536),
                             shape = RoundedCornerShape(8.dp),
                             border = androidx.compose.foundation.BorderStroke(
-                                width = if (isSel) 2.dp else 1.dp,
-                                color = if (isSel) Color.White else accent
+                                width = if (isLinkSource || isSel) 2.dp else 1.dp,
+                                color = if (isLinkSource) NeonGreen else if (isSel) Color.White else accent
                             ),
                             shadowElevation = 6.dp
                         ) {
@@ -1484,25 +1585,72 @@ fun Studio3DSplitNodesOverlay(
                     }
                 }
 
-                // Selected Node Parameter Inspector
+                // Selected Node Blender Parameter Inspector (with Link / Delete / Semantic Labels / Color)
                 if (activeNode != null) {
                     val accent = Color(activeNode.kind.accentArgb)
+                    val (labelA, labelB, rangeA) = when (activeNode.kind) {
+                        ShaderNodeKind.PRINCIPLED_BSDF -> Triple("Metálico", "Rugos.", 0f..1f)
+                        ShaderNodeKind.FRESNEL -> Triple("Borda", "IOR", 0f..1.5f)
+                        ShaderNodeKind.MIX_RGB -> Triple("Fator", "Intens.", 0f..1f)
+                        ShaderNodeKind.NOISE_PROC -> Triple("Escala", "Força", 0.1f..3f)
+                        ShaderNodeKind.EMISSAO -> Triple("Brilho", "Suave", 0f..2f)
+                        ShaderNodeKind.CEL_RAMP -> Triple("Bandas", "Suav.", 2f..6f)
+                        ShaderNodeKind.CONTORNO -> Triple("Espess.", "Força", 0.5f..5f)
+                        ShaderNodeKind.UV_COORD -> Triple("Escala", "Desloc.", 0.5f..5f)
+                        else -> Triple("Valor A", "Valor B", 0f..1.5f)
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = activeNode.kind.labelPt,
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = accent
+                        )
+                        StudioPill(
+                            label = if (linkingFromNodeId == activeNode.id) "Toque Destino..." else "Conectar",
+                            selected = linkingFromNodeId == activeNode.id,
+                            accent = NeonGreen,
+                            textColor = textColor,
+                            icon = Icons.Default.Link,
+                            testTag = "nodes_connect_btn"
+                        ) {
+                            linkingFromNodeId = if (linkingFromNodeId == activeNode.id) null else activeNode.id
+                        }
+                        if (activeNode.kind != ShaderNodeKind.SAIDA_MATERIAL && graph.nodes.size > 1) {
+                            StudioPill(
+                                label = "Excluir",
+                                selected = false,
+                                accent = NeonPink,
+                                textColor = NeonPink,
+                                icon = Icons.Default.DeleteOutline,
+                                testTag = "nodes_delete_node_btn"
+                            ) {
+                                val delId = activeNode.id
+                                onUpdateObject(curObj.id, true) { cur ->
+                                    cur.copy(
+                                        nodeGraph = cur.nodeGraph.copy(
+                                            nodes = cur.nodeGraph.nodes.filterNot { it.id == delId },
+                                            links = cur.nodeGraph.links.filterNot { it.fromNodeId == delId || it.toNodeId == delId }
+                                        )
+                                    )
+                                }
+                                selectedNodeId = graph.nodes.firstOrNull { it.id != delId }?.id
+                                if (linkingFromNodeId == delId) linkingFromNodeId = null
+                            }
+                        }
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = activeNode.kind.labelPt,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = accent
-                        )
-                        val rangeA = if (activeNode.kind == ShaderNodeKind.CEL_RAMP) 2f..6f
-                        else if (activeNode.kind == ShaderNodeKind.CONTORNO || activeNode.kind == ShaderNodeKind.UV_COORD) 0.5f..5f
-                        else 0f..1.5f
                         StudioSlider(
-                            label = "Valor A",
+                            label = labelA,
                             valueText = String.format("%.2f", activeNode.paramA),
                             value = activeNode.paramA,
                             range = rangeA,
@@ -1518,7 +1666,7 @@ fun Studio3DSplitNodesOverlay(
                             }
                         }
                         StudioSlider(
-                            label = "Valor B",
+                            label = labelB,
                             valueText = String.format("%.2f", activeNode.paramB),
                             value = activeNode.paramB,
                             range = 0f..1f,
@@ -1529,6 +1677,28 @@ fun Studio3DSplitNodesOverlay(
                             onUpdateObject(curObj.id, true) { cur ->
                                 val nextNodes = cur.nodeGraph.nodes.map {
                                     if (it.id == activeNode.id) it.copy(paramB = nb) else it
+                                }
+                                cur.copy(nodeGraph = cur.nodeGraph.copy(enabled = true, nodes = nextNodes))
+                            }
+                        }
+                    }
+
+                    if (activeNode.kind in listOf(
+                            ShaderNodeKind.MIX_RGB,
+                            ShaderNodeKind.EMISSAO,
+                            ShaderNodeKind.CONTORNO,
+                            ShaderNodeKind.PRINCIPLED_BSDF
+                        )
+                    ) {
+                        SwatchStrip(
+                            label = "Cor Node:",
+                            swatches = STUDIO_3D_SWATCHES,
+                            selected = activeNode.colorArgb,
+                            textColor = textColor
+                        ) { c ->
+                            onUpdateObject(curObj.id, true) { cur ->
+                                val nextNodes = cur.nodeGraph.nodes.map {
+                                    if (it.id == activeNode.id) it.copy(colorArgb = c) else it
                                 }
                                 cur.copy(nodeGraph = cur.nodeGraph.copy(enabled = true, nodes = nextNodes))
                             }
@@ -1553,18 +1723,18 @@ private fun StudioPill(
 ) {
     Row(
         modifier = modifier
-            .heightIn(min = 32.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .heightIn(min = 36.dp)
+            .clip(RoundedCornerShape(9.dp))
             .background(if (selected) accent.copy(alpha = 0.24f) else textColor.copy(alpha = 0.08f))
-            .border(1.dp, if (selected) accent else textColor.copy(alpha = 0.18f), RoundedCornerShape(8.dp))
+            .border(1.dp, if (selected) accent else textColor.copy(alpha = 0.18f), RoundedCornerShape(9.dp))
             .clickable { onClick() }
-            .padding(horizontal = 8.dp, vertical = 5.dp)
+            .padding(horizontal = 9.dp, vertical = 6.dp)
             .let { if (testTag != null) it.testTag(testTag) else it },
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         if (icon != null) {
-            Icon(icon, contentDescription = label, tint = if (selected) accent else textColor, modifier = Modifier.size(13.dp))
+            Icon(icon, contentDescription = label, tint = if (selected) accent else textColor, modifier = Modifier.size(14.dp))
         }
         Text(
             text = label,

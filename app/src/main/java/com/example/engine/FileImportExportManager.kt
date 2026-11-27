@@ -411,6 +411,9 @@ object FileImportExportManager {
         if (layer.isBucketReference) {
             layerObj.put("isBucketReference", true)
         }
+        if (layer.placeBelowFrame) {
+            layerObj.put("placeBelowFrame", true)
+        }
         layer.celHoldTicks?.let { layerObj.put("celHoldTicks", it) }
         layer.celStartTick?.let { layerObj.put("celStartTick", it) }
         layer.imageAttachment?.let { att ->
@@ -491,6 +494,7 @@ object FileImportExportManager {
         val isClippingMask = lObj.optBoolean("isClippingMask", false)
         val isBucketLayer = lObj.optBoolean("isBucketLayer", false)
         val isBucketReference = lObj.optBoolean("isBucketReference", false)
+        val placeBelowFrame = lObj.optBoolean("placeBelowFrame", false)
 
         val strokesList = ArrayList<DrawingStroke>()
         val strokesArray = lObj.optJSONArray("strokes")
@@ -601,7 +605,8 @@ object FileImportExportManager {
             isBucketLayer = isBucketLayer,
             isBucketReference = isBucketReference,
             celHoldTicks = if (lObj.has("celHoldTicks")) lObj.optInt("celHoldTicks", 1).coerceIn(0, 240) else null,
-            celStartTick = if (lObj.has("celStartTick")) lObj.optInt("celStartTick", 0).coerceAtLeast(0) else null
+            celStartTick = if (lObj.has("celStartTick")) lObj.optInt("celStartTick", 0).coerceAtLeast(0) else null,
+            placeBelowFrame = placeBelowFrame
         )
     }
 
@@ -669,6 +674,9 @@ object FileImportExportManager {
             put("captureHeight", cam.captureHeight)
             put("layerDepthSpacing", cam.layerDepthSpacing.toDouble())
             put("cameraMode", cam.cameraMode.name)
+            put("showFloorGrid", cam.showFloorGrid)
+            put("shadingMode", cam.shadingMode.name)
+            put("transformSpace", cam.transformSpace.name)
             val kArr = JSONArray()
             cam.keyframes.forEach { kf ->
                 kArr.put(JSONObject().apply {
@@ -816,6 +824,16 @@ object FileImportExportManager {
                 sceneObjsParsed.add(jsonToSceneObject3D(oo))
             }
         }
+        val shadingMode = try {
+            com.example.model.StageShadingMode.valueOf(
+                camObjParsed.optString("shadingMode", com.example.model.StageShadingMode.RENDERED.name)
+            )
+        } catch (_: Exception) { com.example.model.StageShadingMode.RENDERED }
+        val transformSpace = try {
+            com.example.model.TransformSpaceMode.valueOf(
+                camObjParsed.optString("transformSpace", com.example.model.TransformSpaceMode.GLOBAL.name)
+            )
+        } catch (_: Exception) { com.example.model.TransformSpaceMode.GLOBAL }
         return Camera3DSettings(
             isEnabled = camObjParsed.optBoolean("isEnabled", false),
             showCaptureFrame = camObjParsed.optBoolean("showCaptureFrame", true),
@@ -828,7 +846,10 @@ object FileImportExportManager {
             cameraMode = camMode,
             effectSpans = spansList,
             layerTransformTracks = layerTracksParsed,
-            scene3DObjects = sceneObjsParsed
+            scene3DObjects = sceneObjsParsed,
+            showFloorGrid = camObjParsed.optBoolean("showFloorGrid", true),
+            shadingMode = shadingMode,
+            transformSpace = transformSpace
         )
     }
 
@@ -870,6 +891,11 @@ object FileImportExportManager {
                         slot.textureBase64?.let { put("textureBase64", it) }
                     }
                     slot.textureUri?.let { put("textureUri", it) }
+                    if (slot.customUvs.isNotEmpty()) {
+                        val cuArr = JSONArray()
+                        slot.customUvs.forEach { cuArr.put(it.toDouble()) }
+                        put("customUvs", cuArr)
+                    }
                 })
             }
             put("uvSlots", uvArr)
@@ -966,6 +992,10 @@ object FileImportExportManager {
                 } catch (_: Exception) {
                     com.example.model.UvUnwrapProjection.ORIGINAL
                 }
+                val customUvArr = uo.optJSONArray("customUvs")
+                val customUvsList = if (customUvArr != null && customUvArr.length() > 0) {
+                    List(customUvArr.length()) { idx -> customUvArr.optDouble(idx, 0.0).toFloat() }
+                } else emptyList()
                 uvSlots.add(
                     com.example.model.ObjectUVMapSlot(
                         id = uo.optString("id", java.util.UUID.randomUUID().toString()),
@@ -976,7 +1006,8 @@ object FileImportExportManager {
                         offsetU = uo.optDouble("offsetU", 0.0).toFloat(),
                         offsetV = uo.optDouble("offsetV", 0.0).toFloat(),
                         textureBase64 = if (uo.has("textureBase64") && !uo.isNull("textureBase64")) uo.optString("textureBase64", "").ifBlank { null } else null,
-                        textureUri = if (uo.has("textureUri") && !uo.isNull("textureUri")) uo.optString("textureUri", "").ifBlank { null } else null
+                        textureUri = if (uo.has("textureUri") && !uo.isNull("textureUri")) uo.optString("textureUri", "").ifBlank { null } else null,
+                        customUvs = customUvsList
                     )
                 )
             }

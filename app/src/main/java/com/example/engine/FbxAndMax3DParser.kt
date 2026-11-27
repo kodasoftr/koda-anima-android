@@ -68,6 +68,32 @@ object FbxAndMax3DParser {
         }
     }
 
+    fun extractFbxBones(bytes: ByteArray): List<Mesh3DBone> {
+        val text = if (isFbxBinary(bytes)) {
+            // Binary FBX keeps ASCII identifiers like "LimbNode" and "Model::"
+            bytes.decodeToString(0, min(bytes.size, 2_000_000))
+        } else {
+            bytes.toString(Charsets.UTF_8)
+        }
+        val bones = ArrayList<Mesh3DBone>()
+        val limbRegex = Regex("Model::([A-Za-z0-9_ .-]{1,48}).{0,80}?LimbNode", RegexOption.DOT_MATCHES_ALL)
+        val asciiRegex = Regex("Model:\\s*\\d+,\\s*\"(?:Model::)?([^\"]+)\",\\s*\"LimbNode\"")
+        val seen = HashSet<String>()
+        for (m in limbRegex.findAll(text)) {
+            val bName = m.groupValues[1].trim()
+            if (bName.isNotBlank() && seen.add(bName)) {
+                bones.add(Mesh3DBone(name = bName, parentIndex = bones.size - 1))
+            }
+        }
+        for (m in asciiRegex.findAll(text)) {
+            val bName = m.groupValues[1].trim()
+            if (bName.isNotBlank() && seen.add(bName)) {
+                bones.add(Mesh3DBone(name = bName, parentIndex = bones.size - 1))
+            }
+        }
+        return bones
+    }
+
     fun parse3ds(
         bytes: ByteArray,
         siblingResolver: ((String) -> ByteArray?)? = null
@@ -547,7 +573,8 @@ object FbxAndMax3DParser {
                 val rel = vNode.firstChild("RelativeFilename")?.stringProp(0)
                     ?: vNode.firstChild("Filename")?.stringProp(0)
                 if (!rel.isNullOrBlank()) {
-                    siblingResolver(rel)?.let { b -> decoded = decodeTexturePixels(b) }
+                    val b = siblingResolver(rel) ?: siblingResolver(rel.substringAfterLast('/').substringAfterLast('\\'))
+                    b?.let { decoded = decodeTexturePixels(it) }
                 }
             }
             decoded?.let { (p, w, h) -> videoTexById[vid] = TexData(p, w, h) }
@@ -561,8 +588,9 @@ object FbxAndMax3DParser {
                 val rel = tNode.firstChild("RelativeFileName")?.stringProp(0)
                     ?: tNode.firstChild("FileName")?.stringProp(0)
                 if (!rel.isNullOrBlank()) {
-                    siblingResolver(rel)?.let { b ->
-                        decodeTexturePixels(b)?.let { (p, w, h) -> found = TexData(p, w, h) }
+                    val b = siblingResolver(rel) ?: siblingResolver(rel.substringAfterLast('/').substringAfterLast('\\'))
+                    b?.let { bytesResolved ->
+                        decodeTexturePixels(bytesResolved)?.let { (p, w, h) -> found = TexData(p, w, h) }
                     }
                 }
             }
@@ -635,11 +663,15 @@ object FbxAndMax3DParser {
                 outVerts.add(rawVerts[safeVi * 3 + 2])
 
                 if (rawUvs != null && rawUvCount > 0) {
-                    val uvIdx = when {
-                        uvIndices != null && cornerSeq < uvIndices.size -> uvIndices[cornerSeq]
+                    val rawUvIndex = when {
+                        uvIndices != null && cornerSeq < uvIndices.size -> {
+                            val idxVal = uvIndices[cornerSeq]
+                            if (idxVal >= 0) idxVal else safeVi
+                        }
                         uvMapping.contains("ByPolygonVertex", ignoreCase = true) -> cornerSeq
                         else -> safeVi
-                    }.coerceIn(0, rawUvCount - 1)
+                    }
+                    val uvIdx = rawUvIndex.coerceIn(0, rawUvCount - 1)
                     outUvs.add(rawUvs[uvIdx * 2])
                     outUvs.add(1f - rawUvs[uvIdx * 2 + 1])
                 } else {
@@ -754,15 +786,24 @@ object FbxAndMax3DParser {
         val out = ArrayList<Mesh3DSubMesh>()
         val targets = if (geomSections.size > 1) geomSections.drop(1) else listOf(text)
 
-        // Attempt resolving first texture filename in ASCII FBX
+        // Attempt resolving first texture filename & DiffuseColor in ASCII FBX
         var fallbackTex: Triple<IntArray, Int, Int>? = null
         if (siblingResolver != null) {
-            val relMatch = Regex("(?:RelativeFilename|FileName):\\s*\"([^\"]+)\"").find(text)
+            val relMatch = Regex("(?:RelativeFilename|FileName):\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).find(text)
             val path = relMatch?.groupValues?.getOrNull(1)
             if (!path.isNullOrBlank()) {
-                siblingResolver(path)?.let { fallbackTex = decodeTexturePixels(it) }
+                val resolved = siblingResolver(path) ?: siblingResolver(path.substringAfterLast('/').substringAfterLast('\\'))
+                resolved?.let { fallbackTex = decodeTexturePixels(it) }
             }
         }
+        var asciiDiffuseColor = 0xFFE2E8F0.toInt()
+        Regex("P:\\s*\"DiffuseColor\"[^\\n]*?,\\s*([0-9.+\\-eE]+)\\s*,\\s*([0-9.+\\-eE]+)\\s*,\\s*([0-9.+\\-eE]+)")
+            .find(text)?.let { cm ->
+                val r = ((cm.groupValues[1].toFloatOrNull() ?: 0.85f).coerceIn(0f, 1f) * 255f).toInt()
+                val g = ((cm.groupValues[2].toFloatOrNull() ?: 0.85f).coerceIn(0f, 1f) * 255f).toInt()
+                val b = ((cm.groupValues[3].toFloatOrNull() ?: 0.85f).coerceIn(0f, 1f) * 255f).toInt()
+                asciiDiffuseColor = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
 
         for (sec in targets) {
             val vDoubles = extractSectionArray(sec, "Vertices:") ?: continue
@@ -770,6 +811,7 @@ object FbxAndMax3DParser {
             if (vDoubles.size < 9 || pDoubles.isEmpty()) continue
             val uvDoubles = extractSectionArray(sec, "UV:")
             val uvIdxDoubles = extractSectionArray(sec, "UVIndex:")
+            val isUvByPolyVert = Regex("MappingInformationType:\\s*\"ByPolygonVertex\"", RegexOption.IGNORE_CASE).containsMatchIn(sec)
 
             val rawVerts = FloatArray(vDoubles.size) { vDoubles[it].toFloat() }
             val vCount = rawVerts.size / 3
@@ -790,9 +832,15 @@ object FbxAndMax3DParser {
                 outVerts.add(rawVerts[vi * 3 + 1])
                 outVerts.add(rawVerts[vi * 3 + 2])
                 if (uvDoubles != null && uvCount > 0) {
-                    val uvi = (if (uvIdxDoubles != null && cornerSeq < uvIdxDoubles.size) {
-                        uvIdxDoubles[cornerSeq].toInt()
-                    } else vi).coerceIn(0, uvCount - 1)
+                    val rawUvi = when {
+                        uvIdxDoubles != null && cornerSeq < uvIdxDoubles.size -> {
+                            val idxVal = uvIdxDoubles[cornerSeq].toInt()
+                            if (idxVal >= 0) idxVal else vi
+                        }
+                        isUvByPolyVert -> cornerSeq
+                        else -> vi
+                    }
+                    val uvi = rawUvi.coerceIn(0, uvCount - 1)
                     outUvs.add(uvDoubles[uvi * 2].toFloat())
                     outUvs.add(1f - uvDoubles[uvi * 2 + 1].toFloat())
                 } else {
@@ -819,7 +867,7 @@ object FbxAndMax3DParser {
                     normals = computeSmoothNormals(va, ia),
                     uvs = uva,
                     indices = ia,
-                    baseColorArgb = 0xFFE2E8F0.toInt(),
+                    baseColorArgb = asciiDiffuseColor,
                     texturePixels = fallbackTex?.first,
                     textureWidth = fallbackTex?.second ?: 0,
                     textureHeight = fallbackTex?.third ?: 0
@@ -1124,7 +1172,7 @@ object FbxAndMax3DParser {
             if (opts.outWidth <= 0 || opts.outHeight <= 0) return null
             val maxDim = max(opts.outWidth, opts.outHeight)
             var sample = 1
-            while (maxDim / sample > 512) sample *= 2
+            while (maxDim / sample > 1024) sample *= 2
             val bmp = BitmapFactory.decodeByteArray(
                 bytes,
                 0,

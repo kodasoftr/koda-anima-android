@@ -105,8 +105,11 @@ import com.example.ui.components.ProjectsListDialog
 import com.example.ui.components.QuickCopyPasteGestureMenu
 import com.example.ui.components.QuickPaletteFloatingWindow
 import com.example.ui.components.ReferenceImageChoiceDialog
+import com.example.model.SceneObject3D
 import com.example.ui.components.Studio3DSplitNodesOverlay
 import com.example.ui.components.Studio3DThreeWheelsSheet
+import com.example.ui.components.Studio3DUvEditorScreen
+import com.example.ui.components.Studio3DUvPaintScreen
 import com.example.ui.components.ThreeWheelsIcon
 import com.example.ui.components.TimelineBar
 import com.example.ui.components.TimelineLayerImageTransformHud
@@ -178,6 +181,16 @@ fun AnimationEditorScreen(
         val objId = pendingTexObjId
         if (uri != null && objId != null) {
             viewModel.applySceneObjectSlotTextureUri(context, objId, pendingTexSlotIdx, uri)
+        }
+    }
+
+    var pendingExportObjId by remember { mutableStateOf<String?>(null) }
+    val export3DObjLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/zip")
+    ) { uri: Uri? ->
+        val objId = pendingExportObjId
+        if (uri != null && objId != null) {
+            viewModel.exportSelected3DObjectToUri(context, objId, uri)
         }
     }
 
@@ -253,7 +266,8 @@ fun AnimationEditorScreen(
             },
         containerColor = bgColor,
         bottomBar = {
-            if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideTimeline) {
+            val hideTimelineForFullscreenStudio = uiState.isStudio3DSplitNodesOpen || uiState.isStudio3DUvPaintScreenOpen || uiState.isStudio3DUvEditorOpen
+            if ((!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideTimeline) && !hideTimelineForFullscreenStudio) {
                 if (uiState.isCameraTimelineOpen) {
                     CameraTimelinePanel(
                         cameraSettings = uiState.project.camera3D,
@@ -330,7 +344,8 @@ fun AnimationEditorScreen(
                         onAddCelAtTick = { lIdx, tick -> viewModel.activateOrAddCelOnLayerAtTick(lIdx, tick) },
                         onSetKeyframeHold = { tickIdx, hold -> viewModel.setSelectedTargetKeyframeHold(tickIdx, hold) },
                         onApplyTweenBetween = { tickA, tickB, curve -> viewModel.applyTweenBetweenTwoPoints(tickA, tickB, curve) },
-                        onAddKeyframeAtTick = { tick -> viewModel.addSelectedTargetKeyframeAtTick(tick) }
+                        onAddKeyframeAtTick = { tick -> viewModel.addSelectedTargetKeyframeAtTick(tick) },
+                        onSetTransformSpace = { viewModel.setStageTransformSpace(it) }
                     )
                 } else {
                     TimelineBar(
@@ -338,7 +353,7 @@ fun AnimationEditorScreen(
                         currentFrameIndex = uiState.currentFrameIndex,
                         isPlaying = uiState.isPlaying,
                         onionSkinEnabled = uiState.onionSkinEnabled,
-                        layerCount = uiState.project.frames[uiState.currentFrameIndex].layers.size,
+                        layerCount = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers?.size ?: 1,
                         fps = uiState.project.fps,
                         onSelectFrame = { viewModel.goToFrame(it) },
                         onTogglePlay = { viewModel.togglePlayback() },
@@ -967,7 +982,9 @@ fun AnimationEditorScreen(
             }
 
             // Floating Left Toolbox Palette OR Camera Mode Dedicated Toolbar
-            if (!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideToolbar) {
+            if ((!uiState.isZenModeActive || !uiState.preferences.zenModeSettings.hideToolbar) &&
+                !uiState.isStudio3DSplitNodesOpen && !uiState.isStudio3DUvPaintScreenOpen && !uiState.isStudio3DUvEditorOpen
+            ) {
                 if (uiState.isCameraTimelineOpen) {
                     CameraSideToolbar(
                         selectedAction = uiState.cameraToolAction,
@@ -993,6 +1010,8 @@ fun AnimationEditorScreen(
                         onToggleThreeWheels3D = { viewModel.toggleStudio3DThreeWheels() },
                         isSplitNodesOpen = uiState.isStudio3DSplitNodesOpen,
                         onToggleSplitNodes = { viewModel.toggleStudio3DSplitNodes() },
+                        isUvEditorOpen = uiState.isStudio3DUvEditorOpen,
+                        onOpenUvEditor = { viewModel.openStudio3DUvEditor() },
                         modifier = Modifier
                             .align(Alignment.CenterStart)
                             .padding(start = 8.dp)
@@ -1182,61 +1201,12 @@ fun AnimationEditorScreen(
                 onAddBucketLayer = { viewModel.addFrameLocalBucketLayer() },
                 onToggleBucketReference = { viewModel.toggleFrameLocalLayerBucketReference(it) },
                 onSelectBucketTargetLayer = { viewModel.setActiveBucketTargetLayer(it) },
+                onSetLocalLayerPlacement = { idx, below -> viewModel.setFrameLocalLayerPlacement(idx, below) },
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
                     .padding(end = 10.dp)
             )
 
-            // Dedicated Top-End Undo / Redo Floating Pill (always reachable in Canvas & Estúdio 3D)
-            if (!uiState.isZenModeActive) {
-                Surface(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .statusBarsPadding()
-                        .padding(top = 8.dp, end = 10.dp)
-                        .shadow(6.dp, RoundedCornerShape(999.dp))
-                        .clip(RoundedCornerShape(999.dp))
-                        .border(1.dp, borderCol, RoundedCornerShape(999.dp)),
-                    color = panelColor.copy(alpha = 0.94f)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(2.dp)
-                    ) {
-                        IconButton(
-                            onClick = { if (uiState.canUndo) viewModel.undo() },
-                            enabled = uiState.canUndo,
-                            modifier = Modifier
-                                .size(34.dp)
-                                .minimumInteractiveComponentSize()
-                                .testTag("undo_action_btn")
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Undo,
-                                contentDescription = "Desfazer (Ctrl+Z)",
-                                tint = if (uiState.canUndo) textColor else textColor.copy(alpha = 0.32f),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        IconButton(
-                            onClick = { if (uiState.canRedo) viewModel.redo() },
-                            enabled = uiState.canRedo,
-                            modifier = Modifier
-                                .size(34.dp)
-                                .minimumInteractiveComponentSize()
-                                .testTag("redo_action_btn")
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Redo,
-                                contentDescription = "Refazer (Ctrl+Y)",
-                                tint = if (uiState.canRedo) textColor else textColor.copy(alpha = 0.32f),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                    }
-                }
-            }
 
             // Floating Mobile Zen / Focus Mode Exit Pill
             if (uiState.isZenModeActive) {
@@ -1297,10 +1267,21 @@ fun AnimationEditorScreen(
                         },
                         isUvUnfoldOpen = uiState.isStudio3DUVUnfoldOpen,
                         onToggleUvUnfold = { viewModel.toggleStudio3DUVUnfold() },
+                        onOpenUvVertexEditor = { viewModel.openStudio3DUvEditor() },
                         onOpenSplitNodes = {
                             viewModel.closeStudio3DThreeWheels()
                             viewModel.toggleStudio3DSplitNodes()
                         },
+                        onOpenFullscreenUvPaint = { viewModel.openStudio3DUvPaintScreen() },
+                        onRequestImport3D = { scene3DPicker.launch(arrayOf("*/*")) },
+                        onExportObjectZip = { obj ->
+                            pendingExportObjId = obj.id
+                            export3DObjLauncher.launch("${obj.name.ifBlank { "modelo_3d" }}.zip")
+                        },
+                        shadingMode = uiState.project.camera3D.shadingMode,
+                        onSelectShadingMode = { viewModel.setStageShadingMode(it) },
+                        showFloorGrid = uiState.project.camera3D.showFloorGrid,
+                        onToggleFloorGrid = { viewModel.toggleStageFloorGrid() },
                         studio3DPaintEnabled = uiState.studio3DPaintEnabled,
                         onToggleStudio3DPaint = { viewModel.setStudio3DPaintEnabled(it) },
                         paintTool = uiState.studio3DPaintTool,
@@ -1323,7 +1304,7 @@ fun AnimationEditorScreen(
                     )
                 }
 
-                if (uiState.isStudio3DUVUnfoldOpen && selectedStudio3DObj != null) {
+                if (uiState.isStudio3DUVUnfoldOpen && selectedStudio3DObj != null && !uiState.isStudio3DUvPaintScreenOpen && !uiState.isStudio3DUvEditorOpen) {
                     UvUnfoldWindowOverlay(
                         selectedObject = selectedStudio3DObj,
                         paintTool = uiState.studio3DPaintTool,
@@ -1335,6 +1316,7 @@ fun AnimationEditorScreen(
                         onPaintUVSegment = { objId, u0, v0, u1, v1 ->
                             viewModel.paintSceneObjectSurfaceSegment(objId, u0, v0, u1, v1)
                         },
+                        onOpenUvVertexEditor = { viewModel.openStudio3DUvEditor() },
                         onClose = { viewModel.toggleStudio3DUVUnfold() },
                         bgColor = panelColor,
                         textColor = textColor,
@@ -1351,15 +1333,81 @@ fun AnimationEditorScreen(
                     }
                     Studio3DSplitNodesOverlay(
                         selectedObject = selectedStudio3DObj,
-                        studio3DPaintEnabled = uiState.studio3DPaintEnabled,
-                        onToggleStudio3DPaint = { viewModel.setStudio3DPaintEnabled(it) },
-                        onPaintObjectUV = { objId, u0, v0, u1, v1 ->
-                            viewModel.paintSceneObjectSurfaceSegment(objId, u0, v0, u1, v1)
-                        },
                         onUpdateObject = { id, bump, tf -> viewModel.updateSceneObject3D(id, bump, tf) },
+                        customPresets = uiState.customShaderNodePresets,
+                        onSaveCustomPreset = { name, graph -> viewModel.saveCustomShaderNodePreset(name, graph) },
+                        onApplyCustomPreset = { objId, preset -> viewModel.applyCustomShaderNodePreset(objId, preset) },
+                        onDeleteCustomPreset = { presetId -> viewModel.deleteCustomShaderNodePreset(presetId) },
                         onClose = { viewModel.closeStudio3DSplitNodes() },
                         bgColor = panelColor,
                         textColor = textColor,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+
+                if (uiState.isStudio3DUvPaintScreenOpen) {
+                    Studio3DUvPaintScreen(
+                        sceneObjects = studio3DObjs,
+                        selectedObjectId = selectedStudio3DObj?.id,
+                        onSelectObject = { viewModel.selectStageTarget(StageSelection(StageTargetType.OBJECT_3D, it)) },
+                        onUpdateObject = { id, bump, tf -> viewModel.updateSceneObject3D(id, bump, tf) },
+                        onPaintUVSegment = { objId, u0, v0, u1, v1 ->
+                            viewModel.paintSceneObjectSurfaceSegment(objId, u0, v0, u1, v1)
+                        },
+                        onMergePaintLayers = { viewModel.mergeSceneObjectPaintLayers(it) },
+                        onExportObjectZip = { obj ->
+                            pendingExportObjId = obj.id
+                            export3DObjLauncher.launch("${obj.name.ifBlank { "modelo_3d" }}.zip")
+                        },
+                        paintTool = uiState.studio3DPaintTool,
+                        onSelectPaintTool = { viewModel.setStudio3DPaintTool(it) },
+                        paintSize = uiState.studio3DPaintSize,
+                        onChangePaintSize = { viewModel.setStudio3DPaintSize(it) },
+                        paintOpacity = uiState.studio3DPaintOpacity,
+                        onChangePaintOpacity = { viewModel.setStudio3DPaintOpacity(it) },
+                        activeBrushPreset = uiState.activeBrushPreset,
+                        nativeBrushPresets = uiState.nativeBrushPresets,
+                        importedBrushes = uiState.importedKritaBrushes,
+                        onSelectBrushPreset = { viewModel.selectBrushPreset(it) },
+                        onSaveBrushCustomization = { preset, sz, op, params ->
+                            viewModel.saveBrushCustomization(context, preset, sz, op, params)
+                        },
+                        onResetBrushCustomization = { preset ->
+                            viewModel.resetBrushCustomization(context, preset)
+                        },
+                        onRequestImportKrita = { kritaBrushPicker.launch(arrayOf("*/*")) },
+                        onDeleteImportedBrush = { viewModel.deleteImportedKritaBrush(context, it) },
+                        currentColorArgb = uiState.currentColor,
+                        onOpenColorPicker = { viewModel.openDialog(EditorDialog.COLOR_PICKER) },
+                        canUndo = uiState.canUndo,
+                        canRedo = uiState.canRedo,
+                        onUndo = { viewModel.undo() },
+                        onRedo = { viewModel.redo() },
+                        onOpenUvVertexEditor = { viewModel.openStudio3DUvEditor() },
+                        theme = currentTheme,
+                        onClose = { viewModel.closeStudio3DUvPaintScreen() },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+
+                if (uiState.isStudio3DUvEditorOpen) {
+                    Studio3DUvEditorScreen(
+                        sceneObjects = studio3DObjs,
+                        selectedObjectId = selectedStudio3DObj?.id,
+                        onSelectObject = { viewModel.selectStageTarget(StageSelection(StageTargetType.OBJECT_3D, it)) },
+                        onUpdateObject = { id, bump, tf -> viewModel.updateSceneObject3D(id, bump, tf) },
+                        onCommitCustomUvs = { objId, flatUvs, coalesce -> viewModel.updateSceneObjectUvVertices(objId, flatUvs, coalesce) },
+                        onResetCustomUvs = { objId -> viewModel.resetSceneObjectCustomUvs(objId) },
+                        onExportObjectZip = { obj ->
+                            pendingExportObjId = obj.id
+                            export3DObjLauncher.launch("${obj.name.ifBlank { "modelo_3d" }}.zip")
+                        },
+                        canUndo = uiState.canUndo,
+                        canRedo = uiState.canRedo,
+                        onUndo = { viewModel.undo() },
+                        onRedo = { viewModel.redo() },
+                        theme = currentTheme,
+                        onClose = { viewModel.closeStudio3DUvEditor() },
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -1387,7 +1435,7 @@ fun AnimationEditorScreen(
     when (uiState.activeDialog) {
         EditorDialog.LAYERS -> {
             LayersBottomSheet(
-                layers = uiState.project.frames[uiState.currentFrameIndex].layers,
+                layers = uiState.project.frames.getOrNull(uiState.currentFrameIndex)?.layers ?: emptyList(),
                 activeLayerIndex = uiState.activeLayerIndex,
                 mediaAssets = uiState.project.mediaAssets,
                 onSelectLayer = { viewModel.setActiveLayer(it) },

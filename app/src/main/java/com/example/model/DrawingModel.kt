@@ -125,7 +125,7 @@ data class DrawingStroke(
      */
     fun intersects(left: Float, top: Float, right: Float, bottom: Float): Boolean {
         if (points.isEmpty()) return false
-        val halfB = brushSize / 2f + 4f
+        val halfB = brushSize * 1.6f + 16f
         val bMinX = (if (minX != Float.MAX_VALUE) minX else points.minOf { it.x }) - halfB
         val bMinY = (if (minY != Float.MAX_VALUE) minY else points.minOf { it.y }) - halfB
         val bMaxX = (if (maxX != -Float.MAX_VALUE) maxX else points.maxOf { it.x }) + halfB
@@ -179,7 +179,8 @@ data class Layer(
     val isBucketLayer: Boolean = false,
     val isBucketReference: Boolean = false,
     val celHoldTicks: Int? = null,
-    val celStartTick: Int? = null
+    val celStartTick: Int? = null,
+    val placeBelowFrame: Boolean = false
 )
 
 enum class BucketReferenceMode(val labelPt: String) {
@@ -189,6 +190,8 @@ enum class BucketReferenceMode(val labelPt: String) {
 
 data class BucketFillConfig(
     val expandPixels: Int = 1,
+    val tolerance: Int = 36,
+    val closeGapsPixels: Int = 0,
     val paintUnderneathLineArt: Boolean = false,
     val referenceMode: BucketReferenceMode = BucketReferenceMode.ALL_LAYERS,
     val selectedReferenceLayerIds: Set<String> = emptySet(),
@@ -480,6 +483,18 @@ data class LayerTransformTrack(
     val keyframes: List<ObjectTransformKeyframe> = emptyList()
 )
 
+enum class StageShadingMode(val labelPt: String) {
+    WIREFRAME("Vértices"),
+    SOLID("Sólido"),
+    TEXTURE("Textura"),
+    RENDERED("Luz & Shader")
+}
+
+enum class TransformSpaceMode(val labelPt: String) {
+    GLOBAL("Global"),
+    LOCAL("Próprio Eixo")
+}
+
 enum class ObjectShaderMode(val labelPt: String) {
     PADRAO("Padrão PBR"),
     ANIME_CEL("Cel Anime"),
@@ -521,7 +536,8 @@ data class ObjectUVMapSlot(
     val offsetU: Float = 0f,
     val offsetV: Float = 0f,
     val textureBase64: String? = null,
-    val textureUri: String? = null
+    val textureUri: String? = null,
+    val customUvs: List<Float> = emptyList()
 )
 
 enum class Estudio3DPaintTool(val labelPt: String) {
@@ -548,8 +564,19 @@ enum class ShaderNodeKind(val labelPt: String, val accentArgb: Long) {
     CEL_RAMP("Rampa Cel/Anime", 0xFF00BCD4L),
     BRUSH_GRAIN("Traço Cartoon", 0xFFE91E63L),
     CONTORNO("Contorno", 0xFF2ECC71L),
+    PRINCIPLED_BSDF("Principled BSDF", 0xFF3498DBL),
+    FRESNEL("Fresnel / Borda", 0xFF1ABC9CL),
+    MIX_RGB("Misturar Cores", 0xFF9B59B6L),
+    NOISE_PROC("Ruído Procedural", 0xFF7F8C8DL),
+    EMISSAO("Emissão / Brilho", 0xFFF1C40FL),
     SAIDA_MATERIAL("Saída Material", 0xFFC0392BL)
 }
+
+data class CustomShaderNodePreset(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "Meu Node",
+    val graph: ShaderNodeGraph = ShaderNodeGraph()
+)
 
 data class ShaderNode(
     val id: String,
@@ -644,6 +671,9 @@ data class Camera3DSettings(
     val cameraMode: CameraMode = CameraMode.MODE_3D,
     val effectSpans: List<CameraEffectSpan> = emptyList(),
     val layerTransformTracks: List<LayerTransformTrack> = emptyList(),
-    val scene3DObjects: List<SceneObject3D> = emptyList()
+    val scene3DObjects: List<SceneObject3D> = emptyList(),
+    val showFloorGrid: Boolean = true,
+    val shadingMode: StageShadingMode = StageShadingMode.RENDERED,
+    val transformSpace: TransformSpaceMode = TransformSpaceMode.GLOBAL
 )
 

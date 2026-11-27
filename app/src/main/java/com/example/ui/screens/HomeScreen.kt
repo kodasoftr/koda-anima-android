@@ -734,11 +734,7 @@ private fun ProjectCard(
                         canvas.drawColor(android.graphics.Color.WHITE)
                         canvas.save()
                         canvas.scale(scale, scale)
-                        val combinedLayers = if (targetFrame.localLayers.isEmpty()) {
-                            targetFrame.layers
-                        } else {
-                            targetFrame.layers + targetFrame.localLayers
-                        }
+                        val combinedLayers = com.example.engine.KodanimaGraphicsEngine.composeOrderedFrameLayers(targetFrame)
                         com.example.engine.KodanimaGraphicsEngine.drawLayersStackToCanvas(
                             layers = combinedLayers,
                             canvas = canvas,

@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -60,11 +61,13 @@ import androidx.compose.material.icons.filled.Wallpaper
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -112,6 +115,7 @@ import com.example.model.ObjectTransformKeyframe
 import com.example.model.SkyBackdropMode
 import com.example.model.StageSelection
 import com.example.model.StageTargetType
+import com.example.model.TransformSpaceMode
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.NeonGreen
 import com.example.ui.theme.NeonPink
@@ -206,6 +210,7 @@ fun CameraTimelinePanel(
     onSetKeyframeHold: (Int, Int) -> Unit = { _, _ -> },
     onApplyTweenBetween: (Int, Int, CameraEasingCurve) -> Unit = { _, _, _ -> },
     onAddKeyframeAtTick: (Int) -> Unit = {},
+    onSetTransformSpace: (TransformSpaceMode) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val panelColor = Color(theme.panel)
@@ -713,21 +718,67 @@ fun CameraTimelinePanel(
                                                         val isSel = cameraSettings.captureWidth == w && cameraSettings.captureHeight == h
                                                         CamPill("${w}×${h}", isSel, accentColor, textColor) { onSetCameraResolution(w, h) }
                                                     }
-                                                    OutlinedTextField(
-                                                        value = customResW,
-                                                        onValueChange = { customResW = it.filter { ch -> ch.isDigit() }.take(4) },
-                                                        singleLine = true,
-                                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                                        modifier = Modifier.width(60.dp).height(40.dp)
-                                                    )
+                                                    Surface(
+                                                        color = bgColor.copy(alpha = 0.85f),
+                                                        shape = RoundedCornerShape(8.dp),
+                                                        border = androidx.compose.foundation.BorderStroke(1.dp, accentColor.copy(alpha = 0.45f)),
+                                                        modifier = Modifier
+                                                            .width(62.dp)
+                                                            .heightIn(min = 38.dp)
+                                                    ) {
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .fillMaxWidth()
+                                                                .padding(horizontal = 6.dp, vertical = 9.dp),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            BasicTextField(
+                                                                value = customResW,
+                                                                onValueChange = { customResW = it.filter { ch -> ch.isDigit() }.take(4) },
+                                                                singleLine = true,
+                                                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                                                textStyle = TextStyle(
+                                                                    color = textColor,
+                                                                    fontSize = 11.sp,
+                                                                    fontWeight = FontWeight.Bold,
+                                                                    textAlign = TextAlign.Center
+                                                                ),
+                                                                cursorBrush = SolidColor(accentColor),
+                                                                modifier = Modifier.fillMaxWidth()
+                                                            )
+                                                        }
+                                                    }
                                                     Text("×", color = textColor, fontSize = 11.sp)
-                                                    OutlinedTextField(
-                                                        value = customResH,
-                                                        onValueChange = { customResH = it.filter { ch -> ch.isDigit() }.take(4) },
-                                                        singleLine = true,
-                                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                                        modifier = Modifier.width(60.dp).height(40.dp)
-                                                    )
+                                                    Surface(
+                                                        color = bgColor.copy(alpha = 0.85f),
+                                                        shape = RoundedCornerShape(8.dp),
+                                                        border = androidx.compose.foundation.BorderStroke(1.dp, accentColor.copy(alpha = 0.45f)),
+                                                        modifier = Modifier
+                                                            .width(62.dp)
+                                                            .heightIn(min = 38.dp)
+                                                    ) {
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .fillMaxWidth()
+                                                                .padding(horizontal = 6.dp, vertical = 9.dp),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            BasicTextField(
+                                                                value = customResH,
+                                                                onValueChange = { customResH = it.filter { ch -> ch.isDigit() }.take(4) },
+                                                                singleLine = true,
+                                                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                                                textStyle = TextStyle(
+                                                                    color = textColor,
+                                                                    fontSize = 11.sp,
+                                                                    fontWeight = FontWeight.Bold,
+                                                                    textAlign = TextAlign.Center
+                                                                ),
+                                                                cursorBrush = SolidColor(accentColor),
+                                                                modifier = Modifier.fillMaxWidth()
+                                                            )
+                                                        }
+                                                    }
                                                     CamPill("Aplicar", false, NeonGreen, textColor) {
                                                         val w = customResW.toIntOrNull() ?: cameraSettings.captureWidth
                                                         val h = customResH.toIntOrNull() ?: cameraSettings.captureHeight
@@ -754,12 +805,42 @@ fun CameraTimelinePanel(
                                             }
                                         }
                                         1 -> {
-                                            // Intuitive Rotation Dial + Eixos X/Y/Z
+                                            // Intuitive Rotation Dial + Eixos X/Y/Z + Global vs Próprio Eixo
                                             var rotDialAxis by remember { mutableIntStateOf(2) } // 0=X, 1=Y, 2=Z
+                                            val isLocalSpace = cameraSettings.transformSpace == TransformSpaceMode.LOCAL
                                             val currentAxisAngle = when (rotDialAxis) {
                                                 0 -> evaluatedObjKf.rotX
                                                 1 -> evaluatedObjKf.rotY
                                                 else -> evaluatedObjKf.rotZ
+                                            }
+                                            fun applyAxisAngle(axis: Int, targetDeg: Float) {
+                                                onUpdateSelectedObjectTransform { cur ->
+                                                    if (isLocalSpace) {
+                                                        val prev = when (axis) {
+                                                            0 -> cur.rotX
+                                                            1 -> cur.rotY
+                                                            else -> cur.rotZ
+                                                        }
+                                                        var d = targetDeg - prev
+                                                        while (d > 180f) d -= 360f
+                                                        while (d < -180f) d += 360f
+                                                        val (nx, ny, nz) = Camera3DEngine.composeLocalAxisRotationEuler(
+                                                            rxDeg = cur.rotX,
+                                                            ryDeg = cur.rotY,
+                                                            rzDeg = cur.rotZ,
+                                                            dLocalX = if (axis == 0) d else 0f,
+                                                            dLocalY = if (axis == 1) d else 0f,
+                                                            dLocalZ = if (axis == 2) d else 0f
+                                                        )
+                                                        cur.copy(rotX = nx, rotY = ny, rotZ = nz)
+                                                    } else {
+                                                        when (axis) {
+                                                            0 -> cur.copy(rotX = targetDeg)
+                                                            1 -> cur.copy(rotY = targetDeg)
+                                                            else -> cur.copy(rotZ = targetDeg)
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Row(
                                                 modifier = Modifier.fillMaxWidth(),
@@ -775,20 +856,16 @@ fun CameraTimelinePanel(
                                                     },
                                                     textColor = textColor,
                                                     testTag = "object_rot_dial"
-                                                ) { deg ->
-                                                    onUpdateSelectedObjectTransform {
-                                                        when (rotDialAxis) {
-                                                            0 -> it.copy(rotX = deg)
-                                                            1 -> it.copy(rotY = deg)
-                                                            else -> it.copy(rotZ = deg)
-                                                        }
-                                                    }
-                                                }
+                                                ) { deg -> applyAxisAngle(rotDialAxis, deg) }
                                                 Column(
                                                     modifier = Modifier.weight(1f),
                                                     verticalArrangement = Arrangement.spacedBy(3.dp)
                                                 ) {
-                                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                    Row(
+                                                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                        verticalAlignment = Alignment.CenterVertically
+                                                    ) {
                                                         Text("Eixo:", fontSize = 8.5.sp, color = textColor.copy(alpha = 0.72f))
                                                         CamPill("X", rotDialAxis == 0, NeonPink, textColor) { rotDialAxis = 0 }
                                                         CamPill("Y", rotDialAxis == 1, NeonGreen, textColor) { rotDialAxis = 1 }
@@ -796,17 +873,26 @@ fun CameraTimelinePanel(
                                                         CamPill("0°", false, OrangeAccent, textColor) {
                                                             onUpdateSelectedObjectTransform { it.copy(rotX = 0f, rotY = 0f, rotZ = 0f) }
                                                         }
+                                                        TransformSpaceMode.entries.forEach { sp ->
+                                                            CamPill(
+                                                                label = sp.labelPt,
+                                                                active = cameraSettings.transformSpace == sp,
+                                                                activeColor = OrangeAccent,
+                                                                textColor = textColor,
+                                                                testTag = "transform_space_${sp.name}"
+                                                            ) { onSetTransformSpace(sp) }
+                                                        }
                                                     }
                                                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                                         CamSlider("Rot X", "${evaluatedObjKf.rotX.roundToInt()}°", evaluatedObjKf.rotX, -180f..180f, NeonPink, textColor, Modifier.weight(1f)) { rx ->
-                                                            onUpdateSelectedObjectTransform { it.copy(rotX = rx) }
+                                                            applyAxisAngle(0, rx)
                                                         }
                                                         CamSlider("Rot Y", "${evaluatedObjKf.rotY.roundToInt()}°", evaluatedObjKf.rotY, -180f..180f, NeonGreen, textColor, Modifier.weight(1f)) { ry ->
-                                                            onUpdateSelectedObjectTransform { it.copy(rotY = ry) }
+                                                            applyAxisAngle(1, ry)
                                                         }
                                                     }
                                                     CamSlider("Rot Z", "${evaluatedObjKf.rotZ.roundToInt()}°", evaluatedObjKf.rotZ, -180f..180f, CyanAccent, textColor, Modifier.fillMaxWidth()) { rz ->
-                                                        onUpdateSelectedObjectTransform { it.copy(rotZ = rz) }
+                                                        applyAxisAngle(2, rz)
                                                     }
                                                 }
                                             }
@@ -2381,13 +2467,41 @@ fun CameraTimelinePanel(
                                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
                                         Icon(Icons.Default.FolderSpecial, contentDescription = null, tint = OrangeAccent, modifier = Modifier.size(15.dp))
-                                        OutlinedTextField(
-                                            value = templateNameInput,
-                                            onValueChange = { templateNameInput = it },
-                                            placeholder = { Text("Nome na Pasta Animada...", fontSize = 10.sp) },
-                                            singleLine = true,
-                                            modifier = Modifier.weight(1f).height(44.dp)
-                                        )
+                                        Surface(
+                                            color = bgColor.copy(alpha = 0.85f),
+                                            shape = RoundedCornerShape(8.dp),
+                                            border = androidx.compose.foundation.BorderStroke(1.dp, OrangeAccent.copy(alpha = 0.45f)),
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .heightIn(min = 40.dp)
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(horizontal = 10.dp, vertical = 9.dp),
+                                                contentAlignment = Alignment.CenterStart
+                                            ) {
+                                                if (templateNameInput.isEmpty()) {
+                                                    Text(
+                                                        text = "Nome na Pasta Animada...",
+                                                        fontSize = 10.5.sp,
+                                                        color = textColor.copy(alpha = 0.48f)
+                                                    )
+                                                }
+                                                BasicTextField(
+                                                    value = templateNameInput,
+                                                    onValueChange = { templateNameInput = it },
+                                                    singleLine = true,
+                                                    textStyle = TextStyle(
+                                                        color = textColor,
+                                                        fontSize = 11.sp,
+                                                        fontWeight = FontWeight.Medium
+                                                    ),
+                                                    cursorBrush = SolidColor(OrangeAccent),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                            }
+                                        }
                                         Surface(
                                             modifier = Modifier
                                                 .clip(RoundedCornerShape(8.dp))

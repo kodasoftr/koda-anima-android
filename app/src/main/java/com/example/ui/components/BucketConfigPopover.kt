@@ -212,6 +212,66 @@ fun BucketConfigPopover(
                 }
             }
 
+            // 1b. Tolerância de Cor (anti-aliasing) e Fechar Lacunas
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "Tolerância: ${config.tolerance}",
+                        color = textColor,
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    androidx.compose.material3.Slider(
+                        value = config.tolerance.toFloat(),
+                        onValueChange = { v ->
+                            onUpdateConfig(config.copy(tolerance = v.toInt().coerceIn(0, 120)))
+                        },
+                        valueRange = 0f..120f,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(22.dp)
+                            .testTag("bucket_tolerance_slider"),
+                        colors = androidx.compose.material3.SliderDefaults.colors(
+                            thumbColor = accentColor,
+                            activeTrackColor = accentColor
+                        )
+                    )
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        "Fechar lacunas",
+                        color = textColor,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                        listOf(0, 1, 2, 4).forEach { gapPx ->
+                            val chosen = config.closeGapsPixels == gapPx
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(if (chosen) accentColor else textColor.copy(alpha = 0.08f))
+                                    .clickable { onUpdateConfig(config.copy(closeGapsPixels = gapPx)) }
+                                    .padding(horizontal = 6.dp, vertical = 3.dp)
+                                    .testTag("bucket_gap_$gapPx")
+                            ) {
+                                Text(
+                                    text = if (gapPx == 0) "Off" else "${gapPx}px",
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (chosen) Color.White else textColor
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
             // 2. Pintar Sempre Por Baixo da Line Art
             Row(
                 modifier = Modifier

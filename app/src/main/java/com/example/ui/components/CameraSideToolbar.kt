@@ -35,10 +35,12 @@ import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.CropLandscape
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.GpsFixed
+import androidx.compose.material.icons.filled.Grain
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -89,6 +91,8 @@ fun CameraSideToolbar(
     onToggleThreeWheels3D: () -> Unit = {},
     isSplitNodesOpen: Boolean = false,
     onToggleSplitNodes: () -> Unit = {},
+    isUvEditorOpen: Boolean = false,
+    onOpenUvEditor: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val panelColor = Color(theme.panel)
@@ -241,65 +245,15 @@ fun CameraSideToolbar(
                         testTag = "cam_tool_orbit",
                         onClick = { onSelectAction(CameraToolAction.ORBIT_3D) }
                     )
-                }
 
-                Box(
-                    modifier = Modifier
-                        .width(24.dp)
-                        .height(1.dp)
-                        .background(borderColor)
-                )
-
-                CameraActionBtn(
-                    icon = Icons.Default.Add,
-                    label = "+ ◆",
-                    isSelected = false,
-                    accent = OrangeAccent,
-                    textColor = OrangeAccent,
-                    bgColor = bgColor,
-                    size = btnSize,
-                    testTag = "cam_tool_add_key",
-                    onClick = onAddOrUpdateKeyframe
-                )
-
-                CameraActionBtn(
-                    icon = Icons.Default.Link,
-                    label = "Interp.",
-                    isSelected = false,
-                    accent = NeonGreen,
-                    textColor = NeonGreen,
-                    bgColor = bgColor,
-                    size = btnSize,
-                    testTag = "cam_tool_connect_keys",
-                    onClick = onConnectTwoKeyframes
-                )
-
-                CameraActionBtn(
-                    icon = Icons.Default.CropFree,
-                    label = "Mold.",
-                    isSelected = showCaptureFrame,
-                    accent = accentColor,
-                    textColor = textColor,
-                    bgColor = bgColor,
-                    size = btnSize,
-                    testTag = "cam_tool_frame_overlay",
-                    onClick = onToggleCaptureFrame
-                )
-
-                if (is3DMode) {
-                    CameraActionBtn(
-                        icon = Icons.Default.Layers,
-                        label = "Palco 3D",
-                        isSelected = isSideView3D,
-                        accent = OrangeAccent,
-                        textColor = textColor,
-                        bgColor = bgColor,
-                        size = btnSize,
-                        testTag = "cam_tool_stage_3d",
-                        onClick = onToggleSideView3D
+                    Box(
+                        modifier = Modifier
+                            .width(24.dp)
+                            .height(1.dp)
+                            .background(borderColor)
                     )
 
-                    // 3 Rodas do Estúdio 3D (UV Desdobrado, Shader/Contorno, Luz, Pintura 3D)
+                    // 3 Rodas do Estúdio 3D (Importar 3D, Modos de Visão, Grade, UV, Shader/Luz, Pintura UV)
                     Column(
                         modifier = Modifier
                             .width(48.dp)
@@ -341,19 +295,19 @@ fun CameraSideToolbar(
                         testTag = "studio3d_split_nodes_btn",
                         onClick = onToggleSplitNodes
                     )
-                }
 
-                CameraActionBtn(
-                    icon = Icons.Default.RestartAlt,
-                    label = "Zerar",
-                    isSelected = false,
-                    accent = NeonPink,
-                    textColor = NeonPink,
-                    bgColor = bgColor,
-                    size = btnSize,
-                    testTag = "cam_tool_reset",
-                    onClick = onResetCurrentKeyframe
-                )
+                    CameraActionBtn(
+                        icon = Icons.Default.Grain,
+                        label = "Malha UV",
+                        isSelected = isUvEditorOpen,
+                        accent = OrangeAccent,
+                        textColor = textColor,
+                        bgColor = bgColor,
+                        size = btnSize,
+                        testTag = "studio3d_uv_editor_btn",
+                        onClick = onOpenUvEditor
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(2.dp))
 
@@ -407,7 +361,8 @@ private fun CameraActionBtn(
     Column(
         modifier = Modifier
             .width(48.dp)
-            .heightIn(min = 42.dp)
+            .heightIn(min = 48.dp)
+            .minimumInteractiveComponentSize()
             .clip(RoundedCornerShape(9.dp))
             .background(if (isSelected) accent.copy(alpha = 0.24f) else bgColor.copy(alpha = 0.35f))
             .border(

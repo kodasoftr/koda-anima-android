@@ -98,9 +98,12 @@ import com.example.model.ObjectTexturePaintLayer
 import com.example.model.ObjectTransformKeyframe
 import com.example.model.ObjectUVMapSlot
 import com.example.model.SceneObject3D
+import com.example.model.CustomShaderNodePreset
 import com.example.model.ShaderNodeGraph
 import com.example.model.StageSelection
+import com.example.model.StageShadingMode
 import com.example.model.StageTargetType
+import com.example.model.TransformSpaceMode
 import com.example.model.Estudio3DPaintTool
 import com.example.model.UvUnwrapProjection
 import com.example.model.PerspectiveRulerSettings
@@ -222,13 +225,16 @@ data class EditorUiState(
     val isStudio3DThreeWheelsOpen: Boolean = false,
     val isStudio3DSplitNodesOpen: Boolean = false,
     val isStudio3DUVUnfoldOpen: Boolean = false,
+    val isStudio3DUvPaintScreenOpen: Boolean = false,
+    val isStudio3DUvEditorOpen: Boolean = false,
     val studio3DPaintEnabled: Boolean = false,
     val studio3DPaintTool: Estudio3DPaintTool = Estudio3DPaintTool.PINCEL,
     val studio3DPaintSize: Float = 14f,
     val studio3DPaintOpacity: Float = 1.0f,
     val studio3DActiveAxisLock: Int = 0,          // 0=Livre, 1=X, 2=Y, 3=Z
     val studio3DTransformShortcutMode: Int = 0,  // 0=Livre, 1=Mover(G), 2=Girar(R), 3=Escalar(S)
-    val studio3DMeshRevision: Int = 0
+    val studio3DMeshRevision: Int = 0,
+    val customShaderNodePresets: List<CustomShaderNodePreset> = emptyList()
 )
 
 class KodanimaViewModel : ViewModel() {
@@ -280,6 +286,9 @@ class KodanimaViewModel : ViewModel() {
     private val perFrameUndoOps = mutableMapOf<String, MutableList<CanvasOp>>()
     private val perFrameRedoOps = mutableMapOf<String, MutableList<CanvasOp>>()
     private val perFrameLocalTarget = mutableMapOf<String, Pair<Boolean, Int>>()
+    private val camera3DUndoStack = mutableListOf<Camera3DSettings>()
+    private val camera3DRedoStack = mutableListOf<Camera3DSettings>()
+    private var lastCameraUndoSnapshotMs: Long = 0L
     private val maxHistorySize: Int
         get() = HardwareCapabilitiesEngine.currentProfile.maxUndoHistory
 
@@ -327,6 +336,8 @@ class KodanimaViewModel : ViewModel() {
         perFrameUndoOps.clear()
         perFrameRedoOps.clear()
         perFrameLocalTarget.clear()
+        camera3DUndoStack.clear()
+        camera3DRedoStack.clear()
         KodanimaBitmapPool.clear()
         appContext = null
     }
@@ -1460,6 +1471,8 @@ class KodanimaViewModel : ViewModel() {
         perFrameUndoOps.clear()
         perFrameRedoOps.clear()
         perFrameLocalTarget.clear()
+        camera3DUndoStack.clear()
+        camera3DRedoStack.clear()
         val uniqueName = ensureUniqueProjectName(name)
         val newProj = SampleProjects.createEmptyProject(uniqueName, resolution, fps)
         _uiState.update {
@@ -1484,6 +1497,8 @@ class KodanimaViewModel : ViewModel() {
         perFrameUndoOps.clear()
         perFrameRedoOps.clear()
         perFrameLocalTarget.clear()
+        camera3DUndoStack.clear()
+        camera3DRedoStack.clear()
         val initialFrame = project.lastActiveFrameIndex.coerceIn(0, (project.frames.size - 1).coerceAtLeast(0))
         val initialTick = TimelineTrackEngine.computeCelStartTick(project, 0, initialFrame)
         _uiState.update {
@@ -1511,6 +1526,8 @@ class KodanimaViewModel : ViewModel() {
         perFrameUndoOps.clear()
         perFrameRedoOps.clear()
         perFrameLocalTarget.clear()
+        camera3DUndoStack.clear()
+        camera3DRedoStack.clear()
         val loadedProject = if (entry.isCompressed) {
             try {
                 ProjectCompressionManager.decompressProject(context, entry.fileOnDisk)
@@ -1565,6 +1582,8 @@ class KodanimaViewModel : ViewModel() {
         perFrameUndoOps.clear()
         perFrameRedoOps.clear()
         perFrameLocalTarget.clear()
+        camera3DUndoStack.clear()
+        camera3DRedoStack.clear()
         val uniqueName = ensureUniqueProjectName(name)
         val newProj = SampleProjects.createEmptyProject(uniqueName, resolution, fps)
         ProjectCompressionManager.saveWorkingProject(context, newProj)
@@ -2599,29 +2618,112 @@ class KodanimaViewModel : ViewModel() {
             val spans = withContext(KodanimaDispatchers.backgroundRender) {
                 var bmp: Bitmap? = null
                 try {
-                    bmp = KodanimaGraphicsEngine.renderSelectedLayersToBitmap(
+                    val projW = proj.resolution.width.coerceAtLeast(1)
+                    val projH = proj.resolution.height.coerceAtLeast(1)
+                    val targetLayers = if (refLayerIds == null) {
+                        KodanimaGraphicsEngine.composeOrderedFrameLayers(currFrame)
+                    } else {
+                        KodanimaGraphicsEngine.composeOrderedFrameLayers(currFrame).filter { it.id in refLayerIds }
+                    }
+                    var minRX = 0f
+                    var minRY = 0f
+                    var maxRX = projW.toFloat()
+                    var maxRY = projH.toFloat()
+                    val tapIsOffCanvas = x < 0f || x >= projW || y < 0f || y >= projH
+                    if (tapIsOffCanvas) {
+                        minRX = min(minRX, x - 96f)
+                        minRY = min(minRY, y - 96f)
+                        maxRX = max(maxRX, x + 96f)
+                        maxRY = max(maxRY, y + 96f)
+                    }
+                    for (rl in targetLayers) {
+                        if (!rl.isVisible) continue
+                        for (st in rl.strokes) {
+                            if (st.points.isEmpty()) continue
+                            val pad = st.brushSize + 8f
+                            if (st.minX != Float.MAX_VALUE && st.maxX != -Float.MAX_VALUE) {
+                                if (tapIsOffCanvas || st.minX < 0f || st.minY < 0f || st.maxX > projW || st.maxY > projH) {
+                                    minRX = min(minRX, st.minX - pad)
+                                    minRY = min(minRY, st.minY - pad)
+                                    maxRX = max(maxRX, st.maxX + pad)
+                                    maxRY = max(maxRY, st.maxY + pad)
+                                }
+                            } else if (tapIsOffCanvas) {
+                                for (pt in st.points) {
+                                    minRX = min(minRX, pt.x - pad)
+                                    minRY = min(minRY, pt.y - pad)
+                                    maxRX = max(maxRX, pt.x + pad)
+                                    maxRY = max(maxRY, pt.y + pad)
+                                }
+                            }
+                        }
+                    }
+                    val regW = (maxRX - minRX).coerceAtLeast(1f)
+                    val regH = (maxRY - minRY).coerceAtLeast(1f)
+                    val maxFloodDim = 1800f
+                    val fillScale = if (regW > maxFloodDim || regH > maxFloodDim) {
+                        min(maxFloodDim / regW, maxFloodDim / regH)
+                    } else 1.0f
+                    val bmpW = (regW * fillScale).toInt().coerceAtLeast(1)
+                    val bmpH = (regH * fillScale).toInt().coerceAtLeast(1)
+
+                    bmp = KodanimaGraphicsEngine.renderSelectedLayersRegionToBitmap(
                         frame = currFrame,
-                        width = proj.resolution.width,
-                        height = proj.resolution.height,
+                        width = bmpW,
+                        height = bmpH,
                         selectedLayerIds = refLayerIds,
-                        backgroundColor = android.graphics.Color.WHITE
+                        offsetX = minRX,
+                        offsetY = minRY,
+                        renderScale = fillScale,
+                        projectWidth = projW,
+                        projectHeight = projH,
+                        backgroundColor = android.graphics.Color.TRANSPARENT
                     )
-                    val px = x.toInt().coerceIn(0, bmp.width - 1)
-                    val py = y.toInt().coerceIn(0, bmp.height - 1)
-                    KodanimaGraphicsEngine.createFloodFillSpans(
+                    val px = ((x - minRX) * fillScale).toInt().coerceIn(0, bmp.width - 1)
+                    val py = ((y - minRY) * fillScale).toInt().coerceIn(0, bmp.height - 1)
+                    val mappedPoly = if (selectionClipPoly != null && (minRX != 0f || minRY != 0f || fillScale != 1f)) {
+                        selectionClipPoly.map { pt ->
+                            StrokePoint((pt.x - minRX) * fillScale, (pt.y - minRY) * fillScale, pt.pressure, pt.timestamp)
+                        }
+                    } else selectionClipPoly
+                    val rawSpans = KodanimaGraphicsEngine.createFloodFillSpans(
                         bitmap = bmp,
                         startX = px,
                         startY = py,
-                        tolerance = 20,
-                        selectionPoly = selectionClipPoly,
+                        tolerance = cfg.tolerance.coerceIn(0, 140),
+                        selectionPoly = mappedPoly,
                         isSelectionInverted = activeSel.isInverted,
-                        expandPixels = cfg.expandPixels
+                        expandPixels = cfg.expandPixels,
+                        closeGapsPixels = cfg.closeGapsPixels
                     )
+                    if (minRX == 0f && minRY == 0f && fillScale == 1.0f) {
+                        rawSpans
+                    } else {
+                        val invS = 1f / fillScale
+                        rawSpans.map { pt ->
+                            StrokePoint(
+                                x = minRX + pt.x * invS,
+                                y = minRY + pt.y * invS,
+                                pressure = pt.pressure,
+                                timestamp = pt.timestamp
+                            )
+                        }
+                    }
                 } finally {
                     KodanimaBitmapPool.release(bmp)
                 }
             }
             if (spans.isNotEmpty()) {
+                var sMinX = Float.MAX_VALUE
+                var sMinY = Float.MAX_VALUE
+                var sMaxX = -Float.MAX_VALUE
+                var sMaxY = -Float.MAX_VALUE
+                for (pt in spans) {
+                    if (pt.x < sMinX) sMinX = pt.x
+                    if (pt.y < sMinY) sMinY = pt.y
+                    if (pt.x > sMaxX) sMaxX = pt.x
+                    if (pt.y > sMaxY) sMaxY = pt.y
+                }
                 val stroke = DrawingStroke(
                     tool = ToolType.BUCKET,
                     color = fillColor,
@@ -2632,7 +2734,11 @@ class KodanimaViewModel : ViewModel() {
                     clipPolygon = selectionClipPoly,
                     clipInverted = if (selectionClipPoly != null) activeSel.isInverted else false,
                     clipBoundsWidth = proj.resolution.width.toFloat(),
-                    clipBoundsHeight = proj.resolution.height.toFloat()
+                    clipBoundsHeight = proj.resolution.height.toFloat(),
+                    minX = sMinX,
+                    minY = sMinY,
+                    maxX = sMaxX,
+                    maxY = sMaxY
                 )
                 commitBucketStrokeToDestination(stroke, frameIndex)
             }
@@ -2984,7 +3090,7 @@ class KodanimaViewModel : ViewModel() {
         }
         var appliedLayerIdx = 0
         _uiState.update { state ->
-            val currFrame = state.project.frames[state.currentFrameIndex]
+            val currFrame = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
             val updatedFrame = if (useLocal && currFrame.localLayers.isNotEmpty()) {
                 val validIdx = state.activeLocalLayerIndex.coerceIn(0, currFrame.localLayers.lastIndex)
                 appliedLayerIdx = validIdx
@@ -3070,18 +3176,20 @@ class KodanimaViewModel : ViewModel() {
             pushUndoOp(CanvasOp.ReplaceStrokes(myId, currFrame.id, validLayerIdx, removedList, outsideKeep, isLocalLayer = useLocal))
         }
         _uiState.update { state ->
-            val f = state.project.frames[state.currentFrameIndex]
+            val f = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
             val updatedFrame = if (useLocal && f.localLayers.isNotEmpty()) {
-                val l = f.localLayers[validLayerIdx]
+                val validLocal = validLayerIdx.coerceIn(0, f.localLayers.lastIndex)
+                val l = f.localLayers[validLocal]
                 val remainingStrokes = l.strokes.filter { it.id !in removeIds } + outsideKeep
                 val updatedLayers = f.localLayers.toMutableList()
-                updatedLayers[validLayerIdx] = l.copy(strokes = remainingStrokes)
+                updatedLayers[validLocal] = l.copy(strokes = remainingStrokes)
                 f.copy(localLayers = updatedLayers)
             } else {
-                val l = f.layers[validLayerIdx]
+                val validMain = validLayerIdx.coerceIn(0, f.layers.lastIndex)
+                val l = f.layers[validMain]
                 val remainingStrokes = l.strokes.filter { it.id !in removeIds } + outsideKeep
                 val updatedLayers = f.layers.toMutableList()
-                updatedLayers[validLayerIdx] = l.copy(strokes = remainingStrokes)
+                updatedLayers[validMain] = l.copy(strokes = remainingStrokes)
                 f.copy(layers = updatedLayers)
             }
             val updatedFrames = state.project.frames.toMutableList()
@@ -3147,16 +3255,18 @@ class KodanimaViewModel : ViewModel() {
         }
         pushUndoOp(CanvasOp.AddStroke(myId, currFrame.id, validLayerIdx, fillStroke, isLocalLayer = useLocal))
         _uiState.update { state ->
-            val f = state.project.frames[state.currentFrameIndex]
+            val f = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
             val updatedFrame = if (useLocal && f.localLayers.isNotEmpty()) {
-                val l = f.localLayers[validLayerIdx]
+                val validLocal = validLayerIdx.coerceIn(0, f.localLayers.lastIndex)
+                val l = f.localLayers[validLocal]
                 val updatedLayers = f.localLayers.toMutableList()
-                updatedLayers[validLayerIdx] = l.copy(strokes = l.strokes + fillStroke)
+                updatedLayers[validLocal] = l.copy(strokes = l.strokes + fillStroke)
                 f.copy(localLayers = updatedLayers)
             } else {
-                val l = f.layers[validLayerIdx]
+                val validMain = validLayerIdx.coerceIn(0, f.layers.lastIndex)
+                val l = f.layers[validMain]
                 val updatedLayers = f.layers.toMutableList()
-                updatedLayers[validLayerIdx] = l.copy(strokes = l.strokes + fillStroke)
+                updatedLayers[validMain] = l.copy(strokes = l.strokes + fillStroke)
                 f.copy(layers = updatedLayers)
             }
             val updatedFrames = state.project.frames.toMutableList()
@@ -3242,18 +3352,20 @@ class KodanimaViewModel : ViewModel() {
             }
 
             _uiState.update { state ->
-                val f = state.project.frames[state.currentFrameIndex]
+                val f = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
                 val updatedFrame = if (useLocal && f.localLayers.isNotEmpty()) {
-                    val l = f.localLayers[validLayerIdx]
+                    val validLocal = validLayerIdx.coerceIn(0, f.localLayers.lastIndex)
+                    val l = f.localLayers[validLocal]
                     val otherStrokes = l.strokes.filter { it.id !in targetOldIds }
                     val updatedLayers = f.localLayers.toMutableList()
-                    updatedLayers[validLayerIdx] = l.copy(strokes = otherStrokes + replacementStrokes)
+                    updatedLayers[validLocal] = l.copy(strokes = otherStrokes + replacementStrokes)
                     f.copy(localLayers = updatedLayers)
                 } else {
-                    val l = f.layers[validLayerIdx]
+                    val validMain = validLayerIdx.coerceIn(0, f.layers.lastIndex)
+                    val l = f.layers[validMain]
                     val otherStrokes = l.strokes.filter { it.id !in targetOldIds }
                     val updatedLayers = f.layers.toMutableList()
-                    updatedLayers[validLayerIdx] = l.copy(strokes = otherStrokes + replacementStrokes)
+                    updatedLayers[validMain] = l.copy(strokes = otherStrokes + replacementStrokes)
                     f.copy(layers = updatedLayers)
                 }
                 val updatedFrames = state.project.frames.toMutableList()
@@ -3338,7 +3450,7 @@ class KodanimaViewModel : ViewModel() {
     fun duplicateCurrentFrame() {
         _uiState.update { state ->
             saveCurrentFrameTargetPreference(state)
-            val curr = state.project.frames[state.currentFrameIndex]
+            val curr = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
             val duplicatedLayers = curr.layers.map { layer ->
                 layer.copy(
                     id = java.util.UUID.randomUUID().toString(),
@@ -3422,7 +3534,7 @@ class KodanimaViewModel : ViewModel() {
             )
         )
         _uiState.update { state ->
-            val currFrame = state.project.frames[state.currentFrameIndex]
+            val currFrame = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
             val clearedLayers = currFrame.layers.map { it.copy(strokes = emptyList()) }
             val clearedLocalLayers = currFrame.localLayers.map { it.copy(strokes = emptyList()) }
             val updatedFrames = state.project.frames.toMutableList()
@@ -4411,12 +4523,20 @@ class KodanimaViewModel : ViewModel() {
         }
     }
 
-    fun addFrameLocalBucketLayer() {
+    fun addFrameLocalBucketLayer(placeBelowFrame: Boolean = true) {
         pushCurrentFrameToUndo()
-        updateCurrentFrameLocalLayers { locals, activeIdx ->
+        updateCurrentFrameLocalLayers { locals, _ ->
             val count = locals.count { it.isBucketLayer }
-            val created = Layer(name = "Sub-Balde ${count + 1}", isBucketLayer = true)
-            val insertAt = activeIdx.coerceIn(0, locals.size)
+            val created = Layer(
+                name = "Sub-Balde ${count + 1}",
+                isBucketLayer = true,
+                placeBelowFrame = placeBelowFrame
+            )
+            val insertAt = if (placeBelowFrame) {
+                locals.count { it.placeBelowFrame }
+            } else {
+                locals.size
+            }
             val mutable = locals.toMutableList()
             mutable.add(insertAt, created)
             _uiState.update {
@@ -4427,7 +4547,7 @@ class KodanimaViewModel : ViewModel() {
                     )
                 )
             }
-            mutable to (insertAt + 1).coerceAtMost(mutable.lastIndex)
+            mutable to insertAt
         }
         updateUndoRedoAvailability()
     }
@@ -4516,12 +4636,15 @@ class KodanimaViewModel : ViewModel() {
         }
     }
 
-    fun addFrameLocalLayer(name: String? = null) {
+    fun addFrameLocalLayer(name: String? = null, placeBelowFrame: Boolean = false) {
         pushCurrentFrameToUndo()
         updateCurrentFrameLocalLayers { locals, _ ->
             val layerName = name?.trim()?.takeIf { it.isNotEmpty() } ?: "Subcamada ${locals.size + 1}"
-            val updated = locals + Layer(name = layerName)
-            updated to updated.lastIndex
+            val created = Layer(name = layerName, placeBelowFrame = placeBelowFrame)
+            val insertAt = if (placeBelowFrame) locals.count { it.placeBelowFrame } else locals.size
+            val mutable = locals.toMutableList()
+            mutable.add(insertAt, created)
+            mutable to insertAt
         }
         updateUndoRedoAvailability()
     }
@@ -4625,6 +4748,34 @@ class KodanimaViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Moves a frame sub-layer either underneath ([placeBelowFrame] = true) or on top of
+     * ([placeBelowFrame] = false) the frame's timeline layers, keeping below/above groups ordered.
+     */
+    fun setFrameLocalLayerPlacement(localIndex: Int, placeBelowFrame: Boolean) {
+        val currFrame = _uiState.value.project.frames.getOrNull(_uiState.value.currentFrameIndex) ?: return
+        if (localIndex !in currFrame.localLayers.indices) return
+        if (currFrame.localLayers[localIndex].placeBelowFrame == placeBelowFrame) return
+        pushCurrentFrameToUndo()
+        updateCurrentFrameLocalLayers { locals, _ ->
+            if (localIndex !in locals.indices) return@updateCurrentFrameLocalLayers locals to null
+            val updatedItem = locals[localIndex].copy(placeBelowFrame = placeBelowFrame)
+            val remaining = locals.filterIndexed { idx, _ -> idx != localIndex }
+            val below = remaining.filter { it.placeBelowFrame }.toMutableList()
+            val above = remaining.filter { !it.placeBelowFrame }.toMutableList()
+            val targetIdx: Int
+            if (placeBelowFrame) {
+                below.add(updatedItem)
+                targetIdx = below.lastIndex
+            } else {
+                above.add(0, updatedItem)
+                targetIdx = below.size
+            }
+            (below + above) to targetIdx
+        }
+        updateUndoRedoAvailability()
+    }
+
     // --- Per-User Independent Undo / Redo (Synced Over LAN) ---
 
     private fun pushUndoOp(op: CanvasOp) {
@@ -4641,8 +4792,57 @@ class KodanimaViewModel : ViewModel() {
         pushUndoOp(CanvasOp.FrameSnapshot(curr.id, curr))
     }
 
+    private fun pushCamera3DUndoSnapshot(coalesceMs: Long = 0L) {
+        val now = System.currentTimeMillis()
+        val curCam = _uiState.value.project.camera3D
+        if (coalesceMs > 0L && camera3DUndoStack.isNotEmpty() && (now - lastCameraUndoSnapshotMs) < coalesceMs) {
+            return
+        }
+        if (camera3DUndoStack.lastOrNull() == curCam) return
+        camera3DUndoStack.add(curCam)
+        if (camera3DUndoStack.size > maxHistorySize) {
+            camera3DUndoStack.removeAt(0)
+        }
+        camera3DRedoStack.clear()
+        lastCameraUndoSnapshotMs = now
+        updateUndoRedoAvailability()
+    }
+
+    private fun isInCameraOr3DContext(state: EditorUiState): Boolean {
+        return state.isCameraSideView3D ||
+            state.isCameraTimelineOpen ||
+            state.isStudio3DSplitNodesOpen ||
+            state.isStudio3DUvPaintScreenOpen ||
+            state.isStudio3DUvEditorOpen
+    }
+
     fun undo() {
         val stateBefore = _uiState.value
+        if (isInCameraOr3DContext(stateBefore) && camera3DUndoStack.isNotEmpty()) {
+            val prevCam = camera3DUndoStack.removeAt(camera3DUndoStack.lastIndex)
+            camera3DRedoStack.add(stateBefore.project.camera3D)
+            if (camera3DRedoStack.size > maxHistorySize) {
+                camera3DRedoStack.removeAt(0)
+            }
+            _uiState.update { st ->
+                val safeSel = if (st.stageSelection.type == StageTargetType.OBJECT_3D &&
+                    prevCam.scene3DObjects.none { it.id == st.stageSelection.id }
+                ) {
+                    StageSelection(StageTargetType.CAMERA, "camera")
+                } else st.stageSelection
+                val updatedProj = st.project.copy(camera3D = prevCam, updatedAt = System.currentTimeMillis())
+                multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+                st.copy(
+                    project = updatedProj,
+                    stageSelection = safeSel,
+                    studio3DMeshRevision = st.studio3DMeshRevision + 1,
+                    statusMessage = "Ação 3D desfeita."
+                )
+            }
+            scheduleCamera3DSyncIfCoop(includeTextures = true)
+            updateUndoRedoAvailability()
+            return
+        }
         val frameIdx = stateBefore.currentFrameIndex
         val currFrame = stateBefore.project.frames.getOrNull(frameIdx) ?: return
         val undoStack = perFrameUndoOps[currFrame.id] ?: return
@@ -4803,6 +5003,31 @@ class KodanimaViewModel : ViewModel() {
 
     fun redo() {
         val stateBefore = _uiState.value
+        if (isInCameraOr3DContext(stateBefore) && camera3DRedoStack.isNotEmpty()) {
+            val nextCam = camera3DRedoStack.removeAt(camera3DRedoStack.lastIndex)
+            camera3DUndoStack.add(stateBefore.project.camera3D)
+            if (camera3DUndoStack.size > maxHistorySize) {
+                camera3DUndoStack.removeAt(0)
+            }
+            _uiState.update { st ->
+                val safeSel = if (st.stageSelection.type == StageTargetType.OBJECT_3D &&
+                    nextCam.scene3DObjects.none { it.id == st.stageSelection.id }
+                ) {
+                    StageSelection(StageTargetType.CAMERA, "camera")
+                } else st.stageSelection
+                val updatedProj = st.project.copy(camera3D = nextCam, updatedAt = System.currentTimeMillis())
+                multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+                st.copy(
+                    project = updatedProj,
+                    stageSelection = safeSel,
+                    studio3DMeshRevision = st.studio3DMeshRevision + 1,
+                    statusMessage = "Ação 3D refeita."
+                )
+            }
+            scheduleCamera3DSyncIfCoop(includeTextures = true)
+            updateUndoRedoAvailability()
+            return
+        }
         val frameIdx = stateBefore.currentFrameIndex
         val currFrame = stateBefore.project.frames.getOrNull(frameIdx) ?: return
         val redoStack = perFrameRedoOps[currFrame.id] ?: return
@@ -4939,10 +5164,16 @@ class KodanimaViewModel : ViewModel() {
 
     private fun updateUndoRedoAvailability() {
         _uiState.update { state ->
+            val in3D = isInCameraOr3DContext(state)
             val currFrameId = state.project.frames.getOrNull(state.currentFrameIndex)?.id
-            val hasUndo = currFrameId != null && (perFrameUndoOps[currFrameId]?.isNotEmpty() == true)
-            val hasRedo = currFrameId != null && (perFrameRedoOps[currFrameId]?.isNotEmpty() == true)
-            state.copy(canUndo = hasUndo, canRedo = hasRedo)
+            val frameHasUndo = currFrameId != null && (perFrameUndoOps[currFrameId]?.isNotEmpty() == true)
+            val frameHasRedo = currFrameId != null && (perFrameRedoOps[currFrameId]?.isNotEmpty() == true)
+            val camHasUndo = camera3DUndoStack.isNotEmpty()
+            val camHasRedo = camera3DRedoStack.isNotEmpty()
+            state.copy(
+                canUndo = if (in3D) (camHasUndo || frameHasUndo) else frameHasUndo,
+                canRedo = if (in3D) (camHasRedo || frameHasRedo) else frameHasRedo
+            )
         }
     }
 
@@ -5511,7 +5742,8 @@ class KodanimaViewModel : ViewModel() {
         tickFloat: Float = frameIndex.toFloat()
     ): Bitmap {
         val useCam = cropToCamera && proj.camera3D.isEnabled
-        if (useCam || proj.camera3D.postEffects.hasAnyEffect() || proj.canvasBackground.show3DInCanvas) {
+        val has3DObjects = proj.camera3D.scene3DObjects.any { it.isVisible && it.meshAssetPath.isNotBlank() }
+        if (useCam || has3DObjects || proj.camera3D.postEffects.hasAnyEffect() || proj.canvasBackground.show3DInCanvas) {
             val bmp = KodanimaBitmapPool.acquire(outW, outH, Bitmap.Config.ARGB_8888, android.graphics.Color.TRANSPARENT)
             Camera3DEngine.renderFrameWithCameraAndEffects(
                 frame = frame,
@@ -5543,17 +5775,19 @@ class KodanimaViewModel : ViewModel() {
                 val stateNow = _uiState.value
                 val proj = stateNow.project
                 val cropToCam = stateNow.exportCameraCropOnly && proj.camera3D.isEnabled
+                val has3DObjects = proj.camera3D.scene3DObjects.any { it.isVisible && it.meshAssetPath.isNotBlank() }
                 val baseW = if (cropToCam) proj.camera3D.captureWidth else proj.resolution.width
                 val baseH = if (cropToCam) proj.camera3D.captureHeight else proj.resolution.height
-                val w = min(640, baseW).coerceAtLeast(64)
-                val h = ((w.toLong() * baseH) / baseW.coerceAtLeast(1)).toInt().coerceAtLeast(64)
+                val scaleDown = if (max(baseW, baseH) > 800) 800f / max(baseW, baseH).toFloat() else 1f
+                val w = (baseW * scaleDown).roundToInt().coerceAtLeast(64)
+                val h = (baseH * scaleDown).roundToInt().coerceAtLeast(64)
                 val hasDecoupledTiming = proj.frames.any { f -> f.layers.any { it.celHoldTicks != null || it.celStartTick != null } }
 
                 val gifBytes = withContext(KodanimaDispatchers.backgroundRender) {
                     val framePairs = ArrayList<Pair<Bitmap, Int>>(proj.frames.size)
                     try {
-                        if (cropToCam || proj.camera3D.postEffects.hasAnyEffect() || proj.canvasBackground.show3DInCanvas || hasDecoupledTiming) {
-                            val totalTicks = TimelineTrackEngine.computeTotalTicks(proj, includeCameraRunway = cropToCam)
+                        if (cropToCam || has3DObjects || proj.camera3D.postEffects.hasAnyEffect() || proj.canvasBackground.show3DInCanvas || hasDecoupledTiming) {
+                            val totalTicks = TimelineTrackEngine.computeTotalTicks(proj, includeCameraRunway = cropToCam || has3DObjects)
                             for (tick in 0 until totalTicks) {
                                 val composed = TimelineTrackEngine.composeFrameAtTick(proj, tick, 0, 0)
                                 val bmp = renderExportFrameBitmap(proj, composed, tick, w, h, cropToCam, tick.toFloat())
@@ -5601,15 +5835,16 @@ class KodanimaViewModel : ViewModel() {
                 val stateNow = _uiState.value
                 val proj = stateNow.project
                 val cropToCam = stateNow.exportCameraCropOnly && proj.camera3D.isEnabled
+                val has3DObjects = proj.camera3D.scene3DObjects.any { it.isVisible && it.meshAssetPath.isNotBlank() }
                 val baseW = if (cropToCam) proj.camera3D.captureWidth else proj.resolution.width
                 val baseH = if (cropToCam) proj.camera3D.captureHeight else proj.resolution.height
-                val cellW = min(320, baseW).coerceAtLeast(32)
+                val cellW = min(384, baseW).coerceAtLeast(32)
                 val cellH = ((cellW.toLong() * baseH) / baseW.coerceAtLeast(1)).toInt().coerceAtLeast(32)
 
                 val pngBytes = withContext(KodanimaDispatchers.backgroundRender) {
                     var sheetBmp: Bitmap? = null
                     try {
-                        sheetBmp = if (!cropToCam && !proj.canvasBackground.show3DInCanvas) {
+                        sheetBmp = if (!cropToCam && !has3DObjects && !proj.camera3D.postEffects.hasAnyEffect() && !proj.canvasBackground.show3DInCanvas) {
                             KodanimaGraphicsEngine.generateSpriteSheet(
                                 proj.frames,
                                 cellW,
@@ -5661,15 +5896,15 @@ class KodanimaViewModel : ViewModel() {
             try {
                 val stateNow = _uiState.value
                 val proj = stateNow.project
-                val frameIdx = stateNow.currentFrameIndex
-                val curr = proj.frames[frameIdx]
+                val frameIdx = stateNow.currentFrameIndex.coerceIn(0, (proj.frames.size - 1).coerceAtLeast(0))
+                val curr = TimelineTrackEngine.composeFrameAtTick(proj, stateNow.currentTimelineTick, stateNow.activeLayerIndex, frameIdx)
                 val cropToCam = stateNow.exportCameraCropOnly && proj.camera3D.isEnabled
                 val outW = if (cropToCam) proj.camera3D.captureWidth else proj.resolution.width
                 val outH = if (cropToCam) proj.camera3D.captureHeight else proj.resolution.height
                 val pngBytes = withContext(KodanimaDispatchers.backgroundRender) {
                     var bmp: Bitmap? = null
                     try {
-                        bmp = renderExportFrameBitmap(proj, curr, frameIdx, outW, outH, cropToCam)
+                        bmp = renderExportFrameBitmap(proj, curr, frameIdx, outW, outH, cropToCam, stateNow.currentTimelineTick.toFloat())
                         val out = ByteArrayOutputStream()
                         bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
                         out.toByteArray()
@@ -5959,7 +6194,7 @@ class KodanimaViewModel : ViewModel() {
         pushCurrentFrameToUndo()
         _uiState.update { state ->
             saveCurrentFrameTargetPreference(state)
-            val currFrame = state.project.frames[state.currentFrameIndex]
+            val currFrame = state.project.frames.getOrNull(state.currentFrameIndex) ?: return@update state
             val hasDecoupledTiming = state.project.frames.any { f ->
                 f.layers.any { it.celHoldTicks != null || it.celStartTick != null }
             }
@@ -5994,7 +6229,17 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun setProjectResolution(resolution: ProjectResolution) {
-        _uiState.update { it.copy(project = it.project.copy(resolution = resolution)) }
+        _uiState.update {
+            it.copy(
+                project = it.project.copy(
+                    resolution = resolution,
+                    camera3D = it.project.camera3D.copy(
+                        captureWidth = resolution.width,
+                        captureHeight = resolution.height
+                    )
+                )
+            )
+        }
     }
 
     fun setOnionSkinOpacity(opacity: Float) {
@@ -6445,10 +6690,20 @@ class KodanimaViewModel : ViewModel() {
                 isCameraSideView3D = if (opening) state.isCameraSideView3D else false
             )
         }
+        updateUndoRedoAvailability()
     }
 
     fun closeCameraTimeline() {
-        _uiState.update { it.copy(isCameraTimelineOpen = false, isCameraSideView3D = false) }
+        _uiState.update {
+            it.copy(
+                isCameraTimelineOpen = false,
+                isCameraSideView3D = false,
+                isStudio3DSplitNodesOpen = false,
+                isStudio3DUvPaintScreenOpen = false,
+                isStudio3DUvEditorOpen = false
+            )
+        }
+        updateUndoRedoAvailability()
     }
 
     fun toggleCameraEnabled() {
@@ -6474,6 +6729,7 @@ class KodanimaViewModel : ViewModel() {
                 statusMessage = if (next) "Visão 3D lateral (eixo Z das camadas) ativada!" else "Visão frontal do canvas restaurada."
             )
         }
+        updateUndoRedoAvailability()
     }
 
     fun toggleCameraAutoInterpolate() {
@@ -6553,6 +6809,7 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun updateCameraAtCurrentFrame(transform: (Camera3DKeyframe) -> Camera3DKeyframe) {
+        pushCamera3DUndoSnapshot(coalesceMs = 650L)
         _uiState.update { state ->
             val tickIdx = state.currentTimelineTick.coerceAtLeast(0)
             val cam = state.project.camera3D
@@ -7247,6 +7504,7 @@ class KodanimaViewModel : ViewModel() {
     fun updateSelectedObjectTransform(transform: (ObjectTransformKeyframe) -> ObjectTransformKeyframe) {
         val sel = _uiState.value.stageSelection
         if (sel.type == StageTargetType.CAMERA) return
+        pushCamera3DUndoSnapshot(coalesceMs = 650L)
         _uiState.update { state ->
             val tickIdx = state.currentTimelineTick.coerceAtLeast(0)
             val cam = state.project.camera3D
@@ -7318,18 +7576,27 @@ class KodanimaViewModel : ViewModel() {
     ) {
         val sel = _uiState.value.stageSelection
         if (sel.type == StageTargetType.CAMERA) return
+        val useLocalAxis = _uiState.value.project.camera3D.transformSpace == TransformSpaceMode.LOCAL
         updateSelectedObjectTransform { cur ->
             val nextS = if (kotlin.math.abs(scaleFactor - 1f) > 0.0005f) {
                 (cur.scaleX * scaleFactor).coerceIn(0.1f, 12f)
             } else cur.scaleX
             val sRatio = if (cur.scaleX > 0.001f) nextS / cur.scaleX else 1f
+            val (nextRx, nextRy, nextRz) = if (useLocalAxis && (dRotX != 0f || dRotY != 0f || dRotZ != 0f)) {
+                Camera3DEngine.composeLocalAxisRotationEuler(
+                    cur.rotX, cur.rotY, cur.rotZ,
+                    dRotX, dRotY, dRotZ
+                )
+            } else {
+                Triple(cur.rotX + dRotX, cur.rotY + dRotY, cur.rotZ + dRotZ)
+            }
             cur.copy(
                 x = (cur.x + dx).coerceIn(-2400f, 2400f),
                 y = (cur.y + dy).coerceIn(-2400f, 2400f),
                 z = (cur.z + dz).coerceIn(-2400f, 2400f),
-                rotX = cur.rotX + dRotX,
-                rotY = cur.rotY + dRotY,
-                rotZ = cur.rotZ + dRotZ,
+                rotX = nextRx,
+                rotY = nextRy,
+                rotZ = nextRz,
                 scaleX = (cur.scaleX * sRatio).coerceIn(0.1f, 12f),
                 scaleY = (cur.scaleY * sRatio).coerceIn(0.1f, 12f),
                 scaleZ = (cur.scaleZ * sRatio).coerceIn(0.1f, 12f)
@@ -7395,6 +7662,7 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun addBuiltIn3DPrimitive(primitive: BuiltIn3DPrimitive) {
+        pushCamera3DUndoSnapshot(coalesceMs = 0L)
         val (assetPath, sceneData) = Mesh3DImporter.createBuiltInSceneAsset(primitive)
         val obj = SceneObject3D(
             name = sceneData.name,
@@ -7429,10 +7697,11 @@ class KodanimaViewModel : ViewModel() {
             }
             if (imported == null) {
                 _uiState.update {
-                    it.copy(statusMessage = "Não foi possível ler a cena 3D. Use .glb, .gltf, .obj, .fbx, .max, .3ds ou .zip.")
+                    it.copy(statusMessage = "Não foi possível ler a cena 3D. Use .glb, .gltf, .obj, .fbx, .max, .3ds, .zip ou .rar.")
                 }
                 return@launch
             }
+            pushCamera3DUndoSnapshot(coalesceMs = 0L)
             val (assetPath, sceneData) = imported
             val fmt = assetPath.substringAfterLast('.', "3D").uppercase().take(6)
             val newObj = SceneObject3D(
@@ -7457,8 +7726,11 @@ class KodanimaViewModel : ViewModel() {
                     ),
                     statusMessage = buildString {
                         append("Cena 3D '${newObj.name}' (${sceneData.totalTriangles} triângulos")
+                        if (sceneData.hasBones) {
+                            append(" • ${sceneData.bones.size} ossos")
+                        }
                         if (sceneData.hasAnimations) {
-                            append(" • ${sceneData.animData?.clips?.size ?: 1} animação(ões)")
+                            append(" • ${sceneData.animData?.clips?.size ?: 1} anim.")
                         }
                         append(") importada!")
                     }
@@ -7498,6 +7770,7 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun deleteSceneObject3D(objectId: String) {
+        pushCamera3DUndoSnapshot(coalesceMs = 0L)
         _uiState.update { state ->
             val cam = state.project.camera3D
             val objs = cam.scene3DObjects.filterNot { it.id == objectId }
@@ -7559,14 +7832,221 @@ class KodanimaViewModel : ViewModel() {
             } else state.stageSelection
             state.copy(
                 isStudio3DSplitNodesOpen = nextOpen,
+                isStudio3DUvPaintScreenOpen = if (nextOpen) false else state.isStudio3DUvPaintScreenOpen,
+                isStudio3DUvEditorOpen = if (nextOpen) false else state.isStudio3DUvEditorOpen,
                 isCameraSideView3D = if (nextOpen) true else state.isCameraSideView3D,
                 stageSelection = nextSel
             )
         }
+        updateUndoRedoAvailability()
     }
 
     fun closeStudio3DSplitNodes() {
         _uiState.update { it.copy(isStudio3DSplitNodesOpen = false) }
+        updateUndoRedoAvailability()
+    }
+
+    fun openStudio3DUvPaintScreen() {
+        _uiState.update { state ->
+            val fallbackObjId = state.project.camera3D.scene3DObjects.firstOrNull()?.id
+            val nextSel = if (state.stageSelection.type != StageTargetType.OBJECT_3D && fallbackObjId != null) {
+                StageSelection(StageTargetType.OBJECT_3D, fallbackObjId)
+            } else state.stageSelection
+            state.copy(
+                isStudio3DUvPaintScreenOpen = true,
+                isStudio3DThreeWheelsOpen = false,
+                isStudio3DSplitNodesOpen = false,
+                isStudio3DUvEditorOpen = false,
+                studio3DPaintEnabled = true,
+                stageSelection = nextSel
+            )
+        }
+        updateUndoRedoAvailability()
+    }
+
+    fun closeStudio3DUvPaintScreen() {
+        _uiState.update { it.copy(isStudio3DUvPaintScreenOpen = false) }
+        updateUndoRedoAvailability()
+    }
+
+    fun openStudio3DUvEditor() {
+        _uiState.update { state ->
+            val fallbackObjId = state.project.camera3D.scene3DObjects.firstOrNull()?.id
+            val nextSel = if (state.stageSelection.type != StageTargetType.OBJECT_3D && fallbackObjId != null) {
+                StageSelection(StageTargetType.OBJECT_3D, fallbackObjId)
+            } else state.stageSelection
+            state.copy(
+                isStudio3DUvEditorOpen = true,
+                isStudio3DThreeWheelsOpen = false,
+                isStudio3DSplitNodesOpen = false,
+                isStudio3DUvPaintScreenOpen = false,
+                stageSelection = nextSel
+            )
+        }
+        updateUndoRedoAvailability()
+    }
+
+    fun closeStudio3DUvEditor() {
+        _uiState.update { it.copy(isStudio3DUvEditorOpen = false) }
+        updateUndoRedoAvailability()
+    }
+
+    fun updateSceneObjectUvVertices(
+        objectId: String,
+        updatedFlatUvs: List<Float>,
+        coalesceMs: Long = 350L
+    ) {
+        pushCamera3DUndoSnapshot(coalesceMs = coalesceMs)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val objs = cam.scene3DObjects.map { obj ->
+                if (obj.id != objectId) obj
+                else {
+                    val slots = obj.uvSlots.ifEmpty { listOf(ObjectUVMapSlot()) }.toMutableList()
+                    val idx = obj.activeUvSlotIndex.coerceIn(0, slots.lastIndex)
+                    slots[idx] = slots[idx].copy(customUvs = updatedFlatUvs)
+                    obj.copy(uvSlots = slots, activeUvSlotIndex = idx)
+                }
+            }
+            val updatedProj = state.project.copy(
+                camera3D = cam.copy(scene3DObjects = objs),
+                updatedAt = System.currentTimeMillis()
+            )
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(
+                studio3DMeshRevision = state.studio3DMeshRevision + 1,
+                project = updatedProj
+            )
+        }
+        scheduleCamera3DSyncIfCoop()
+    }
+
+    fun resetSceneObjectCustomUvs(objectId: String) {
+        pushCamera3DUndoSnapshot(coalesceMs = 0L)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val objs = cam.scene3DObjects.map { obj ->
+                if (obj.id != objectId) obj
+                else {
+                    val slots = obj.uvSlots.ifEmpty { listOf(ObjectUVMapSlot()) }.toMutableList()
+                    val idx = obj.activeUvSlotIndex.coerceIn(0, slots.lastIndex)
+                    slots[idx] = slots[idx].copy(customUvs = emptyList())
+                    obj.copy(uvSlots = slots, activeUvSlotIndex = idx)
+                }
+            }
+            val updatedProj = state.project.copy(
+                camera3D = cam.copy(scene3DObjects = objs),
+                updatedAt = System.currentTimeMillis()
+            )
+            multiplayerEngine.updateHostedProjectSnapshot(updatedProj)
+            state.copy(
+                studio3DMeshRevision = state.studio3DMeshRevision + 1,
+                project = updatedProj,
+                statusMessage = "Malha UV restaurada para a projeção padrão."
+            )
+        }
+        scheduleCamera3DSyncIfCoop()
+    }
+
+    fun setStageShadingMode(mode: StageShadingMode) {
+        pushCamera3DUndoSnapshot(coalesceMs = 0L)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(shadingMode = mode),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Visualização 3D: ${mode.labelPt}"
+            )
+        }
+        scheduleCamera3DSyncIfCoop()
+    }
+
+    fun toggleStageFloorGrid() {
+        pushCamera3DUndoSnapshot(coalesceMs = 0L)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            val nextGrid = !cam.showFloorGrid
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(showFloorGrid = nextGrid),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = if (nextGrid) "Grade do chão visível" else "Grade do chão oculta (limpa para render)"
+            )
+        }
+        scheduleCamera3DSyncIfCoop()
+    }
+
+    fun setStageTransformSpace(space: TransformSpaceMode) {
+        pushCamera3DUndoSnapshot(coalesceMs = 0L)
+        _uiState.update { state ->
+            val cam = state.project.camera3D
+            state.copy(
+                project = state.project.copy(
+                    camera3D = cam.copy(transformSpace = space),
+                    updatedAt = System.currentTimeMillis()
+                ),
+                statusMessage = "Eixo de rotação: ${space.labelPt}"
+            )
+        }
+    }
+
+    fun saveCustomShaderNodePreset(name: String, graph: ShaderNodeGraph) {
+        val cleanName = name.trim().ifBlank { "Meu Node ${_uiState.value.customShaderNodePresets.size + 1}" }
+        val preset = CustomShaderNodePreset(name = cleanName, graph = graph.copy(enabled = true, presetName = cleanName))
+        _uiState.update {
+            it.copy(
+                customShaderNodePresets = listOf(preset) + it.customShaderNodePresets,
+                statusMessage = "Node próprio '$cleanName' salvo!"
+            )
+        }
+    }
+
+    fun applyCustomShaderNodePreset(objectId: String, preset: CustomShaderNodePreset) {
+        updateSceneObject3D(objectId) { obj ->
+            obj.copy(nodeGraph = preset.graph.copy(enabled = true, presetName = preset.name))
+        }
+        _uiState.update { it.copy(statusMessage = "Node próprio '${preset.name}' aplicado!") }
+    }
+
+    fun deleteCustomShaderNodePreset(presetId: String) {
+        _uiState.update {
+            it.copy(customShaderNodePresets = it.customShaderNodePresets.filterNot { p -> p.id == presetId })
+        }
+    }
+
+    fun exportSelected3DObjectToUri(context: Context, objectId: String, uri: Uri) {
+        val obj = _uiState.value.project.camera3D.scene3DObjects.firstOrNull { it.id == objectId }
+        if (obj == null) {
+            _uiState.update { it.copy(statusMessage = "Selecione um objeto 3D para exportar.") }
+            return
+        }
+        val meshData = Mesh3DImporter.getOrLoadMesh(obj.meshAssetPath)
+        if (meshData == null) {
+            _uiState.update { it.copy(statusMessage = "Malha 3D não encontrada para exportar.") }
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update { it.copy(statusMessage = "Exportando objeto 3D + UV em ZIP...") }
+            val ok = withContext(KodanimaDispatchers.networkIo) {
+                runCatching {
+                    val zipBytes = Mesh3DImporter.exportSceneObject3DAsObjZipBytes(obj, meshData)
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(zipBytes)
+                        out.flush()
+                    }
+                    true
+                }.getOrDefault(false)
+            }
+            _uiState.update {
+                it.copy(
+                    statusMessage = if (ok) "Objeto '${obj.name}' (.obj + .mtl + textura UV) exportado!"
+                    else "Falha ao exportar objeto 3D."
+                )
+            }
+        }
     }
 
     fun toggleStudio3DUVUnfold() {
@@ -7600,6 +8080,7 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun updateSceneObject3D(objectId: String, bumpRevision: Boolean = true, transform: (SceneObject3D) -> SceneObject3D) {
+        pushCamera3DUndoSnapshot(coalesceMs = 600L)
         _uiState.update { state ->
             val cam = state.project.camera3D
             val objs = cam.scene3DObjects.map { if (it.id == objectId) transform(it) else it }
@@ -7621,6 +8102,7 @@ class KodanimaViewModel : ViewModel() {
         u1: Float,
         v1: Float
     ) {
+        pushCamera3DUndoSnapshot(coalesceMs = 700L)
         _uiState.update { state ->
             val cam = state.project.camera3D
             val preset = state.activeBrushPreset
@@ -7668,6 +8150,7 @@ class KodanimaViewModel : ViewModel() {
     }
 
     fun mergeSceneObjectPaintLayers(objectId: String) {
+        pushCamera3DUndoSnapshot(coalesceMs = 0L)
         var syncedObj: SceneObject3D? = null
         _uiState.update { state ->
             val cam = state.project.camera3D

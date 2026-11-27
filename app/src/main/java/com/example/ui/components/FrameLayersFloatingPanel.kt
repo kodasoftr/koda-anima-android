@@ -111,6 +111,7 @@ fun FrameLayersFloatingPanel(
     onAddBucketLayer: (() -> Unit)? = null,
     onToggleBucketReference: ((Int) -> Unit)? = null,
     onSelectBucketTargetLayer: ((String) -> Unit)? = null,
+    onSetLocalLayerPlacement: ((Int, Boolean) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var dragOffsetX by remember { mutableFloatStateOf(0f) }
@@ -426,147 +427,305 @@ fun FrameLayersFloatingPanel(
                         }
                     }
                 } else {
-                    val reversedIndices = remember(localLayers.size) { localLayers.indices.reversed().toList() }
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 172.dp),
-                        verticalArrangement = Arrangement.spacedBy(5.dp)
-                    ) {
-                        items(reversedIndices, key = { idx -> localLayers[idx].id }) { idx ->
-                            val layer = localLayers[idx]
-                            val isSelected = activeTargetIsFrameLocalLayer && idx == validLocalIdx
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(9.dp))
-                                    .clickable { onSelectLocalLayer(idx) }
-                                    .testTag("frame_layer_row_$idx"),
-                                color = if (isSelected) accentColor.copy(alpha = 0.22f) else bgDeep.copy(alpha = 0.45f),
-                                border = BorderStroke(
-                                    width = if (isSelected) 1.4.dp else 0.8.dp,
-                                    color = if (isSelected) accentColor else textColor.copy(alpha = 0.16f)
-                                ),
-                                shape = RoundedCornerShape(9.dp)
+                    val aboveIndices = remember(localLayers) {
+                        localLayers.indices.filter { !localLayers[it].placeBelowFrame }.reversed()
+                    }
+                    val belowIndices = remember(localLayers) {
+                        localLayers.indices.filter { localLayers[it].placeBelowFrame }.reversed()
+                    }
+
+                    @Composable
+                    fun SubLayerRowCard(idx: Int) {
+                        val layer = localLayers[idx]
+                        val isSelected = activeTargetIsFrameLocalLayer && idx == validLocalIdx
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(9.dp))
+                                .clickable { onSelectLocalLayer(idx) }
+                                .testTag("frame_layer_row_$idx"),
+                            color = if (isSelected) accentColor.copy(alpha = 0.22f) else bgDeep.copy(alpha = 0.45f),
+                            border = BorderStroke(
+                                width = if (isSelected) 1.4.dp else 0.8.dp,
+                                color = if (isSelected) accentColor else textColor.copy(alpha = 0.16f)
+                            ),
+                            shape = RoundedCornerShape(9.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                                IconButton(
+                                    onClick = { onToggleVisibility(idx) },
+                                    modifier = Modifier.size(34.dp)
                                 ) {
-                                    IconButton(
-                                        onClick = { onToggleVisibility(idx) },
-                                        modifier = Modifier.size(34.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = if (layer.isVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                            contentDescription = if (layer.isVisible) "Ocultar subcamada" else "Mostrar subcamada",
-                                            tint = if (layer.isVisible) accentColor else mutedText,
-                                            modifier = Modifier.size(16.dp)
-                                        )
-                                    }
+                                    Icon(
+                                        imageVector = if (layer.isVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                        contentDescription = if (layer.isVisible) "Ocultar subcamada" else "Mostrar subcamada",
+                                        tint = if (layer.isVisible) accentColor else mutedText,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
 
-                                    if (layer.isClippingMask) {
-                                        Icon(
-                                            imageVector = Icons.Default.SubdirectoryArrowRight,
-                                            contentDescription = "Máscara de Recorte ativa",
-                                            tint = NeonGreen,
-                                            modifier = Modifier.size(15.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(3.dp))
-                                    }
+                                if (layer.isClippingMask) {
+                                    Icon(
+                                        imageVector = Icons.Default.SubdirectoryArrowRight,
+                                        contentDescription = "Máscara de Recorte ativa",
+                                        tint = NeonGreen,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                }
 
-                                    Column(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .padding(horizontal = 4.dp)
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(horizontal = 4.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        Text(
+                                            text = layer.name,
+                                            fontSize = 11.5.sp,
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (layer.isVisible) textColor else mutedText,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false)
+                                        )
+                                        val placeBadgeColor = if (layer.placeBelowFrame) Color(0xFFFFB74D) else accentColor
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(4.dp))
+                                                .background(placeBadgeColor.copy(alpha = 0.18f))
+                                                .border(0.7.dp, placeBadgeColor.copy(alpha = 0.7f), RoundedCornerShape(4.dp))
+                                                .clickable(enabled = onSetLocalLayerPlacement != null) {
+                                                    onSetLocalLayerPlacement?.invoke(idx, !layer.placeBelowFrame)
+                                                }
+                                                .padding(horizontal = 4.dp, vertical = 1.dp)
+                                                .testTag("frame_layer_pos_badge_$idx")
                                         ) {
                                             Text(
-                                                text = layer.name,
-                                                fontSize = 11.5.sp,
-                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                                color = if (layer.isVisible) textColor else mutedText,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                                modifier = Modifier.weight(1f, fill = false)
+                                                text = if (layer.placeBelowFrame) "EMBAIXO" else "EM CIMA",
+                                                fontSize = 7.5.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = placeBadgeColor
                                             )
-                                            if (layer.isBucketLayer) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .clip(RoundedCornerShape(4.dp))
-                                                        .background(Color(0xFF00D2FF).copy(alpha = 0.22f))
-                                                        .border(0.8.dp, Color(0xFF00D2FF), RoundedCornerShape(4.dp))
-                                                        .clickable(enabled = onSelectBucketTargetLayer != null) {
-                                                            onSelectBucketTargetLayer?.invoke(layer.id)
-                                                        }
-                                                        .padding(horizontal = 4.dp, vertical = 1.dp)
-                                                ) {
-                                                    Text("BALDE", fontSize = 8.sp, fontWeight = FontWeight.Bold, color = Color(0xFF00D2FF))
-                                                }
-                                            }
-                                            if (onToggleBucketReference != null) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .clip(RoundedCornerShape(4.dp))
-                                                        .background(
-                                                            if (layer.isBucketReference) NeonGreen.copy(alpha = 0.22f)
-                                                            else bgDeep.copy(alpha = 0.5f)
-                                                        )
-                                                        .border(
-                                                            0.8.dp,
-                                                            if (layer.isBucketReference) NeonGreen else textColor.copy(alpha = 0.22f),
-                                                            RoundedCornerShape(4.dp)
-                                                        )
-                                                        .clickable { onToggleBucketReference(idx) }
-                                                        .padding(horizontal = 4.dp, vertical = 1.dp)
-                                                        .testTag("frame_layer_ref_$idx")
-                                                ) {
-                                                    Text(
-                                                        text = if (layer.isBucketReference) "Ref ✓" else "Ref",
-                                                        fontSize = 8.sp,
-                                                        fontWeight = FontWeight.Bold,
-                                                        color = if (layer.isBucketReference) NeonGreen else mutedText
-                                                    )
-                                                }
+                                        }
+                                        if (layer.isBucketLayer) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(4.dp))
+                                                    .background(Color(0xFF00D2FF).copy(alpha = 0.22f))
+                                                    .border(0.8.dp, Color(0xFF00D2FF), RoundedCornerShape(4.dp))
+                                                    .clickable(enabled = onSelectBucketTargetLayer != null) {
+                                                        onSelectBucketTargetLayer?.invoke(layer.id)
+                                                    }
+                                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                                            ) {
+                                                Text("BALDE", fontSize = 8.sp, fontWeight = FontWeight.Bold, color = Color(0xFF00D2FF))
                                             }
                                         }
-                                        Text(
-                                            text = buildString {
-                                                append("${(layer.opacity * 100).toInt()}%")
-                                                append(" • ${layer.blendEffect.labelPt}")
-                                                if (layer.isClippingMask) append(" • Recorte")
-                                            },
-                                            fontSize = 9.5.sp,
-                                            color = if (layer.isClippingMask) NeonGreen else mutedText,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
+                                        if (onToggleBucketReference != null) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(4.dp))
+                                                    .background(
+                                                        if (layer.isBucketReference) NeonGreen.copy(alpha = 0.22f)
+                                                        else bgDeep.copy(alpha = 0.5f)
+                                                    )
+                                                    .border(
+                                                        0.8.dp,
+                                                        if (layer.isBucketReference) NeonGreen else textColor.copy(alpha = 0.22f),
+                                                        RoundedCornerShape(4.dp)
+                                                    )
+                                                    .clickable { onToggleBucketReference(idx) }
+                                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                                                    .testTag("frame_layer_ref_$idx")
+                                            ) {
+                                                Text(
+                                                    text = if (layer.isBucketReference) "Ref ✓" else "Ref",
+                                                    fontSize = 8.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = if (layer.isBucketReference) NeonGreen else mutedText
+                                                )
+                                            }
+                                        }
                                     }
+                                    Text(
+                                        text = buildString {
+                                            append("${(layer.opacity * 100).toInt()}%")
+                                            append(" • ${layer.blendEffect.labelPt}")
+                                            if (layer.isClippingMask) append(" • Recorte")
+                                        },
+                                        fontSize = 9.5.sp,
+                                        color = if (layer.isClippingMask) NeonGreen else mutedText,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
 
-                                    IconButton(
-                                        onClick = { onToggleLock(idx) },
-                                        modifier = Modifier.size(34.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = if (layer.isLocked) Icons.Default.Lock else Icons.Default.LockOpen,
-                                            contentDescription = if (layer.isLocked) "Desbloquear subcamada" else "Bloquear subcamada",
-                                            tint = if (layer.isLocked) NeonPink else mutedText,
-                                            modifier = Modifier.size(15.dp)
-                                        )
-                                    }
+                                IconButton(
+                                    onClick = { onToggleLock(idx) },
+                                    modifier = Modifier.size(34.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (layer.isLocked) Icons.Default.Lock else Icons.Default.LockOpen,
+                                        contentDescription = if (layer.isLocked) "Desbloquear subcamada" else "Bloquear subcamada",
+                                        tint = if (layer.isLocked) NeonPink else mutedText,
+                                        modifier = Modifier.size(15.dp)
+                                    )
                                 }
                             }
                         }
                     }
 
-                    // Active Sub-layer Controls: Clipping Mask + Opacity + Blend Effect
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 186.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        items(aboveIndices, key = { idx -> localLayers[idx].id }) { idx ->
+                            SubLayerRowCard(idx)
+                        }
+
+                        item(key = "timeline_frame_anchor_divider") {
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(7.dp))
+                                    .clickable { onUseTimelineLayerTarget() }
+                                    .testTag("frame_layer_timeline_anchor"),
+                                color = if (!activeTargetIsFrameLocalLayer) accentColor.copy(alpha = 0.16f) else bgDeep.copy(alpha = 0.7f),
+                                border = BorderStroke(
+                                    0.9.dp,
+                                    if (!activeTargetIsFrameLocalLayer) accentColor.copy(alpha = 0.8f) else textColor.copy(alpha = 0.2f)
+                                ),
+                                shape = RoundedCornerShape(7.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = "— Quadro: $activeTimelineLayerName —",
+                                        fontSize = 9.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (!activeTargetIsFrameLocalLayer) accentColor else mutedText,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                        text = if (!activeTargetIsFrameLocalLayer) "Ativo" else "Selecionar",
+                                        fontSize = 8.5.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (!activeTargetIsFrameLocalLayer) accentColor else mutedText
+                                    )
+                                }
+                            }
+                        }
+
+                        items(belowIndices, key = { idx -> localLayers[idx].id }) { idx ->
+                            SubLayerRowCard(idx)
+                        }
+                    }
+
+                    // Active Sub-layer Controls: Posição no Quadro + Clipping Mask + Opacity + Blend Effect
                     if (selectedLocalLayer != null) {
                         HorizontalDivider(color = textColor.copy(alpha = 0.14f))
 
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (onSetLocalLayerPlacement != null) {
+                                Text(
+                                    text = "Posição da subcamada no quadro",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = textColor
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    val isBelow = selectedLocalLayer.placeBelowFrame
+                                    Surface(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .heightIn(min = 38.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .clickable { onSetLocalLayerPlacement(validLocalIdx, true) }
+                                            .testTag("frame_layer_place_below_btn"),
+                                        color = if (isBelow) Color(0xFFFFB74D).copy(alpha = 0.24f) else bgDeep.copy(alpha = 0.5f),
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (isBelow) Color(0xFFFFB74D) else textColor.copy(alpha = 0.2f)
+                                        ),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.KeyboardArrowDown,
+                                                contentDescription = null,
+                                                tint = if (isBelow) Color(0xFFFFB74D) else textColor,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                            Spacer(Modifier.width(3.dp))
+                                            Text(
+                                                text = "Embaixo do quadro",
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (isBelow) Color(0xFFFFB74D) else textColor,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                    Surface(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .heightIn(min = 38.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .clickable { onSetLocalLayerPlacement(validLocalIdx, false) }
+                                            .testTag("frame_layer_place_above_btn"),
+                                        color = if (!isBelow) accentColor.copy(alpha = 0.24f) else bgDeep.copy(alpha = 0.5f),
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (!isBelow) accentColor else textColor.copy(alpha = 0.2f)
+                                        ),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.KeyboardArrowUp,
+                                                contentDescription = null,
+                                                tint = if (!isBelow) accentColor else textColor,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                            Spacer(Modifier.width(3.dp))
+                                            Text(
+                                                text = "Em cima do quadro",
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (!isBelow) accentColor else textColor,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                             // Clipping Mask Toggle ("Máscara de Recorte")
                             Surface(
                                 modifier = Modifier

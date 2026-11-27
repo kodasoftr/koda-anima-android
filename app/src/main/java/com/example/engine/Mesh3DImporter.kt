@@ -18,7 +18,9 @@ import java.nio.ByteOrder
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.max
@@ -88,17 +90,27 @@ data class Mesh3DAnimationData(
     val normScale: Float
 )
 
+data class Mesh3DBone(
+    val name: String,
+    val parentIndex: Int = -1,
+    val head: FloatArray = floatArrayOf(0f, 0f, 0f),
+    val tail: FloatArray = floatArrayOf(0f, 0.1f, 0f)
+)
+
 data class Mesh3DSceneData(
     val id: String,
     val name: String,
     val subMeshes: List<Mesh3DSubMesh>,
     val boundingRadius: Float,
-    val animData: Mesh3DAnimationData? = null
+    val animData: Mesh3DAnimationData? = null,
+    val bones: List<Mesh3DBone> = emptyList()
 ) {
     val totalTriangles: Int
         get() = subMeshes.sumOf { it.indices.size / 3 }
     val hasAnimations: Boolean
         get() = animData != null && animData.clips.isNotEmpty()
+    val hasBones: Boolean
+        get() = bones.isNotEmpty()
 }
 
 enum class BuiltIn3DPrimitive(val uriKey: String, val labelPt: String) {
@@ -167,6 +179,12 @@ object Mesh3DImporter {
             val scene = parseSceneFile(mainFile, vaultRoot, displayName.substringBeforeLast('.')) ?: return null
             sceneCache[mainFile.absolutePath] = scene
             mainFile.absolutePath to scene
+        } else if (ext == "rar" || isRarHeader(bytes)) {
+            extractRarToVault(bytes, vaultRoot)
+            val mainFile = findPrimarySceneFile(vaultRoot) ?: return null
+            val scene = parseSceneFile(mainFile, vaultRoot, displayName.substringBeforeLast('.')) ?: return null
+            sceneCache[mainFile.absolutePath] = scene
+            mainFile.absolutePath to scene
         } else {
             val safeFileName = sanitizeFileName(displayName.ifBlank { "cena_3d.$ext" }).let {
                 if (it.contains('.')) it else "$it.$ext"
@@ -186,28 +204,47 @@ object Mesh3DImporter {
     ): Mesh3DSceneData? {
         val ext = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
             .ifBlank { detectFormatByHeader(bytes, fileName) }
+        if (ext == "rar" || isRarHeader(bytes)) {
+            val archiveMap = extractRarArchiveMap(bytes)
+            val mainName = findPrimarySceneEntryName(archiveMap.keys) ?: return null
+            val mainBytes = archiveMap[mainName] ?: return null
+            val archiveResolver: (String) -> ByteArray? = { ref ->
+                val clean = safeUrlDecode(ref).replace('\\', '/').trim().removePrefix("./")
+                val baseOnly = clean.substringAfterLast('/')
+                archiveMap.entries.firstOrNull { (k, _) ->
+                    k.equals(clean, ignoreCase = true) || k.substringAfterLast('/').equals(baseOnly, ignoreCase = true)
+                }?.value ?: siblingResolver?.invoke(ref)
+            }
+            return parseSceneBytesForTest(mainBytes, mainName, archiveResolver)
+        }
         val baseName = fileName.substringBeforeLast('.').ifBlank { "Cena 3D" }
         var parsedAnimData: Mesh3DAnimationData? = null
+        var parsedBones: List<Mesh3DBone> = emptyList()
         val rawMeshes = when (ext) {
-            "glb" -> parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
-            "gltf" -> parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, siblingResolver)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
-            "fbx" -> FbxAndMax3DParser.parseFbx(bytes, siblingResolver)
+            "glb" -> parseGlbWithAnim(bytes, siblingResolver)?.let { (m, a, b) -> parsedAnimData = a; parsedBones = b; m } ?: emptyList()
+            "gltf" -> parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, siblingResolver)?.let { (m, a, b) -> parsedAnimData = a; parsedBones = b; m } ?: emptyList()
+            "fbx" -> {
+                parsedBones = FbxAndMax3DParser.extractFbxBones(bytes)
+                FbxAndMax3DParser.parseFbx(bytes, siblingResolver)
+            }
             "3ds" -> FbxAndMax3DParser.parse3ds(bytes, siblingResolver)
             "max" -> FbxAndMax3DParser.parseMaxScene(bytes, siblingResolver)
             "obj" -> parseObj(bytes.toString(Charsets.UTF_8), siblingResolver)
             "stl" -> parseStl(bytes)
             "ply" -> parsePly(bytes.toString(Charsets.UTF_8))
             else -> when {
-                isGlbHeader(bytes) -> parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
-                FbxAndMax3DParser.isFbxBinary(bytes) || FbxAndMax3DParser.isFbxAscii(bytes) ->
+                isGlbHeader(bytes) -> parseGlbWithAnim(bytes, siblingResolver)?.let { (m, a, b) -> parsedAnimData = a; parsedBones = b; m } ?: emptyList()
+                FbxAndMax3DParser.isFbxBinary(bytes) || FbxAndMax3DParser.isFbxAscii(bytes) -> {
+                    parsedBones = FbxAndMax3DParser.extractFbxBones(bytes)
                     FbxAndMax3DParser.parseFbx(bytes, siblingResolver)
+                }
                 FbxAndMax3DParser.is3dsBinary(bytes) -> FbxAndMax3DParser.parse3ds(bytes, siblingResolver)
                 FbxAndMax3DParser.isMaxCompoundFile(bytes) -> FbxAndMax3DParser.parseMaxScene(bytes, siblingResolver)
                 else -> parseObj(bytes.toString(Charsets.UTF_8), siblingResolver)
             }
         }
         if (rawMeshes.isEmpty()) return null
-        return normalizeAndWrapScene(UUID.randomUUID().toString(), baseName, rawMeshes, animData = parsedAnimData)
+        return normalizeAndWrapScene(UUID.randomUUID().toString(), baseName, rawMeshes, animData = parsedAnimData, bones = parsedBones)
     }
 
     private fun parseSceneFile(
@@ -233,28 +270,61 @@ object Mesh3DImporter {
         }
 
         var parsedAnimData: Mesh3DAnimationData? = null
-        val rawMeshes = when (ext) {
-            "glb" -> parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
-            "gltf" -> parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, resolver)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
-            "fbx" -> FbxAndMax3DParser.parseFbx(bytes, resolver)
+        var parsedBones: List<Mesh3DBone> = emptyList()
+        var rawMeshes = when (ext) {
+            "glb" -> parseGlbWithAnim(bytes, resolver)?.let { (m, a, b) -> parsedAnimData = a; parsedBones = b; m } ?: emptyList()
+            "gltf" -> parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, resolver)?.let { (m, a, b) -> parsedAnimData = a; parsedBones = b; m } ?: emptyList()
+            "fbx" -> {
+                parsedBones = FbxAndMax3DParser.extractFbxBones(bytes)
+                FbxAndMax3DParser.parseFbx(bytes, resolver)
+            }
             "3ds" -> FbxAndMax3DParser.parse3ds(bytes, resolver)
             "max" -> FbxAndMax3DParser.parseMaxScene(bytes, resolver)
             "obj" -> parseObj(bytes.toString(Charsets.UTF_8), resolver)
             "stl" -> parseStl(bytes)
             "ply" -> parsePly(bytes.toString(Charsets.UTF_8))
             else -> when {
-                isGlbHeader(bytes) -> parseGlbWithAnim(bytes)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
-                FbxAndMax3DParser.isFbxBinary(bytes) || FbxAndMax3DParser.isFbxAscii(bytes) ->
+                isGlbHeader(bytes) -> parseGlbWithAnim(bytes, resolver)?.let { (m, a, b) -> parsedAnimData = a; parsedBones = b; m } ?: emptyList()
+                FbxAndMax3DParser.isFbxBinary(bytes) || FbxAndMax3DParser.isFbxAscii(bytes) -> {
+                    parsedBones = FbxAndMax3DParser.extractFbxBones(bytes)
                     FbxAndMax3DParser.parseFbx(bytes, resolver)
+                }
                 FbxAndMax3DParser.is3dsBinary(bytes) -> FbxAndMax3DParser.parse3ds(bytes, resolver)
                 FbxAndMax3DParser.isMaxCompoundFile(bytes) -> FbxAndMax3DParser.parseMaxScene(bytes, resolver)
                 bytes.decodeToString(0, min(bytes.size, 64)).trimStart().startsWith("{") ->
-                    parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, resolver)?.let { (m, a) -> parsedAnimData = a; m } ?: emptyList()
+                    parseGltfJsonWithAnim(bytes.toString(Charsets.UTF_8), null, resolver)?.let { (m, a, b) -> parsedAnimData = a; parsedBones = b; m } ?: emptyList()
                 else -> parseObj(bytes.toString(Charsets.UTF_8), resolver)
             }
         }
         if (rawMeshes.isEmpty()) return null
-        return normalizeAndWrapScene(UUID.randomUUID().toString(), cleanName, rawMeshes, animData = parsedAnimData)
+        if (rawMeshes.all { it.texturePixels == null } && siblingIndex.isNotEmpty()) {
+            val fallbackImgFile = findBestFallbackTextureFile(siblingIndex, cleanName)
+            val fallbackTex = fallbackImgFile?.let {
+                try { decodeBitmapPixels(it.readBytes()) } catch (_: Exception) { null }
+            }
+            if (fallbackTex != null) {
+                rawMeshes = rawMeshes.map { sm ->
+                    sm.copy(
+                        texturePixels = fallbackTex.first,
+                        textureWidth = fallbackTex.second,
+                        textureHeight = fallbackTex.third
+                    )
+                }
+            }
+        }
+        return normalizeAndWrapScene(UUID.randomUUID().toString(), cleanName, rawMeshes, animData = parsedAnimData, bones = parsedBones)
+    }
+
+    private fun findBestFallbackTextureFile(files: List<File>, modelName: String): File? {
+        val imgExts = setOf("png", "jpg", "jpeg", "webp")
+        val imgs = files.filter { it.extension.lowercase(Locale.ROOT) in imgExts }
+        if (imgs.isEmpty()) return null
+        val preferred = imgs.firstOrNull {
+            val n = it.nameWithoutExtension.lowercase(Locale.ROOT)
+            n.contains("albedo") || n.contains("diffuse") || n.contains("basecolor") ||
+                n.contains("color") || n.contains(modelName.lowercase(Locale.ROOT))
+        }
+        return preferred ?: imgs.first()
     }
 
     private fun resolveSiblingBytes(
@@ -340,7 +410,101 @@ object Mesh3DImporter {
             bytes[1] == 0x4B.toByte()
     }
 
-    private fun parseGlbWithAnim(bytes: ByteArray): Pair<List<Mesh3DSubMesh>, Mesh3DAnimationData?>? {
+    fun isRarHeader(bytes: ByteArray): Boolean {
+        return bytes.size >= 7 &&
+            bytes[0] == 0x52.toByte() &&
+            bytes[1] == 0x61.toByte() &&
+            bytes[2] == 0x72.toByte() &&
+            bytes[3] == 0x21.toByte() &&
+            bytes[4] == 0x1A.toByte() &&
+            bytes[5] == 0x07.toByte()
+    }
+
+    private fun extractRarToVault(rarBytes: ByteArray, destDir: File) {
+        val canonicalDest = destDir.canonicalPath
+        val extracted = extractRarArchiveMap(rarBytes)
+        for ((relPath, payload) in extracted) {
+            val outFile = File(destDir, safeUrlDecode(relPath).replace('\\', '/'))
+            if (outFile.canonicalPath.startsWith(canonicalDest + File.separator)) {
+                outFile.parentFile?.mkdirs()
+                FileOutputStream(outFile).use { it.write(payload) }
+            }
+        }
+    }
+
+    fun extractRarArchiveMap(rarBytes: ByteArray): Map<String, ByteArray> {
+        val result = LinkedHashMap<String, ByteArray>()
+        if (rarBytes.size < 14 || !isRarHeader(rarBytes)) return result
+        val bb = ByteBuffer.wrap(rarBytes).order(ByteOrder.LITTLE_ENDIAN)
+        val isRar5 = rarBytes.size >= 8 && rarBytes[6] == 0x01.toByte() && rarBytes[7] == 0x00.toByte()
+        if (!isRar5) {
+            // RAR4 block walker (marker at 0..6, archive/file blocks follow)
+            var pos = 7
+            while (pos + 7 <= rarBytes.size) {
+                val headType = rarBytes[pos + 2].toInt() and 0xFF
+                val flags = bb.getShort(pos + 3).toInt() and 0xFFFF
+                val headSize = (bb.getShort(pos + 5).toInt() and 0xFFFF).coerceAtLeast(7)
+                if (pos + headSize > rarBytes.size) break
+                if (headType == 0x74 && pos + 32 <= rarBytes.size) { // File header
+                    val packSizeLow = bb.getInt(pos + 7).toLong() and 0xFFFFFFFFL
+                    val method = rarBytes[pos + 25].toInt() and 0xFF
+                    val nameSize = (bb.getShort(pos + 26).toInt() and 0xFFFF).coerceIn(0, 512)
+                    val isHighPack = (flags and 0x0100) != 0
+                    val nameOffset = pos + if (isHighPack) 40 else 32
+                    val safeNameLen = min(nameSize, max(0, pos + headSize - nameOffset))
+                    val rawName = if (safeNameLen > 0) {
+                        String(rarBytes, nameOffset, safeNameLen, Charsets.UTF_8)
+                            .substringBefore('\u0000').replace('\\', '/')
+                    } else ""
+                    val dataStart = pos + headSize
+                    val packLen = packSizeLow.coerceIn(0L, (rarBytes.size - dataStart).toLong()).toInt()
+                    val payload = if (packLen > 0) rarBytes.copyOfRange(dataStart, dataStart + packLen) else ByteArray(0)
+                    if (rawName.isNotBlank() && payload.isNotEmpty() && method == 0x30) {
+                        result[rawName] = payload
+                    }
+                    pos = dataStart + packLen
+                    continue
+                }
+                val addSize = if ((flags and 0x8000) != 0 && pos + 11 <= rarBytes.size) {
+                    (bb.getInt(pos + 7).toLong() and 0xFFFFFFFFL).toInt()
+                } else 0
+                val step = (headSize + max(0, addSize)).coerceAtLeast(7)
+                pos += step
+            }
+        }
+        // Fallback signature scan inside stored/uncompressed RAR blocks if no stored files matched
+        if (result.isEmpty()) {
+            var idx = 0
+            while (idx + 12 < rarBytes.size) {
+                if (rarBytes[idx] == 'g'.code.toByte() && rarBytes[idx + 1] == 'l'.code.toByte() &&
+                    rarBytes[idx + 2] == 'T'.code.toByte() && rarBytes[idx + 3] == 'F'.code.toByte() &&
+                    idx + 12 <= rarBytes.size
+                ) {
+                    val glbLen = bb.getInt(idx + 8)
+                    if (glbLen in 32..(rarBytes.size - idx)) {
+                        result["model_embedded.glb"] = rarBytes.copyOfRange(idx, idx + glbLen)
+                        break
+                    }
+                }
+                idx++
+            }
+        }
+        return result
+    }
+
+    private fun findPrimarySceneEntryName(names: Collection<String>): String? {
+        val priority = listOf("glb", "gltf", "fbx", "obj", "3ds", "max", "ply", "stl")
+        for (ext in priority) {
+            val found = names.firstOrNull { it.substringAfterLast('.', "").equals(ext, ignoreCase = true) }
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun parseGlbWithAnim(
+        bytes: ByteArray,
+        siblingResolver: ((String) -> ByteArray?)? = null
+    ): Triple<List<Mesh3DSubMesh>, Mesh3DAnimationData?, List<Mesh3DBone>>? {
         if (bytes.size < 20 || !isGlbHeader(bytes)) return null
         val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         bb.position(12)
@@ -359,14 +523,14 @@ object Mesh3DImporter {
             }
         }
         if (jsonStr.isNullOrBlank()) return null
-        return parseGltfJsonWithAnim(jsonStr, binChunk, null)
+        return parseGltfJsonWithAnim(jsonStr, binChunk, siblingResolver)
     }
 
     private fun parseGltfJsonWithAnim(
         jsonText: String,
         embeddedBinChunk: ByteArray?,
         siblingResolver: ((String) -> ByteArray?)?
-    ): Pair<List<Mesh3DSubMesh>, Mesh3DAnimationData?>? {
+    ): Triple<List<Mesh3DSubMesh>, Mesh3DAnimationData?, List<Mesh3DBone>>? {
         val root = try {
             JSONObject(jsonText)
         } catch (_: Exception) {
@@ -511,15 +675,17 @@ object Mesh3DImporter {
             val baseOff = acc.optInt("byteOffset", 0) + bv.optInt("byteOffset", 0)
             val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
             val out = IntArray(count)
+            val maxValidVert = (vertexCount - 1).coerceAtLeast(0)
             for (i in 0 until count) {
                 val p = baseOff + i * stride
                 if (p + compBytes > buf.size) break
-                out[i] = when (compType) {
+                val rawIdx = when (compType) {
                     5121 -> buf[p].toInt() and 0xFF
                     5123 -> bb.getShort(p).toInt() and 0xFFFF
                     5125 -> bb.getInt(p)
                     else -> bb.getShort(p).toInt() and 0xFFFF
                 }
+                out[i] = rawIdx.coerceIn(0, maxValidVert)
             }
             return out
         }
@@ -542,7 +708,9 @@ object Mesh3DImporter {
                 val vCount = rawPos.size / 3
                 if (vCount < 3) continue
                 val rawNorm = readAccessorFloats(attrs.optInt("NORMAL", -1), 3)
-                val rawUv = readAccessorFloats(attrs.optInt("TEXCOORD_0", -1), 2)
+                val uvAcc0 = attrs.optInt("TEXCOORD_0", -1)
+                val uvAcc1 = attrs.optInt("TEXCOORD_1", -1)
+                val rawUv = readAccessorFloats(if (uvAcc0 >= 0) uvAcc0 else uvAcc1, 2)
                     ?: FloatArray(vCount * 2)
                 val indices = readAccessorIndices(prim.optInt("indices", -1), vCount)
 
@@ -552,7 +720,8 @@ object Mesh3DImporter {
                 if (matIdx in 0 until materials.length()) {
                     val mat = materials.optJSONObject(matIdx)
                     val pbr = mat?.optJSONObject("pbrMetallicRoughness")
-                    val factorArr = pbr?.optJSONArray("baseColorFactor")
+                    val specGloss = mat?.optJSONObject("extensions")?.optJSONObject("KHR_materials_pbrSpecularGlossiness")
+                    val factorArr = pbr?.optJSONArray("baseColorFactor") ?: specGloss?.optJSONArray("diffuseFactor")
                     if (factorArr != null && factorArr.length() >= 3) {
                         val r = (factorArr.optDouble(0, 1.0).toFloat().coerceIn(0f, 1f) * 255f).toInt()
                         val g = (factorArr.optDouble(1, 1.0).toFloat().coerceIn(0f, 1f) * 255f).toInt()
@@ -563,9 +732,12 @@ object Mesh3DImporter {
                         baseCol = (a shl 24) or (r shl 16) or (g shl 8) or b
                     }
                     val texInfo = pbr?.optJSONObject("baseColorTexture")
+                        ?: specGloss?.optJSONObject("diffuseTexture")
+                        ?: mat?.optJSONObject("emissiveTexture")
                     val texIdx = texInfo?.optInt("index", -1) ?: -1
                     if (texIdx in 0 until textures.length()) {
-                        val srcImg = textures.optJSONObject(texIdx)?.optInt("source", -1) ?: -1
+                        val texObj = textures.optJSONObject(texIdx)
+                        val srcImg = texObj?.optInt("source", -1) ?: -1
                         texTri = getImagePixels(srcImg)
                     }
                 }
@@ -754,7 +926,49 @@ object Mesh3DImporter {
             }
         }
 
-        return collected to animData
+        // Extract skeleton bones from glTF skins.joints & node hierarchy
+        val bones = ArrayList<Mesh3DBone>()
+        val skinsArr = root.optJSONArray("skins")
+        if (skinsArr != null && skinsArr.length() > 0 && nodes.length() > 0) {
+            val nodeWorldPos = HashMap<Int, FloatArray>()
+            val parentOfNode = HashMap<Int, Int>()
+            fun captureJointWorld(nIdx: Int, parentIdx: Int, parentMat: FloatArray) {
+                val nd = nodes.optJSONObject(nIdx) ?: return
+                if (parentIdx >= 0) parentOfNode[nIdx] = parentIdx
+                val wm = mulMat4(parentMat, nodeLocalMatrix(nd))
+                nodeWorldPos[nIdx] = floatArrayOf(wm[12], wm[13], wm[14])
+                val ch = nd.optJSONArray("children")
+                if (ch != null) {
+                    for (c in 0 until ch.length()) captureJointWorld(ch.optInt(c, -1), nIdx, wm)
+                }
+            }
+            for (rIdx in resolvedRootNodes) captureJointWorld(rIdx, -1, ident)
+
+            val jointSet = LinkedHashSet<Int>()
+            for (s in 0 until skinsArr.length()) {
+                val jArr = skinsArr.optJSONObject(s)?.optJSONArray("joints") ?: continue
+                for (j in 0 until jArr.length()) {
+                    val jIdx = jArr.optInt(j, -1)
+                    if (jIdx in 0 until nodes.length()) jointSet.add(jIdx)
+                }
+            }
+            val jointToBoneIdx = HashMap<Int, Int>()
+            for ((bIdx, jNodeIdx) in jointSet.withIndex()) {
+                jointToBoneIdx[jNodeIdx] = bIdx
+            }
+            for (jNodeIdx in jointSet) {
+                val nObj = nodes.optJSONObject(jNodeIdx)
+                val bName = nObj?.optString("name", "")?.ifBlank { "Osso_$jNodeIdx" } ?: "Osso_$jNodeIdx"
+                val parentNode = parentOfNode[jNodeIdx]
+                val pBoneIdx = if (parentNode != null) (jointToBoneIdx[parentNode] ?: -1) else -1
+                val head = nodeWorldPos[jNodeIdx] ?: floatArrayOf(0f, 0f, 0f)
+                val firstChild = nObj?.optJSONArray("children")?.optInt(0, -1) ?: -1
+                val tail = nodeWorldPos[firstChild] ?: floatArrayOf(head[0], head[1] + 0.15f, head[2])
+                bones.add(Mesh3DBone(name = bName, parentIndex = pBoneIdx, head = head, tail = tail))
+            }
+        }
+
+        return Triple(collected, animData, bones)
     }
 
     private fun transformPrimitiveWithMatrix(src: Mesh3DPrimitiveSource, worldMat: FloatArray): Mesh3DSubMesh {
@@ -974,6 +1188,13 @@ object Mesh3DImporter {
         val buckets = LinkedHashMap<String, GroupBucket>()
         var activeMatName = "__default__"
 
+        fun extractMtlTexturePath(rawArg: String): String {
+            val quoteMatch = Regex("[\"']([^\"']+)[\"']").findAll(rawArg).lastOrNull()
+            if (quoteMatch != null) return quoteMatch.groupValues[1].trim()
+            val cleaned = rawArg.replace(Regex("-(?:bm|blendu|blendv|clamp|imfchan|mm|o|s|t|texres)\\s+[^\\s]+(?:\\s+[-+]?\\d*\\.?\\d+){0,3}"), " ").trim()
+            return if (cleaned.isNotBlank()) cleaned else rawArg.split(Regex("\\s+")).lastOrNull().orEmpty()
+        }
+
         fun parseMtl(mtlText: String) {
             var curName: String? = null
             mtlText.lineSequence().forEach { rawLine ->
@@ -997,13 +1218,13 @@ object Mesh3DImporter {
                             c.diffuseColor = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                         }
                     }
-                    "map_kd" -> {
+                    "map_kd", "map_ka", "map_ke", "map_d" -> {
                         val c = curName?.let { materialsMap[it] } ?: return@forEach
-                        // Ignore optional -s / -o flags at start and take last path token
-                        val tokens = arg.split(Regex("\\s+"))
-                        val texPath = tokens.lastOrNull()?.trim('"', '\'') ?: ""
+                        if (kw != "map_kd" && c.texturePixels != null) return@forEach
+                        val texPath = extractMtlTexturePath(arg)
                         if (texPath.isNotBlank() && siblingResolver != null) {
                             val imgBytes = siblingResolver(texPath)
+                                ?: siblingResolver(texPath.substringAfterLast('/').substringAfterLast('\\'))
                             if (imgBytes != null) {
                                 decodeBitmapPixels(imgBytes)?.let { (pix, w, h) ->
                                     c.texturePixels = pix
@@ -1031,9 +1252,15 @@ object Mesh3DImporter {
             when (kw) {
                 "mtllib" -> {
                     if (rest.isNotBlank() && siblingResolver != null) {
-                        val mtlBytes = siblingResolver(rest)
-                        if (mtlBytes != null) {
-                            parseMtl(mtlBytes.toString(Charsets.UTF_8))
+                        val mtlDirect = siblingResolver(rest.trim('"', '\''))
+                        if (mtlDirect != null) {
+                            parseMtl(mtlDirect.toString(Charsets.UTF_8))
+                        } else {
+                            val mtlCandidates = Regex("[\"']([^\"']+)[\"']|\\S+").findAll(rest)
+                                .map { it.groupValues[1].ifBlank { it.value }.trim('"', '\'') }
+                            mtlCandidates.forEach { candidate ->
+                                siblingResolver(candidate)?.let { mb -> parseMtl(mb.toString(Charsets.UTF_8)) }
+                            }
                         }
                     }
                 }
@@ -1402,7 +1629,8 @@ object Mesh3DImporter {
         name: String,
         subMeshes: List<Mesh3DSubMesh>,
         targetRadius: Float = 140f,
-        animData: Mesh3DAnimationData? = null
+        animData: Mesh3DAnimationData? = null,
+        bones: List<Mesh3DBone> = emptyList()
     ): Mesh3DSceneData {
         var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var minZ = Float.MAX_VALUE
         var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
@@ -1419,7 +1647,7 @@ object Mesh3DImporter {
             }
         }
         if (minX == Float.MAX_VALUE) {
-            return Mesh3DSceneData(id, name, subMeshes, targetRadius, animData)
+            return Mesh3DSceneData(id, name, subMeshes, targetRadius, animData, bones)
         }
         val cx = (minX + maxX) * 0.5f
         val cy = (minY + maxY) * 0.5f
@@ -1454,6 +1682,20 @@ object Mesh3DImporter {
             val safeUvs = ensureNonZeroUvs(vOut, sm.uvs)
             sm.copy(vertices = vOut, normals = nOut, uvs = safeUvs)
         }
+        val normalizedBones = bones.map { b ->
+            b.copy(
+                head = floatArrayOf(
+                    (b.head[0] - cx) * scale,
+                    -(b.head[1] - cy) * scale,
+                    (b.head[2] - cz) * scale
+                ),
+                tail = floatArrayOf(
+                    (b.tail[0] - cx) * scale,
+                    -(b.tail[1] - cy) * scale,
+                    (b.tail[2] - cz) * scale
+                )
+            )
+        }
         val finalAnimData = animData?.copy(
             normCenterX = cx,
             normCenterY = cy,
@@ -1465,7 +1707,8 @@ object Mesh3DImporter {
             name = name,
             subMeshes = normalized,
             boundingRadius = targetRadius,
-            animData = finalAnimData
+            animData = finalAnimData,
+            bones = normalizedBones
         )
     }
 
@@ -1526,7 +1769,7 @@ object Mesh3DImporter {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
             val maxDim = max(opts.outWidth, opts.outHeight)
             var sample = 1
-            while (maxDim / sample > 512) sample *= 2
+            while (maxDim / sample > 1024) sample *= 2
             val decodeOpts = BitmapFactory.Options().apply {
                 inSampleSize = sample
                 inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -1610,6 +1853,7 @@ object Mesh3DImporter {
     private fun detectFormatByHeader(bytes: ByteArray, fileName: String): String {
         if (isGlbHeader(bytes)) return "glb"
         if (isZipHeader(bytes)) return "zip"
+        if (isRarHeader(bytes)) return "rar"
         if (FbxAndMax3DParser.isFbxBinary(bytes) || FbxAndMax3DParser.isFbxAscii(bytes)) return "fbx"
         if (FbxAndMax3DParser.is3dsBinary(bytes)) return "3ds"
         if (FbxAndMax3DParser.isMaxCompoundFile(bytes)) return "max"
@@ -1618,6 +1862,104 @@ object Mesh3DImporter {
         if (head.lowercase(Locale.ROOT).startsWith("ply")) return "ply"
         if (head.lowercase(Locale.ROOT).startsWith("solid")) return "stl"
         return fileName.substringAfterLast('.', "obj").lowercase(Locale.ROOT)
+    }
+
+    /**
+     * Exports a SceneObject3D with its effective UVs and composited UV paint texture
+     * as a portable ZIP bundle containing `.obj`, `.mtl`, and `texture_uv.png`.
+     */
+    fun exportSceneObject3DAsObjZipBytes(
+        obj: com.example.model.SceneObject3D,
+        meshData: Mesh3DSceneData
+    ): ByteArray {
+        val baseName = sanitizeFileName(obj.name).substringBeforeLast('.').ifBlank { "objeto_3d" }
+        val activeSlot = obj.uvSlots.getOrNull(obj.activeUvSlotIndex)
+            ?: obj.uvSlots.firstOrNull()
+            ?: com.example.model.ObjectUVMapSlot()
+        val firstSm = meshData.subMeshes.firstOrNull()
+        val compTex = Studio3DPaintEngine.resolveCompositeObjectTexture(
+            obj = obj,
+            basePixels = firstSm?.texturePixels,
+            baseW = firstSm?.textureWidth ?: 0,
+            baseH = firstSm?.textureHeight ?: 0,
+            baseColorArgb = firstSm?.baseColorArgb ?: 0xFFE2E8F0.toInt()
+        )
+        val texW = compTex?.width ?: firstSm?.textureWidth ?: 256
+        val texH = compTex?.height ?: firstSm?.textureHeight ?: 256
+        val texPixels = compTex?.pixels ?: firstSm?.texturePixels ?: IntArray(texW * texH) { 0xFFE2E8F0.toInt() }
+        val pngBytes = ByteArrayOutputStream().use { pngOut ->
+            val bmp = Bitmap.createBitmap(texW.coerceAtLeast(1), texH.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+            bmp.setPixels(texPixels, 0, texW.coerceAtLeast(1), 0, 0, texW.coerceAtLeast(1), texH.coerceAtLeast(1))
+            bmp.compress(Bitmap.CompressFormat.PNG, 100, pngOut)
+            bmp.recycle()
+            pngOut.toByteArray()
+        }
+
+        val objSb = StringBuilder(4096)
+        objSb.append("# Kodanima 3D Studio Export: ").append(obj.name).append('\n')
+        objSb.append("mtllib ").append(baseName).append(".mtl\n")
+        objSb.append("o ").append(baseName).append('\n')
+        objSb.append("usemtl material_uv\n")
+
+        var vertOffset = 1
+        var customUvOffset = 0
+        for (sm in meshData.subMeshes) {
+            val effUvs = Studio3DPaintEngine.generateUVsForProjection(sm.vertices, sm.uvs, activeSlot, customUvOffset)
+            val vCount = sm.vertices.size / 3
+            for (v in 0 until vCount) {
+                val x = sm.vertices[v * 3]
+                val y = -sm.vertices[v * 3 + 1] // Convert back from Android screen-down Y to standard Y-up OBJ
+                val z = sm.vertices[v * 3 + 2]
+                objSb.append(String.format(Locale.US, "v %.5f %.5f %.5f\n", x, y, z))
+            }
+            for (v in 0 until vCount) {
+                val u = if (v * 2 < effUvs.size) effUvs[v * 2] else 0f
+                val vTex = if (v * 2 + 1 < effUvs.size) (1f - effUvs[v * 2 + 1]) else 0f
+                objSb.append(String.format(Locale.US, "vt %.5f %.5f\n", u, vTex))
+            }
+            for (v in 0 until vCount) {
+                val nx = if (v * 3 < sm.normals.size) sm.normals[v * 3] else 0f
+                val ny = if (v * 3 + 1 < sm.normals.size) -sm.normals[v * 3 + 1] else 1f
+                val nz = if (v * 3 + 2 < sm.normals.size) sm.normals[v * 3 + 2] else 0f
+                objSb.append(String.format(Locale.US, "vn %.5f %.5f %.5f\n", nx, ny, nz))
+            }
+            var t = 0
+            while (t + 2 < sm.indices.size) {
+                val a = sm.indices[t] + vertOffset
+                val b = sm.indices[t + 1] + vertOffset
+                val c = sm.indices[t + 2] + vertOffset
+                objSb.append("f $a/$a/$a $b/$b/$b $c/$c/$c\n")
+                t += 3
+            }
+            vertOffset += vCount
+            customUvOffset += vCount
+        }
+
+        val mtlText = buildString {
+            append("# Kodanima 3D Studio Material\n")
+            append("newmtl material_uv\n")
+            append("Kd 1.000 1.000 1.000\n")
+            append("Ka 0.200 0.200 0.200\n")
+            append("Ks 0.150 0.150 0.150\n")
+            append("d 1.0\n")
+            append("map_Kd texture_uv.png\n")
+        }
+
+        val baos = ByteArrayOutputStream()
+        ZipOutputStream(baos).use { zos ->
+            zos.putNextEntry(ZipEntry("$baseName.obj"))
+            zos.write(objSb.toString().toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+
+            zos.putNextEntry(ZipEntry("$baseName.mtl"))
+            zos.write(mtlText.toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+
+            zos.putNextEntry(ZipEntry("texture_uv.png"))
+            zos.write(pngBytes)
+            zos.closeEntry()
+        }
+        return baos.toByteArray()
     }
 
     private fun safeUrlDecode(raw: String): String {

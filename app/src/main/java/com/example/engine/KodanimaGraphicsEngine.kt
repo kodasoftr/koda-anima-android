@@ -210,6 +210,10 @@ object KodanimaGraphicsEngine {
         val fillPaint = Paint(PAINT_QUALITY_FLAGS).apply {
             style = Paint.Style.FILL
         }
+        val bucketFillPaint = Paint(Paint.DITHER_FLAG).apply {
+            style = Paint.Style.FILL
+            isAntiAlias = false
+        }
         val layerAlphaPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
         val strokeIsolationPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
         val innerLayerSavePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
@@ -714,6 +718,92 @@ object KodanimaGraphicsEngine {
         return bitmap
     }
 
+    data class ViewportCacheDimensions(
+        val cacheWidth: Int,
+        val cacheHeight: Int,
+        val marginPx: Int
+    )
+
+    const val DEFAULT_VIEWPORT_OVERSCAN_PX = 8f
+
+    /**
+     * Computes viewport cache dimensions slightly larger than screen resolution (minimum +4 px margin per edge)
+     * so strokes near screen boundaries never visibly crop or pop in during drawing or panning.
+     */
+    fun computeViewportCacheDimensions(
+        containerWidth: Float,
+        containerHeight: Float,
+        vpScale: Float,
+        overscanScreenPx: Float = DEFAULT_VIEWPORT_OVERSCAN_PX
+    ): ViewportCacheDimensions {
+        val safeScale = vpScale.coerceAtLeast(0.01f)
+        val marginPx = (overscanScreenPx * safeScale).roundToInt().coerceAtLeast(4)
+        val baseW = (containerWidth * safeScale).roundToInt().coerceAtLeast(1)
+        val baseH = (containerHeight * safeScale).roundToInt().coerceAtLeast(1)
+        return ViewportCacheDimensions(
+            cacheWidth = baseW + marginPx * 2,
+            cacheHeight = baseH + marginPx * 2,
+            marginPx = marginPx
+        )
+    }
+
+    /**
+     * Computes project-space visible bounds expanded by screen-space overscan margin (>= 4px)
+     * plus zoom-compensated stroke padding so edge strokes never pop in late.
+     */
+    fun computeOverscannedVisibleProjectBounds(
+        projToScreenMatrix: android.graphics.Matrix,
+        containerWidth: Float,
+        containerHeight: Float,
+        screenOverscanPx: Float,
+        zoom: Float
+    ): RectF? {
+        val inv = android.graphics.Matrix()
+        if (!projToScreenMatrix.invert(inv)) return null
+        val margin = screenOverscanPx.coerceAtLeast(4f)
+        val corners = floatArrayOf(
+            -margin, -margin,
+            containerWidth + margin, -margin,
+            containerWidth + margin, containerHeight + margin,
+            -margin, containerHeight + margin
+        )
+        inv.mapPoints(corners)
+        val safeZ = zoom.coerceAtLeast(0.05f)
+        val pad = (140f / safeZ).coerceIn(64f, 600f)
+        val minX = min(min(corners[0], corners[2]), min(corners[4], corners[6])) - pad
+        val maxX = max(max(corners[0], corners[2]), max(corners[4], corners[6])) + pad
+        val minY = min(min(corners[1], corners[3]), min(corners[5], corners[7])) - pad
+        val maxY = max(max(corners[1], corners[3]), max(corners[5], corners[7])) + pad
+        return RectF(minX, minY, maxX, maxY)
+    }
+
+    /**
+     * Orders frame layers bottom-to-top, placing per-frame sub-layers marked [Layer.placeBelowFrame]
+     * underneath global timeline layers and remaining sub-layers on top.
+     */
+    fun composeOrderedFrameLayers(
+        timelineLayers: List<Layer>,
+        localLayers: List<Layer>
+    ): List<Layer> {
+        if (localLayers.isEmpty()) return timelineLayers
+        var hasBelow = false
+        var hasAbove = false
+        for (l in localLayers) {
+            if (l.placeBelowFrame) hasBelow = true else hasAbove = true
+        }
+        if (!hasBelow) return timelineLayers + localLayers
+        if (!hasAbove) return localLayers + timelineLayers
+        val out = ArrayList<Layer>(timelineLayers.size + localLayers.size)
+        for (l in localLayers) if (l.placeBelowFrame) out.add(l)
+        out.addAll(timelineLayers)
+        for (l in localLayers) if (!l.placeBelowFrame) out.add(l)
+        return out
+    }
+
+    fun composeOrderedFrameLayers(frame: Frame): List<Layer> {
+        return composeOrderedFrameLayers(frame.layers, frame.localLayers)
+    }
+
     /**
      * Renders only selected reference layers (when non-empty) or all visible layers into a pooled Bitmap.
      */
@@ -734,13 +824,59 @@ object KodanimaGraphicsEngine {
             clearColor = backgroundColor
         )
         val canvas = Canvas(bitmap)
-        val allLayers = if (frame.localLayers.isEmpty()) frame.layers else frame.layers + frame.localLayers
+        val allLayers = composeOrderedFrameLayers(frame)
         val filtered = allLayers.filter { it.id in selectedLayerIds }
         drawLayersStackToCanvas(
             layers = filtered,
             canvas = canvas,
             targetWidth = bitmap.width,
             targetHeight = bitmap.height
+        )
+        return bitmap
+    }
+
+    /**
+     * Renders selected (or all visible) layers across an arbitrary project-space window (supporting
+     * off-canvas drawings) into a pooled Bitmap at [renderScale].
+     */
+    fun renderSelectedLayersRegionToBitmap(
+        frame: Frame,
+        width: Int,
+        height: Int,
+        selectedLayerIds: Set<String>?,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f,
+        renderScale: Float = 1.0f,
+        projectWidth: Int = width,
+        projectHeight: Int = height,
+        backgroundColor: Int = android.graphics.Color.TRANSPARENT
+    ): Bitmap {
+        val bitmap = KodanimaBitmapPool.acquire(
+            max(1, width),
+            max(1, height),
+            Bitmap.Config.ARGB_8888,
+            clearColor = backgroundColor
+        )
+        val canvas = Canvas(bitmap)
+        val allLayers = composeOrderedFrameLayers(frame)
+        val targetLayers = if (selectedLayerIds.isNullOrEmpty()) {
+            allLayers
+        } else {
+            allLayers.filter { it.id in selectedLayerIds }
+        }
+        val vpMat = android.graphics.Matrix().apply {
+            postTranslate(-offsetX, -offsetY)
+            postScale(renderScale, renderScale)
+        }
+        drawLayersStackToCanvas(
+            layers = targetLayers,
+            canvas = canvas,
+            targetWidth = projectWidth,
+            targetHeight = projectHeight,
+            allowOutOfBounds = true,
+            viewportMatrix = vpMat,
+            viewportWidth = bitmap.width,
+            viewportHeight = bitmap.height
         )
         return bitmap
     }
@@ -774,11 +910,7 @@ object KodanimaGraphicsEngine {
                 canvas.drawColor(android.graphics.Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
             }
         }
-        val combinedLayers = if (frame.localLayers.isEmpty()) {
-            frame.layers
-        } else {
-            frame.layers + frame.localLayers
-        }
+        val combinedLayers = composeOrderedFrameLayers(frame)
         drawLayersStackToCanvas(
             layers = combinedLayers,
             canvas = canvas,
@@ -1042,30 +1174,42 @@ object KodanimaGraphicsEngine {
         for (i in baseStrokes.indices) {
             val s = baseStrokes[i]
             if (s.tool == ToolType.ERASER) hasEraser = true
-            if (s.points.isNotEmpty() && s.minX != Float.MAX_VALUE && s.maxX != -Float.MAX_VALUE) {
-                val pad = s.brushSize + 8f
-                if (s.minX - pad < minX) minX = s.minX - pad
-                if (s.minY - pad < minY) minY = s.minY - pad
-                if (s.maxX + pad > maxX) maxX = s.maxX + pad
-                if (s.maxY + pad > maxY) maxY = s.maxY + pad
-            } else {
-                minX = min(minX, 0f); minY = min(minY, 0f)
-                maxX = max(maxX, targetWidth.toFloat()); maxY = max(maxY, targetHeight.toFloat())
+            if (s.points.isNotEmpty()) {
+                val pad = s.brushSize * 1.6f + 16f
+                if (s.minX != Float.MAX_VALUE && s.maxX != -Float.MAX_VALUE) {
+                    if (s.minX - pad < minX) minX = s.minX - pad
+                    if (s.minY - pad < minY) minY = s.minY - pad
+                    if (s.maxX + pad > maxX) maxX = s.maxX + pad
+                    if (s.maxY + pad > maxY) maxY = s.maxY + pad
+                } else {
+                    for (pt in s.points) {
+                        if (pt.x - pad < minX) minX = pt.x - pad
+                        if (pt.y - pad < minY) minY = pt.y - pad
+                        if (pt.x + pad > maxX) maxX = pt.x + pad
+                        if (pt.y + pad > maxY) maxY = pt.y + pad
+                    }
+                }
             }
         }
         if (extraStrokes != null) {
             for (i in extraStrokes.indices) {
                 val s = extraStrokes[i]
                 if (s.tool == ToolType.ERASER) hasEraser = true
-                if (s.points.isNotEmpty() && s.minX != Float.MAX_VALUE && s.maxX != -Float.MAX_VALUE) {
-                    val pad = s.brushSize + 8f
-                    if (s.minX - pad < minX) minX = s.minX - pad
-                    if (s.minY - pad < minY) minY = s.minY - pad
-                    if (s.maxX + pad > maxX) maxX = s.maxX + pad
-                    if (s.maxY + pad > maxY) maxY = s.maxY + pad
-                } else {
-                    minX = min(minX, 0f); minY = min(minY, 0f)
-                    maxX = max(maxX, targetWidth.toFloat()); maxY = max(maxY, targetHeight.toFloat())
+                if (s.points.isNotEmpty()) {
+                    val pad = s.brushSize * 1.6f + 16f
+                    if (s.minX != Float.MAX_VALUE && s.maxX != -Float.MAX_VALUE) {
+                        if (s.minX - pad < minX) minX = s.minX - pad
+                        if (s.minY - pad < minY) minY = s.minY - pad
+                        if (s.maxX + pad > maxX) maxX = s.maxX + pad
+                        if (s.maxY + pad > maxY) maxY = s.maxY + pad
+                    } else {
+                        for (pt in s.points) {
+                            if (pt.x - pad < minX) minX = pt.x - pad
+                            if (pt.y - pad < minY) minY = pt.y - pad
+                            if (pt.x + pad > maxX) maxX = pt.x + pad
+                            if (pt.y + pad > maxY) maxY = pt.y + pad
+                        }
+                    }
                 }
             }
         }
@@ -1322,24 +1466,43 @@ object KodanimaGraphicsEngine {
                     canvas.drawOval(scratch.rectF, p)
                 }
                 ToolType.BUCKET -> {
-                    val p = scratch.strokePaint.apply {
+                    val p = scratch.bucketFillPaint.apply {
                         color = strokeColor
-                        strokeWidth = 2.5f
                         colorFilter = colorFilterOverride
                     }
                     val pairCount = (points.size / 2) * 2
                     if (pairCount >= 2) {
-                        val buf = scratch.ensureCapacity(pairCount * 2)
-                        var outIdx = 0
+                        val path = scratch.path
+                        path.reset()
+                        path.fillType = Path.FillType.WINDING
+                        var runX0 = Float.NaN
+                        var runX1 = Float.NaN
+                        var runY0 = Float.NaN
+                        var runY1 = Float.NaN
                         var i = 0
                         while (i < pairCount) {
-                            val pt = points[i]
-                            buf[outIdx++] = pt.x
-                            buf[outIdx++] = pt.y
-                            i++
+                            val pt0 = points[i]
+                            val pt1 = points[i + 1]
+                            val sx0 = min(pt0.x, pt1.x)
+                            val sx1 = max(pt0.x, pt1.x) + 1f
+                            val sy = pt0.y
+                            if (!runX0.isNaN() && abs(sx0 - runX0) < 0.01f && abs(sx1 - runX1) < 0.01f && abs(sy - runY1) < 0.05f) {
+                                runY1 = sy + 1f
+                            } else {
+                                if (!runX0.isNaN()) {
+                                    path.addRect(runX0, runY0, runX1, runY1, Path.Direction.CW)
+                                }
+                                runX0 = sx0
+                                runX1 = sx1
+                                runY0 = sy
+                                runY1 = sy + 1f
+                            }
+                            i += 2
                         }
-                        // Single batched JNI drawLines call -> processed via ARM NEON/ASIMD in libhwui
-                        canvas.drawLines(buf, 0, outIdx, p)
+                        if (!runX0.isNaN()) {
+                            path.addRect(runX0, runY0, runX1, runY1, Path.Direction.CW)
+                        }
+                        canvas.drawPath(path, p)
                     }
                 }
                 ToolType.BEZIER_PEN -> {
@@ -2551,14 +2714,15 @@ object KodanimaGraphicsEngine {
 
     private fun colorMatch(c1: Int, c2: Int, tolerance: Int): Boolean {
         if (c1 == c2) return true
+        val a1 = (c1 ushr 24) and 0xFF
+        val a2 = (c2 ushr 24) and 0xFF
+        if (a1 == 0 && a2 == 0) return true
         if (tolerance == 0) return false
 
-        val a1 = (c1 ushr 24) and 0xFF
         val r1 = (c1 ushr 16) and 0xFF
         val g1 = (c1 ushr 8) and 0xFF
         val b1 = c1 and 0xFF
 
-        val a2 = (c2 ushr 24) and 0xFF
         val r2 = (c2 ushr 16) and 0xFF
         val g2 = (c2 ushr 8) and 0xFF
         val b2 = c2 and 0xFF
@@ -2571,6 +2735,7 @@ object KodanimaGraphicsEngine {
 
     /**
      * Executes flood fill with zero-boxing PrimitiveIntQueue and returns horizontal stroke spans.
+     * Supports optional [closeGapsPixels] morphological line closing so small gaps in line art don't leak.
      * When [selectionPoly] is provided, strictly confines flood fill inside the selection polygon.
      */
     fun createFloodFillSpans(
@@ -2580,7 +2745,8 @@ object KodanimaGraphicsEngine {
         tolerance: Int = 20,
         selectionPoly: List<StrokePoint>? = null,
         isSelectionInverted: Boolean = false,
-        expandPixels: Int = 0
+        expandPixels: Int = 0,
+        closeGapsPixels: Int = 0
     ): List<StrokePoint> {
         val width = bitmap.width
         val height = bitmap.height
@@ -2595,6 +2761,50 @@ object KodanimaGraphicsEngine {
         val targetColor = bitmap.getPixel(startX, startY)
         val pixels = IntArray(width * height)
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val gapRadius = closeGapsPixels.coerceIn(0, 6)
+        val barrierMask: BooleanArray? = if (gapRadius > 0) {
+            var cur = BooleanArray(width * height) { i -> !colorMatch(pixels[i], targetColor, tolerance) }
+            var tmp = BooleanArray(width * height)
+            repeat(gapRadius) {
+                cur.copyInto(tmp)
+                for (y in 0 until height) {
+                    val row = y * width
+                    for (x in 0 until width) {
+                        val i = row + x
+                        if (cur[i]) continue
+                        if ((x > 0 && cur[i - 1]) ||
+                            (x < width - 1 && cur[i + 1]) ||
+                            (y > 0 && cur[i - width]) ||
+                            (y < height - 1 && cur[i + width])
+                        ) {
+                            tmp[i] = true
+                        }
+                    }
+                }
+                val swap = cur; cur = tmp; tmp = swap
+            }
+            repeat(gapRadius) {
+                cur.copyInto(tmp)
+                for (y in 0 until height) {
+                    val row = y * width
+                    for (x in 0 until width) {
+                        val i = row + x
+                        if (!cur[i]) continue
+                        if (x == 0 || !cur[i - 1] ||
+                            x == width - 1 || !cur[i + 1] ||
+                            y == 0 || !cur[i - width] ||
+                            y == height - 1 || !cur[i + width]
+                        ) {
+                            tmp[i] = false
+                        }
+                    }
+                }
+                val swap = cur; cur = tmp; tmp = swap
+            }
+            cur[startY * width + startX] = false
+            cur
+        } else null
 
         val visited = BooleanArray(width * height)
         var filledMask = BooleanArray(width * height)
@@ -2623,7 +2833,13 @@ object KodanimaGraphicsEngine {
             val y = packed ushr 16
             val idx = y * width + x
 
-            if (colorMatch(pixels[idx], targetColor, tolerance)) {
+            val isPassable = if (barrierMask != null) {
+                !barrierMask[idx] && colorMatch(pixels[idx], targetColor, tolerance)
+            } else {
+                colorMatch(pixels[idx], targetColor, tolerance)
+            }
+
+            if (isPassable) {
                 filledMask[idx] = true
                 if (y < minY) minY = y
                 if (y > maxY) maxY = y

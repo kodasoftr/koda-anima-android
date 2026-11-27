@@ -66,8 +66,15 @@ import com.example.model.TouchGestureRegistry
 import com.example.model.UvUnwrapProjection
 import com.example.ui.components.computeStage3DZPositions
 import com.example.viewmodel.KodanimaViewModel
+import com.example.engine.SampleProjects
+import com.example.model.CustomShaderNodePreset
+import com.example.model.ShaderNode
+import com.example.model.ShaderNodeKind
+import com.example.model.StageShadingMode
+import com.example.model.TransformSpaceMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -76,11 +83,13 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 @RunWith(RobolectricTestRunner::class)
@@ -2347,5 +2356,576 @@ class StudioUpgradesTest {
         assertEquals(-320f, parsedStroke.points[0].x, 0.5f)
         assertEquals(-150f, parsedStroke.points[0].y, 0.5f)
         assertNotNull(context)
+    }
+
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Test
+    fun `camera resolution sync, studio 3d undo redo, rar and bones import, local axis rotation, 4 shading modes, obj zip export and custom nodes work`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+
+        // 1. Camera resolution matches ProjectResolution on empty project creation & setProjectResolution
+        val portraitRes = ProjectResolution(name = "Shorts 9:16", width = 1080, height = 1920)
+        val emptyProj = SampleProjects.createEmptyProject("ResSync", portraitRes, 24)
+        assertEquals(1080, emptyProj.camera3D.captureWidth)
+        assertEquals(1920, emptyProj.camera3D.captureHeight)
+
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("ResSyncVM", ProjectResolution.PRESETS[0], 24)
+        vm.setProjectResolution(portraitRes)
+        assertEquals(1080, vm.uiState.value.project.camera3D.captureWidth)
+        assertEquals(1920, vm.uiState.value.project.camera3D.captureHeight)
+
+        // 2. Estúdio 3D Undo & Redo for object transforms and object deletion
+        vm.toggleCameraTimeline()
+        vm.toggleCameraSideView3D()
+        vm.addBuiltIn3DPrimitive(BuiltIn3DPrimitive.CUBE)
+        val addedObj = vm.uiState.value.project.camera3D.scene3DObjects.first()
+        val initialX = addedObj.keyframes.first().x
+
+        Thread.sleep(650L)
+        vm.updateSceneObject3D(addedObj.id, bumpRevision = true) { obj ->
+            val tf = obj.keyframes.first()
+            obj.copy(keyframes = listOf(tf.copy(x = 180f, rotY = 45f)))
+        }
+        assertEquals(180f, vm.uiState.value.project.camera3D.scene3DObjects.first().keyframes.first().x, 0.01f)
+        assertTrue(vm.uiState.value.canUndo)
+
+        vm.undo()
+        assertEquals(initialX, vm.uiState.value.project.camera3D.scene3DObjects.first().keyframes.first().x, 0.01f)
+        assertTrue(vm.uiState.value.canRedo)
+
+        vm.redo()
+        assertEquals(180f, vm.uiState.value.project.camera3D.scene3DObjects.first().keyframes.first().x, 0.01f)
+
+        // Delete object then Undo must restore it
+        vm.deleteSceneObject3D(addedObj.id)
+        assertTrue(vm.uiState.value.project.camera3D.scene3DObjects.isEmpty())
+        vm.undo()
+        assertEquals(1, vm.uiState.value.project.camera3D.scene3DObjects.size)
+        assertEquals(addedObj.id, vm.uiState.value.project.camera3D.scene3DObjects.first().id)
+
+        // 3. RAR4 stored .obj extraction + auto-detection + FBX/glTF bone extraction
+        val objPayload = """
+            o TriangleRar
+            v -1.0 0.0 0.0
+            v 1.0 0.0 0.0
+            v 0.0 1.5 0.0
+            vt 0.0 0.0
+            vt 1.0 0.0
+            vt 0.5 1.0
+            f 1/1 2/2 3/3
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+        val fileNameBytes = "mesh_rar.obj".toByteArray(Charsets.UTF_8)
+        val rarHeadSize = 32 + fileNameBytes.size
+        val rarBuf = ByteBuffer.allocate(7 + rarHeadSize + objPayload.size).order(ByteOrder.LITTLE_ENDIAN)
+        rarBuf.put(byteArrayOf(0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00)) // RAR4 marker
+        val fileHdrPos = rarBuf.position()
+        rarBuf.putShort(0x0000) // head CRC placeholder
+        rarBuf.put(0x74.toByte()) // FILE header
+        rarBuf.putShort(0x8000.toShort()) // ADD_SIZE flag
+        rarBuf.putShort(rarHeadSize.toShort())
+        rarBuf.putInt(objPayload.size) // packSizeLow
+        rarBuf.putInt(objPayload.size) // unpSizeLow
+        rarBuf.put(0) // host OS
+        rarBuf.putInt(0) // file CRC
+        rarBuf.putInt(0) // time
+        rarBuf.put(29) // unpVer
+        rarBuf.put(0x30.toByte()) // method = STORE
+        rarBuf.putShort(fileNameBytes.size.toShort())
+        rarBuf.putInt(0) // attr
+        rarBuf.position(fileHdrPos + 32)
+        rarBuf.put(fileNameBytes)
+        rarBuf.put(objPayload)
+        val rarBytes = rarBuf.array()
+
+        val extracted = Mesh3DImporter.extractRarArchiveMap(rarBytes)
+        assertTrue("RAR4 archive must extract stored OBJ entry", extracted.containsKey("mesh_rar.obj"))
+        // Auto-detect format even without filename extension
+        val rarScene = Mesh3DImporter.parseSceneBytesForTest(rarBytes, "arquivo_sem_extensao")
+        assertNotNull("RAR4 scene must auto-detect and parse OBJ cleanly", rarScene)
+        assertEquals(1, rarScene!!.totalTriangles)
+
+        // FBX bones extraction
+        val fbxRigAscii = """
+            ; FBX 7.4.0 project file
+            Objects:  {
+                Model: 100, "Model::SpineRoot", "LimbNode" {
+                }
+                Model: 101, "Model::HeadBone", "LimbNode" {
+                }
+            }
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+        val fbxBones = com.example.engine.FbxAndMax3DParser.extractFbxBones(fbxRigAscii)
+        assertEquals(2, fbxBones.size)
+        assertEquals("SpineRoot", fbxBones[0].name)
+        assertEquals("HeadBone", fbxBones[1].name)
+
+        // glTF bones extraction (skins.joints)
+        val gltfWithSkin = """
+            {
+              "asset": { "version": "2.0" },
+              "nodes": [
+                { "name": "Hips", "children": [1] },
+                { "name": "Spine" }
+              ],
+              "skins": [
+                { "joints": [0, 1] }
+              ]
+            }
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+        val parsedGltfSkin = Mesh3DImporter.parseSceneBytesForTest(gltfWithSkin, "rig.gltf")
+        assertNotNull(parsedGltfSkin)
+        assertEquals(2, parsedGltfSkin!!.bones.size)
+        assertEquals("Hips", parsedGltfSkin.bones[0].name)
+        assertEquals("Spine", parsedGltfSkin.bones[1].name)
+
+        // 4. Local-axis Euler composition ("até no próprio eixo") vs global rotation
+        vm.setStageTransformSpace(TransformSpaceMode.LOCAL)
+        assertEquals(TransformSpaceMode.LOCAL, vm.uiState.value.project.camera3D.transformSpace)
+        val (localRx, localRy, localRz) = Camera3DEngine.composeLocalAxisRotationEuler(
+            rxDeg = 45f,
+            ryDeg = 0f,
+            rzDeg = 0f,
+            dLocalX = 0f,
+            dLocalY = 30f,
+            dLocalZ = 0f
+        )
+        // Rotating locally around Y on a 45°-tilted object must tilt Z as well, unlike naive global ry += 30
+        assertNotEquals("Local Y rotation on X-tilted object must affect Z or X coupling", 0f, localRz, 0.5f)
+        assertTrue(localRy in 15f..35f)
+        assertTrue(localRx in 30f..55f)
+
+        // 5. 4 StageShadingModes & hideable floor grid
+        val restoredObj = vm.uiState.value.project.camera3D.scene3DObjects.first()
+        val renderOutputs = StageShadingMode.entries.map { mode ->
+            vm.setStageShadingMode(mode)
+            assertEquals(mode, vm.uiState.value.project.camera3D.shadingMode)
+            val res = Camera3DEngine.renderSceneObjectsSoftware3D(
+                outW = 96,
+                outH = 96,
+                sceneObjects = listOf(restoredObj),
+                frameIndex = 0,
+                autoInterpolate = false,
+                camYawDeg = 20f,
+                camPitchDeg = 18f,
+                camRollDeg = 0f,
+                camPanX = 0f,
+                camPanY = 0f,
+                focalPx = 220f,
+                vpCx = 48f,
+                vpCy = 48f,
+                shadingMode = mode
+            )
+            assertNotNull("Shading mode $mode must render non-null bitmap", res)
+            val bmp = res!!.first
+            val px = IntArray(96 * 96)
+            bmp.getPixels(px, 0, 96, 0, 0, 96, 96)
+            bmp.recycle()
+            px
+        }
+        // WIREFRAME must differ visually from SOLID
+        assertTrue(
+            "WIREFRAME and SOLID shading modes must render distinct pixels",
+            renderOutputs[0].indices.count { renderOutputs[0][it] != renderOutputs[1][it] } > 100
+        )
+        assertTrue(vm.uiState.value.project.camera3D.showFloorGrid)
+        vm.toggleStageFloorGrid()
+        assertFalse(vm.uiState.value.project.camera3D.showFloorGrid)
+
+        // 6. Export selected 3D object + composited UV as portable ZIP (.obj + .mtl + texture_uv.png)
+        val objMesh = Mesh3DImporter.getOrLoadMesh(restoredObj.meshAssetPath)!!
+        val exportedZipBytes = Mesh3DImporter.exportSceneObject3DAsObjZipBytes(restoredObj, objMesh)
+        val zipEntries = HashSet<String>()
+        ZipInputStream(ByteArrayInputStream(exportedZipBytes)).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                zipEntries.add(entry.name)
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
+        assertTrue("Exported ZIP must contain .obj", zipEntries.any { it.endsWith(".obj") })
+        assertTrue("Exported ZIP must contain .mtl", zipEntries.any { it.endsWith(".mtl") })
+        assertTrue("Exported ZIP must contain texture_uv.png", zipEntries.any { it == "texture_uv.png" })
+
+        // 7. Custom shader node presets ("Nodes Próprios"): save, apply, delete
+        val customGraph = ShaderNodeGraph(
+            enabled = true,
+            nodes = listOf(
+                ShaderNode(id = "bsdf_1", kind = ShaderNodeKind.PRINCIPLED_BSDF, x = 120f, y = 100f, paramA = 0.25f, paramB = 0.8f),
+                ShaderNode(id = "out_1", kind = ShaderNodeKind.CONTORNO, x = 320f, y = 100f, paramA = 0.7f, colorArgb = 0xFF00E5FFL)
+            )
+        )
+        vm.saveCustomShaderNodePreset("Anime Metalizado", customGraph)
+        val savedPreset = vm.uiState.value.customShaderNodePresets.firstOrNull()
+        assertNotNull(savedPreset)
+        assertEquals("Anime Metalizado", savedPreset!!.name)
+
+        vm.applyCustomShaderNodePreset(restoredObj.id, savedPreset)
+        val updatedObj = vm.uiState.value.project.camera3D.scene3DObjects.first { it.id == restoredObj.id }
+        assertTrue(updatedObj.nodeGraph.enabled)
+        assertEquals("Anime Metalizado", updatedObj.nodeGraph.presetName)
+        assertEquals(2, updatedObj.nodeGraph.nodes.size)
+
+        vm.deleteCustomShaderNodePreset(savedPreset.id)
+        assertTrue(vm.uiState.value.customShaderNodePresets.isEmpty())
+    }
+
+    @Test
+    fun testGifLzwQuality_nonCropped3DRender_mtlQuotedImport_andUvVertexEditor() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+
+        // 1. GIF Encoder LZW bit-width & full-frame quantizer test (>200 colors across frame)
+        val gifBmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888)
+        for (y in 0 until 64) {
+            for (x in 0 until 64) {
+                val r = (x * 4).coerceIn(0, 255)
+                val g = (y * 4).coerceIn(0, 255)
+                val b = (((x + y) * 2)).coerceIn(0, 255)
+                gifBmp.setPixel(x, y, android.graphics.Color.rgb(r, g, b))
+            }
+        }
+        val gifBytes = com.example.engine.GifEncoder().encodeFramesWithHolds(
+            frames = listOf(gifBmp to 2),
+            fps = 12
+        )
+        gifBmp.recycle()
+        assertTrue("GIF output should have valid GIF89a header", gifBytes.size > 100 && String(gifBytes, 0, 6) == "GIF89a")
+        val decodedGif = android.graphics.BitmapFactory.decodeByteArray(gifBytes, 0, gifBytes.size)
+        assertNotNull("GIF LZW stream must decode cleanly via BitmapFactory", decodedGif)
+        assertEquals(64, decodedGif!!.width)
+        assertEquals(64, decodedGif.height)
+        val topLeft = decodedGif.getPixel(2, 2)
+        val bottomRight = decodedGif.getPixel(61, 61)
+        assertNotEquals("Top-left and bottom-right colors must remain distinct after quantization & LZW", topLeft, bottomRight)
+        decodedGif.recycle()
+
+        // 2. Non-cropped 3D scene rendering with cropToCamera = false & show3DInCanvas = false
+        val cubeObj = SceneObject3D(
+            id = "export_cube",
+            name = "Cubo Export",
+            meshAssetPath = "builtin:cube",
+            colorTint = 0xFFFF5500L,
+            keyframes = listOf(ObjectTransformKeyframe(frameIndex = 0, z = 0f, scaleX = 1.6f, scaleY = 1.6f, scaleZ = 1.6f))
+        )
+        val frame0 = Frame(layers = listOf(Layer(id = "l1", name = "L1")))
+        val settings3D = Camera3DSettings(
+            isEnabled = true,
+            cameraMode = CameraMode.MODE_3D,
+            showFloorGrid = false,
+            scene3DObjects = listOf(cubeObj)
+        )
+        val outBmp = Bitmap.createBitmap(320, 240, Bitmap.Config.ARGB_8888)
+        Camera3DEngine.renderFrameWithCameraAndEffects(
+            frame = frame0,
+            settings = settings3D,
+            frameIndex = 0,
+            projectWidth = 320,
+            projectHeight = 240,
+            targetBitmap = outBmp,
+            cropToCamera = false
+        )
+        var nonTransparentOrColoredPixels = 0
+        val outPx = IntArray(320 * 240)
+        outBmp.getPixels(outPx, 0, 320, 0, 0, 320, 240)
+        for (p in outPx) {
+            if (android.graphics.Color.alpha(p) > 20 && (android.graphics.Color.red(p) > 80 || android.graphics.Color.green(p) > 40)) {
+                nonTransparentOrColoredPixels++
+            }
+        }
+        outBmp.recycle()
+        assertTrue(
+            "3D object must render in non-cropped export even when show3DInCanvas is false (got $nonTransparentOrColoredPixels px)",
+            nonTransparentOrColoredPixels > 80
+        )
+
+        // 3. Mesh3DImporter: quoted MTL map_Kd path with spaces + OBJ ZIP export honoring customUvs
+        val texBmp = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(android.graphics.Color.rgb(20, 220, 180))
+        }
+        val texBaos = java.io.ByteArrayOutputStream()
+        texBmp.compress(Bitmap.CompressFormat.PNG, 100, texBaos)
+        texBmp.recycle()
+        val texBytes = texBaos.toByteArray()
+
+        val objText = """
+            mtllib "mat space.mtl"
+            v 0 0 0
+            v 1 0 0
+            v 0 1 0
+            vt 0.1 0.2
+            vt 0.8 0.2
+            vt 0.1 0.9
+            usemtl mat1
+            f 1/1 2/2 3/3
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+        val mtlText = """
+            newmtl mat1
+            map_Kd -bm 1.0 "textures/tex with space.png"
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+
+        val parsedObj = Mesh3DImporter.parseSceneBytesForTest(
+            bytes = objText,
+            fileName = "model.obj",
+            siblingResolver = { req ->
+                when {
+                    req.contains("mat space.mtl") -> mtlText
+                    req.contains("tex with space.png") -> texBytes
+                    else -> null
+                }
+            }
+        )
+        assertNotNull("OBJ with quoted mtllib must parse", parsedObj)
+        assertTrue("MTL quoted texture path with spaces & options must load pixels", parsedObj!!.subMeshes.first().texturePixels != null)
+
+        val builtInMesh = Mesh3DImporter.getOrLoadMesh("builtin:cube")!!
+        val customMeshVertCount = builtInMesh.subMeshes.sumOf { it.vertices.size / 3 }
+        val fullCustomUvs = MutableList(customMeshVertCount * 2) { idx ->
+            if (idx % 2 == 0) 0.37f else 0.63f
+        }
+        val objCustomAll = SceneObject3D(
+            id = "custom_uv_obj",
+            name = "CustomUV",
+            meshAssetPath = "builtin:cube",
+            uvSlots = listOf(ObjectUVMapSlot(name = "EditedUV", customUvs = fullCustomUvs))
+        )
+        val exportedZip = Mesh3DImporter.exportSceneObject3DAsObjZipBytes(objCustomAll, builtInMesh)
+        var objContentInZip = ""
+        ZipInputStream(ByteArrayInputStream(exportedZip)).use { zis ->
+            var e = zis.nextEntry
+            while (e != null) {
+                if (e.name.endsWith(".obj")) {
+                    objContentInZip = zis.readBytes().toString(Charsets.UTF_8)
+                }
+                zis.closeEntry()
+                e = zis.nextEntry
+            }
+        }
+        assertTrue("Exported OBJ must contain customUvs vt coordinates (vt 0.37000 0.37000)", objContentInZip.contains("vt 0.37000"))
+
+        // 4. UvVertexEditorMath + ViewModel UV editing, JSON roundtrip, and Undo/Redo
+        val twoIslandUvs = floatArrayOf(
+            0.1f, 0.1f, 0.2f, 0.1f, 0.1f, 0.2f, // island A: 0,1,2
+            0.8f, 0.8f, 0.9f, 0.8f, 0.8f, 0.9f  // island B: 3,4,5
+        )
+        val twoIslandTri = intArrayOf(0, 1, 2, 3, 4, 5)
+        val islandA = com.example.ui.components.UvVertexEditorMath.findConnectedUvIslandIndices(
+            startVertexIdx = 0,
+            uvs = twoIslandUvs,
+            triIndices = twoIslandTri,
+            totalVertices = 6
+        )
+        assertEquals(setOf(0, 1, 2), islandA)
+
+        val moved = com.example.ui.components.UvVertexEditorMath.translateSelectedUvs(
+            baseUvs = twoIslandUvs,
+            selectedIndices = islandA,
+            du = 0.05f,
+            dv = -0.05f,
+            snapStep = 0f
+        )
+        assertEquals(0.15f, moved[0], 0.001f)
+        assertEquals(0.05f, moved[1], 0.001f)
+        assertEquals(0.8f, moved[6], 0.001f) // Island B untouched
+
+        val scaled = com.example.ui.components.UvVertexEditorMath.scaleSelectedUvs(
+            baseUvs = moved,
+            selectedIndices = islandA,
+            pivotU = 0.15f,
+            pivotV = 0.05f,
+            scaleFactor = 2.0f
+        )
+        assertEquals(0.35f, scaled[2], 0.001f)
+
+        val rotated = com.example.ui.components.UvVertexEditorMath.rotateSelectedUvs(
+            baseUvs = moved,
+            selectedIndices = setOf(1),
+            pivotU = 0.15f,
+            pivotV = 0.05f,
+            angleRad = (Math.PI / 2.0).toFloat()
+        )
+        assertEquals(0.15f, rotated[2], 0.002f)
+
+        // ViewModel wiring + JSON persistence + Undo/Redo
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("UvEditTest", ProjectResolution.PRESETS[0], 24)
+        vm.toggleCameraTimeline()
+        vm.toggleCameraSideView3D()
+        vm.addBuiltIn3DPrimitive(BuiltIn3DPrimitive.CUBE)
+        val sceneObj = vm.uiState.value.project.camera3D.scene3DObjects.first()
+
+        vm.openStudio3DUvEditor()
+        assertTrue(vm.uiState.value.isStudio3DUvEditorOpen)
+
+        Thread.sleep(650L)
+        val editedFlat = List(customMeshVertCount * 2) { if (it % 2 == 0) 0.42f else 0.58f }
+        vm.updateSceneObjectUvVertices(sceneObj.id, editedFlat, coalesceMs = 0L)
+        val afterEdit = vm.uiState.value.project.camera3D.scene3DObjects.first { it.id == sceneObj.id }
+        val activeSlotAfter = afterEdit.uvSlots[afterEdit.activeUvSlotIndex]
+        assertEquals(editedFlat.size, activeSlotAfter.customUvs.size)
+        assertEquals(0.42f, activeSlotAfter.customUvs[0], 0.001f)
+
+        // JSON roundtrip preserves customUvs
+        val json = FileImportExportManager.projectToJson(vm.uiState.value.project)
+        val restoredProj = FileImportExportManager.projectFromJson(json)
+        val restoredSlot = restoredProj.camera3D.scene3DObjects.first { it.id == sceneObj.id }.uvSlots.first()
+        assertEquals(0.42f, restoredSlot.customUvs[0], 0.001f)
+
+        // Undo restores pre-edit UVs; Redo brings them back
+        assertTrue(vm.uiState.value.canUndo)
+        vm.undo()
+        val afterUndo = vm.uiState.value.project.camera3D.scene3DObjects.first { it.id == sceneObj.id }
+        assertTrue(afterUndo.uvSlots[afterUndo.activeUvSlotIndex].customUvs.isEmpty())
+        assertTrue(vm.uiState.value.canRedo)
+        vm.redo()
+        val afterRedo = vm.uiState.value.project.camera3D.scene3DObjects.first { it.id == sceneObj.id }
+        assertEquals(0.42f, afterRedo.uvSlots[afterRedo.activeUvSlotIndex].customUvs[0], 0.001f)
+
+        vm.resetSceneObjectCustomUvs(sceneObj.id)
+        val afterReset = vm.uiState.value.project.camera3D.scene3DObjects.first { it.id == sceneObj.id }
+        assertTrue(afterReset.uvSlots[afterReset.activeUvSlotIndex].customUvs.isEmpty())
+
+        vm.closeStudio3DUvEditor()
+        assertFalse(vm.uiState.value.isStudio3DUvEditorOpen)
+    }
+
+    @Test
+    fun `viewport overscan adds 4px+ margin, bucket gap-closing prevents leaks, and frame local layers toggle below or above frame strokes`() {
+        val context = RuntimeEnvironment.getApplication()
+
+        // 1. Viewport cache overscan margin >= 4px beyond screen resolution
+        val dims = KodanimaGraphicsEngine.computeViewportCacheDimensions(
+            containerWidth = 1080f,
+            containerHeight = 2400f,
+            vpScale = 1.0f
+        )
+        assertTrue("Overscan margin must be >= 4px per side", dims.marginPx >= 4)
+        assertTrue("Cache width must exceed screen width by >= 8px", dims.cacheWidth >= 1088)
+        assertTrue("Cache height must exceed screen height by >= 8px", dims.cacheHeight >= 2408)
+
+        val lowScaleDims = KodanimaGraphicsEngine.computeViewportCacheDimensions(
+            containerWidth = 1080f,
+            containerHeight = 2400f,
+            vpScale = 0.5f
+        )
+        assertTrue("Even downscaled viewport cache preserves >= 4px margin", lowScaleDims.marginPx >= 4)
+
+        val idMat = android.graphics.Matrix()
+        val bounds = KodanimaGraphicsEngine.computeOverscannedVisibleProjectBounds(
+            projToScreenMatrix = idMat,
+            containerWidth = 400f,
+            containerHeight = 300f,
+            screenOverscanPx = 8f,
+            zoom = 1.0f
+        )
+        assertNotNull(bounds)
+        assertTrue(bounds!!.left <= -8f)
+        assertTrue(bounds.right >= 408f)
+
+        // 2. Bucket fill gap closing seals hairline breaks + Bucket path draws semi-transparent fill cleanly
+        val gapBmp = Bitmap.createBitmap(80, 80, Bitmap.Config.ARGB_8888)
+        gapBmp.eraseColor(android.graphics.Color.TRANSPARENT)
+        val cGap = android.graphics.Canvas(gapBmp)
+        val linePaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.BLACK
+            strokeWidth = 3f
+            style = android.graphics.Paint.Style.STROKE
+        }
+        // Draw box 20..60 with a 2px hairline gap at top edge (x = 39..41)
+        cGap.drawLine(20f, 20f, 38f, 20f, linePaint)
+        cGap.drawLine(42f, 20f, 60f, 20f, linePaint)
+        cGap.drawLine(60f, 20f, 60f, 60f, linePaint)
+        cGap.drawLine(60f, 60f, 20f, 60f, linePaint)
+        cGap.drawLine(20f, 60f, 20f, 20f, linePaint)
+
+        val leakedSpans = KodanimaGraphicsEngine.createFloodFillSpans(
+            bitmap = gapBmp,
+            startX = 40,
+            startY = 40,
+            tolerance = 36,
+            closeGapsPixels = 0
+        )
+        val sealedSpans = KodanimaGraphicsEngine.createFloodFillSpans(
+            bitmap = gapBmp,
+            startX = 40,
+            startY = 40,
+            tolerance = 36,
+            closeGapsPixels = 2
+        )
+        val leakedArea = leakedSpans.chunked(2).sumOf { (a, b) -> (b.x - a.x + 1f).toDouble() }
+        val sealedArea = sealedSpans.chunked(2).sumOf { (a, b) -> (b.x - a.x + 1f).toDouble() }
+        assertTrue("Unsealed gap leaks outside box ($leakedArea > 3000)", leakedArea > 3000.0)
+        assertTrue("Gap closing keeps fill inside box ($sealedArea < 2000)", sealedArea in 900.0..2000.0)
+        gapBmp.recycle()
+
+        // Uniform opacity check for ToolType.BUCKET (zero overlapping row stripes)
+        val bucketStroke = DrawingStroke(
+            tool = ToolType.BUCKET,
+            color = 0xFFFF0000L,
+            opacity = 0.5f,
+            points = listOf(
+                StrokePoint(10f, 10f), StrokePoint(30f, 10f),
+                StrokePoint(10f, 11f), StrokePoint(30f, 11f),
+                StrokePoint(10f, 12f), StrokePoint(30f, 12f)
+            ),
+            isFilled = true
+        )
+        val outBucketBmp = Bitmap.createBitmap(50, 50, Bitmap.Config.ARGB_8888)
+        outBucketBmp.eraseColor(android.graphics.Color.TRANSPARENT)
+        KodanimaGraphicsEngine.drawStrokeToCanvas(bucketStroke, android.graphics.Canvas(outBucketBmp))
+        val aRow0 = android.graphics.Color.alpha(outBucketBmp.getPixel(20, 10))
+        val aRow1 = android.graphics.Color.alpha(outBucketBmp.getPixel(20, 11))
+        assertEquals("Coalesced bucket path rows must have identical alpha", aRow0, aRow1)
+        assertTrue("Semi-transparent bucket alpha (~127) must not double-compound", aRow0 in 115..140)
+        outBucketBmp.recycle()
+
+        // 3. Frame sub-layer placement ("Embaixo do quadro" vs "Em cima do quadro")
+        val vm = KodanimaViewModel()
+        vm.initializeWithContext(context)
+        vm.loadNewEmptyProject("FrameOrderTest", ProjectResolution(100, 100, "100x100"), 12)
+
+        // Draw BLUE vertical stroke on main timeline layer
+        val timelineStroke = DrawingStroke(
+            tool = ToolType.PEN,
+            color = 0xFF0000FFL,
+            brushSize = 14f,
+            points = listOf(StrokePoint(50f, 10f), StrokePoint(50f, 90f))
+        )
+        vm.addStrokeToCurrentLayer(timelineStroke)
+
+        // Add frame local sub-layer and draw RED horizontal stroke crossing (50, 50)
+        vm.addFrameLocalLayer("Cor Quadro")
+        val localStroke = DrawingStroke(
+            tool = ToolType.PEN,
+            color = 0xFFFF0000L,
+            brushSize = 14f,
+            points = listOf(StrokePoint(10f, 50f), StrokePoint(90f, 50f))
+        )
+        vm.addStrokeToCurrentLayer(localStroke)
+
+        // Default placement is ABOVE frame strokes -> center pixel (50, 50) is RED
+        val aboveBmp = KodanimaGraphicsEngine.renderFrameToBitmap(
+            vm.uiState.value.project.frames[0], 100, 100, android.graphics.Color.WHITE
+        )
+        val abovePx = aboveBmp.getPixel(50, 50)
+        assertTrue("Default local layer draws above timeline strokes (RED)", android.graphics.Color.red(abovePx) > 200 && android.graphics.Color.blue(abovePx) < 40)
+        aboveBmp.recycle()
+
+        // Toggle placement to BELOW frame ("Embaixo do quadro") -> center pixel (50, 50) becomes BLUE
+        vm.setFrameLocalLayerPlacement(0, placeBelowFrame = true)
+        assertTrue(vm.uiState.value.project.frames[0].localLayers[0].placeBelowFrame)
+        val belowBmp = KodanimaGraphicsEngine.renderFrameToBitmap(
+            vm.uiState.value.project.frames[0], 100, 100, android.graphics.Color.WHITE
+        )
+        val belowPx = belowBmp.getPixel(50, 50)
+        assertTrue("Below-frame local layer must draw underneath timeline strokes (BLUE)", android.graphics.Color.blue(belowPx) > 200 && android.graphics.Color.red(belowPx) < 40)
+        belowBmp.recycle()
+
+        // JSON persistence preserves placeBelowFrame
+        val savedJson = FileImportExportManager.projectToJson(vm.uiState.value.project)
+        val reloaded = FileImportExportManager.projectFromJson(savedJson)
+        assertTrue(reloaded.frames[0].localLayers[0].placeBelowFrame)
     }
 }

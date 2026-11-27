@@ -117,6 +117,7 @@ import com.example.model.SceneObject3D
 import com.example.model.SelectionRegion
 import com.example.model.SkyBackdropMode
 import com.example.model.StageSelection
+import com.example.model.StageShadingMode
 import com.example.model.StageTargetType
 import com.example.model.StrokePoint
 import com.example.model.TabletDriverSettings
@@ -156,14 +157,16 @@ private class CanvasBitmapCache {
     var cacheW: Int = 0
     var cacheH: Int = 0
 
-    // Full-viewport screen-resolution off-canvas caches (allow unbounded off-canvas drawing)
+    // Full-viewport screen-resolution off-canvas caches (with overscan margin >= 4px for zero edge clipping)
     var vpW: Int = 0
     var vpH: Int = 0
     var vpScale: Float = 1f
+    var vpMarginPx: Int = 0
     val cachedProjToScreenMatrix: AndroidMatrix = AndroidMatrix()
     var hasCachedMatrix: Boolean = false
     val activeSessionMatrix: AndroidMatrix = AndroidMatrix()
     var activeSessionVpScale: Float = 1f
+    var activeSessionMarginPx: Int = 0
 
     var onionBitmap: Bitmap? = null
     var onionKey: Any? = null
@@ -194,6 +197,8 @@ private class CanvasBitmapCache {
     // Per-layer cached transparent bitmaps for real 3D Stage viewport
     val stage3DLayerBitmaps: MutableMap<String, Bitmap> = mutableMapOf()
     val stage3DLayerKeys: MutableMap<String, LayerSliceCacheKey> = mutableMapOf()
+    val stage3DOffCanvasBitmaps: MutableMap<String, Bitmap> = mutableMapOf()
+    val stage3DOffCanvasKeys: MutableMap<String, LayerSliceCacheKey> = mutableMapOf()
     val stage3DObjectEntries: MutableMap<String, Stage3DObjectCacheEntry> = mutableMapOf()
     var stage3DBgBitmap: Bitmap? = null
     var stage3DBgKey: Any? = null
@@ -220,12 +225,13 @@ private class CanvasBitmapCache {
         cacheH = h
     }
 
-    fun ensureViewportSize(w: Int, h: Int, scale: Float) {
+    fun ensureViewportSize(w: Int, h: Int, scale: Float, marginPx: Int = 0) {
         vpScale = scale
-        if (w == vpW && h == vpH) return
+        if (w == vpW && h == vpH && marginPx == vpMarginPx) return
         releaseViewportLayers()
         vpW = w
         vpH = h
+        vpMarginPx = marginPx
     }
 
     fun acquireOrReuseViewport(current: Bitmap?, clearColor: Int): Bitmap {
@@ -242,11 +248,13 @@ private class CanvasBitmapCache {
     fun beginEraserSession(
         sessionMatrix: AndroidMatrix,
         sessionVpScale: Float,
+        sessionMarginPx: Int = vpMarginPx,
         activeSelection: SelectionRegion = SelectionRegion(),
         densityMult: Float = 1.0f
     ) {
         activeSessionMatrix.set(sessionMatrix)
         activeSessionVpScale = sessionVpScale
+        activeSessionMarginPx = sessionMarginPx
         val base = activeLayerBitmap
         val dst = acquireOrReuseViewport(eraserWorkBitmap, AndroidColor.TRANSPARENT)
         eraserWorkBitmap = dst
@@ -258,8 +266,14 @@ private class CanvasBitmapCache {
             if (hasCachedMatrix && cachedProjToScreenMatrix.invert(invCached)) {
                 val delta = AndroidMatrix()
                 delta.setConcat(sessionMatrix, invCached)
-                val vpToScreen = AndroidMatrix().apply { setScale(1f / vpScale.coerceAtLeast(0.01f), 1f / vpScale.coerceAtLeast(0.01f)) }
-                val screenToVp = AndroidMatrix().apply { setScale(sessionVpScale, sessionVpScale) }
+                val vpToScreen = AndroidMatrix().apply {
+                    setTranslate(-vpMarginPx.toFloat(), -vpMarginPx.toFloat())
+                    postScale(1f / vpScale.coerceAtLeast(0.01f), 1f / vpScale.coerceAtLeast(0.01f))
+                }
+                val screenToVp = AndroidMatrix().apply {
+                    setScale(sessionVpScale, sessionVpScale)
+                    postTranslate(sessionMarginPx.toFloat(), sessionMarginPx.toFloat())
+                }
                 val finalMat = AndroidMatrix()
                 finalMat.setConcat(delta, vpToScreen)
                 finalMat.postConcat(screenToVp)
@@ -272,7 +286,10 @@ private class CanvasBitmapCache {
             }
         }
         if (activeSelection.isActive && activeSelection.capturedStrokes.isNotEmpty()) {
-            val vpMat = AndroidMatrix(sessionMatrix).apply { postScale(sessionVpScale, sessionVpScale) }
+            val vpMat = AndroidMatrix(sessionMatrix).apply {
+                postScale(sessionVpScale, sessionVpScale)
+                postTranslate(sessionMarginPx.toFloat(), sessionMarginPx.toFloat())
+            }
             c.save()
             c.concat(vpMat)
             c.translate(activeSelection.offsetX, activeSelection.offsetY)
@@ -290,9 +307,14 @@ private class CanvasBitmapCache {
         lastErasedPointIdx = 0
     }
 
-    fun beginActiveStrokeSession(sessionMatrix: AndroidMatrix, sessionVpScale: Float) {
+    fun beginActiveStrokeSession(
+        sessionMatrix: AndroidMatrix,
+        sessionVpScale: Float,
+        sessionMarginPx: Int = vpMarginPx
+    ) {
         activeSessionMatrix.set(sessionMatrix)
         activeSessionVpScale = sessionVpScale
+        activeSessionMarginPx = sessionMarginPx
         val dst = acquireOrReuseViewport(activeStrokeBitmap, AndroidColor.TRANSPARENT)
         activeStrokeBitmap = dst
         val c = activeStrokeCanvas ?: AndroidCanvas(dst)
@@ -318,8 +340,8 @@ private class CanvasBitmapCache {
         if (hasCachedMatrix) {
             cachedProjToScreenMatrix.mapPoints(pts)
         }
-        val sx = (pts[0] * vpScale).roundToInt().coerceIn(0, vpW - 1)
-        val sy = (pts[1] * vpScale).roundToInt().coerceIn(0, vpH - 1)
+        val sx = (pts[0] * vpScale + vpMarginPx).roundToInt().coerceIn(0, vpW - 1)
+        val sy = (pts[1] * vpScale + vpMarginPx).roundToInt().coerceIn(0, vpH - 1)
         var argb = AndroidColor.WHITE
         belowLayersBitmap?.takeIf { !it.isRecycled && sx < it.width && sy < it.height }?.let { bmp ->
             argb = blendOver(argb, bmp.getPixel(sx, sy))
@@ -362,6 +384,9 @@ private class CanvasBitmapCache {
         stage3DLayerBitmaps.values.forEach { KodanimaBitmapPool.release(it) }
         stage3DLayerBitmaps.clear()
         stage3DLayerKeys.clear()
+        stage3DOffCanvasBitmaps.values.forEach { KodanimaBitmapPool.release(it) }
+        stage3DOffCanvasBitmaps.clear()
+        stage3DOffCanvasKeys.clear()
         stage3DObjectEntries.values.forEach { KodanimaBitmapPool.release(it.bitmap) }
         stage3DObjectEntries.clear()
         KodanimaBitmapPool.release(stage3DBgBitmap)
@@ -941,18 +966,27 @@ fun CanvasView(
     }
     val timelineLayers = currFrame?.layers ?: emptyList()
     val localLayers = currFrame?.localLayers ?: emptyList()
-    val combinedLayers = remember(timelineLayers, localLayers) { timelineLayers + localLayers }
+    val combinedLayers = remember(timelineLayers, localLayers) {
+        KodanimaGraphicsEngine.composeOrderedFrameLayers(timelineLayers, localLayers)
+    }
     val clampedTimelineLayerIdx = if (timelineLayers.isNotEmpty()) {
         activeLayerIndex.coerceIn(0, timelineLayers.lastIndex)
     } else 0
     val clampedLocalLayerIdx = if (localLayers.isNotEmpty()) {
         activeLocalLayerIndex.coerceIn(0, localLayers.lastIndex)
     } else 0
+    val belowLocalCount = remember(localLayers) { localLayers.count { it.placeBelowFrame } }
     val activeGlobalLayerIdx = if (combinedLayers.isNotEmpty()) {
         if (activeTargetIsFrameLocalLayer && localLayers.isNotEmpty()) {
-            (timelineLayers.size + clampedLocalLayerIdx).coerceIn(0, combinedLayers.lastIndex)
+            val targetLocal = localLayers[clampedLocalLayerIdx]
+            val localOrderedIdx = if (targetLocal.placeBelowFrame) {
+                localLayers.subList(0, clampedLocalLayerIdx).count { it.placeBelowFrame }
+            } else {
+                belowLocalCount + timelineLayers.size + localLayers.subList(0, clampedLocalLayerIdx).count { !it.placeBelowFrame }
+            }
+            localOrderedIdx.coerceIn(0, combinedLayers.lastIndex)
         } else {
-            clampedTimelineLayerIdx.coerceIn(0, combinedLayers.lastIndex)
+            (belowLocalCount + clampedTimelineLayerIdx).coerceIn(0, combinedLayers.lastIndex)
         }
     } else 0
     val activeLayerObj = combinedLayers.getOrNull(activeGlobalLayerIdx)
@@ -1014,30 +1048,65 @@ fun CanvasView(
             staleIds.forEach { staleId ->
                 KodanimaBitmapPool.release(cacheHolder.stage3DLayerBitmaps.remove(staleId))
                 cacheHolder.stage3DLayerKeys.remove(staleId)
+                KodanimaBitmapPool.release(cacheHolder.stage3DOffCanvasBitmaps.remove(staleId))
+                cacheHolder.stage3DOffCanvasKeys.remove(staleId)
             }
+
+            val projWf = project.resolution.width.toFloat()
+            val projHf = project.resolution.height.toFloat()
+            val offW = (cacheW * 2).coerceAtLeast(2)
+            val offH = (cacheH * 2).coerceAtLeast(2)
 
             for (layer in combinedLayers) {
                 val lKey = LayerSliceCacheKey(listOf(layer), cacheW, cacheH, densityMult)
                 val existing = cacheHolder.stage3DLayerBitmaps[layer.id]
-                if (existing != null && !existing.isRecycled && cacheHolder.stage3DLayerKeys[layer.id] == lKey) {
-                    continue
+                if (existing == null || existing.isRecycled || cacheHolder.stage3DLayerKeys[layer.id] != lKey) {
+                    val bmp = if (existing != null && !existing.isRecycled && existing.width == cacheW && existing.height == cacheH) {
+                        existing.also { it.eraseColor(AndroidColor.TRANSPARENT) }
+                    } else {
+                        KodanimaBitmapPool.release(existing)
+                        KodanimaBitmapPool.acquire(cacheW, cacheH, Bitmap.Config.ARGB_8888, AndroidColor.TRANSPARENT)
+                    }
+                    if (layer.isVisible && layer.opacity > 0f) {
+                        val c = AndroidCanvas(bmp)
+                        c.scale(cacheScale, cacheScale)
+                        KodanimaGraphicsEngine.drawLayerToCanvas(
+                            layer, c, project.resolution.width, project.resolution.height,
+                            1.0f, null, null, null, densityMult
+                        )
+                    }
+                    cacheHolder.stage3DLayerBitmaps[layer.id] = bmp
+                    cacheHolder.stage3DLayerKeys[layer.id] = lKey
                 }
-                val bmp = if (existing != null && !existing.isRecycled && existing.width == cacheW && existing.height == cacheH) {
-                    existing.also { it.eraseColor(AndroidColor.TRANSPARENT) }
+
+                // Detect off-canvas artwork beyond defined project resolution without expanding the main layer card
+                val hasOffCanvas = layer.isVisible && layer.opacity > 0f && layer.strokes.any { st ->
+                    st.points.isNotEmpty() && (st.minX < -2f || st.minY < -2f || st.maxX > projWf + 2f || st.maxY > projHf + 2f)
+                }
+                if (!hasOffCanvas) {
+                    cacheHolder.stage3DOffCanvasBitmaps.remove(layer.id)?.let { KodanimaBitmapPool.release(it) }
+                    cacheHolder.stage3DOffCanvasKeys.remove(layer.id)
                 } else {
-                    KodanimaBitmapPool.release(existing)
-                    KodanimaBitmapPool.acquire(cacheW, cacheH, Bitmap.Config.ARGB_8888, AndroidColor.TRANSPARENT)
+                    val offKey = LayerSliceCacheKey(listOf(layer), offW, offH, densityMult)
+                    val existingOff = cacheHolder.stage3DOffCanvasBitmaps[layer.id]
+                    if (existingOff == null || existingOff.isRecycled || cacheHolder.stage3DOffCanvasKeys[layer.id] != offKey) {
+                        val offBmp = if (existingOff != null && !existingOff.isRecycled && existingOff.width == offW && existingOff.height == offH) {
+                            existingOff.also { it.eraseColor(AndroidColor.TRANSPARENT) }
+                        } else {
+                            KodanimaBitmapPool.release(existingOff)
+                            KodanimaBitmapPool.acquire(offW, offH, Bitmap.Config.ARGB_8888, AndroidColor.TRANSPARENT)
+                        }
+                        val oc = AndroidCanvas(offBmp)
+                        oc.translate(cacheW * 0.5f, cacheH * 0.5f)
+                        oc.scale(cacheScale, cacheScale)
+                        KodanimaGraphicsEngine.drawLayerToCanvas(
+                            layer, oc, project.resolution.width, project.resolution.height,
+                            1.0f, null, null, null, densityMult, allowOutOfBounds = true
+                        )
+                        cacheHolder.stage3DOffCanvasBitmaps[layer.id] = offBmp
+                        cacheHolder.stage3DOffCanvasKeys[layer.id] = offKey
+                    }
                 }
-                if (layer.isVisible && layer.opacity > 0f) {
-                    val c = AndroidCanvas(bmp)
-                    c.scale(cacheScale, cacheScale)
-                    KodanimaGraphicsEngine.drawLayerToCanvas(
-                        layer, c, project.resolution.width, project.resolution.height,
-                        1.0f, null, null, null, densityMult
-                    )
-                }
-                cacheHolder.stage3DLayerBitmaps[layer.id] = bmp
-                cacheHolder.stage3DLayerKeys[layer.id] = lKey
             }
 
             // Live Camera POV preview bitmap when viewing through the 3D camera lens
@@ -1309,11 +1378,14 @@ fun CanvasView(
             Camera3DEngine.evaluateCameraAtTick(camSettings, effectiveTickFloat)
         }
 
-        // Screen-resolution off-canvas viewport sizing & settled transform tracking (zero OOM, unbounded drawing)
+        // Screen-resolution off-canvas viewport sizing with >= 4px overscan margin (zero edge clipping)
         val vpLongest = max(containerWidth, containerHeight).coerceAtLeast(1f)
         val vpScale = if (vpLongest > maxCacheDim) maxCacheDim.toFloat() / vpLongest else 1.0f
-        val vpCacheW = (containerWidth * vpScale).roundToInt().coerceAtLeast(1)
-        val vpCacheH = (containerHeight * vpScale).roundToInt().coerceAtLeast(1)
+        val vpDims = KodanimaGraphicsEngine.computeViewportCacheDimensions(containerWidth, containerHeight, vpScale)
+        val vpCacheW = vpDims.cacheWidth
+        val vpCacheH = vpDims.cacheHeight
+        val vpMarginPx = vpDims.marginPx
+        val overscanScreenPx = vpMarginPx / vpScale.coerceAtLeast(0.01f)
 
         var settledTransformSnap by remember {
             mutableStateOf(Triple(zoom, panX, panY) to rotation)
@@ -1321,16 +1393,17 @@ fun CanvasView(
         LaunchedEffect(isTransforming, zoom, panX, panY, rotation, boxW, boxH, mirrorHorizontal) {
             if (!isTransforming) {
                 if (cacheHolder.hasCachedMatrix) {
-                    kotlinx.coroutines.delay(45L)
+                    kotlinx.coroutines.delay(24L)
                 }
                 settledTransformSnap = Triple(zoom, panX, panY) to rotation
             }
         }
 
-        // Rebuild full-viewport screen-resolution layer & onion caches culled to visible screen bounds
+        // Rebuild full-viewport screen-resolution layer & onion caches culled with overscan margin
         LaunchedEffect(
             vpCacheW,
             vpCacheH,
+            vpMarginPx,
             vpScale,
             settledTransformSnap,
             boxW,
@@ -1350,7 +1423,7 @@ fun CanvasView(
             activeSelection.outsideReplacementStrokes
         ) {
             if (containerWidth <= 2f || containerHeight <= 2f) return@LaunchedEffect
-            cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale)
+            cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale, vpMarginPx)
 
             val (snapZ, snapPx, snapPy) = settledTransformSnap.first
             val snapRot = settledTransformSnap.second
@@ -1362,26 +1435,16 @@ fun CanvasView(
                 postRotate(snapRot)
                 postTranslate(halfContainerW + snapPx, halfContainerH + snapPy)
             }
-            val invSnap = AndroidMatrix()
-            val visibleProjBounds = if (snapProjToScreen.invert(invSnap)) {
-                val corners = floatArrayOf(
-                    0f, 0f,
-                    containerWidth, 0f,
-                    containerWidth, containerHeight,
-                    0f, containerHeight
-                )
-                invSnap.mapPoints(corners)
-                val pad = (140f / safeZ).coerceIn(64f, 600f)
-                val minX = min(min(corners[0], corners[2]), min(corners[4], corners[6])) - pad
-                val maxX = max(max(corners[0], corners[2]), max(corners[4], corners[6])) + pad
-                val minY = min(min(corners[1], corners[3]), min(corners[5], corners[7])) - pad
-                val maxY = max(max(corners[1], corners[3]), max(corners[5], corners[7])) + pad
-                RectF(minX, minY, maxX, maxY)
-            } else {
-                null
-            }
+            val visibleProjBounds = KodanimaGraphicsEngine.computeOverscannedVisibleProjectBounds(
+                projToScreenMatrix = snapProjToScreen,
+                containerWidth = containerWidth,
+                containerHeight = containerHeight,
+                screenOverscanPx = overscanScreenPx,
+                zoom = safeZ
+            )
             val vpMat = AndroidMatrix(snapProjToScreen).apply {
                 postScale(vpScale, vpScale)
+                postTranslate(vpMarginPx.toFloat(), vpMarginPx.toFloat())
             }
             val matValues = FloatArray(9).also { snapProjToScreen.getValues(it) }.toList()
             cacheHolder.cachedProjToScreenMatrix.set(snapProjToScreen)
@@ -1612,6 +1675,7 @@ fun CanvasView(
             camSettings.isEnabled,
             camSettings.scene3DObjects,
             camSettings.autoInterpolate,
+            camSettings.shadingMode,
             evaluatedCameraKf,
             currentTimelineTick,
             effectiveTickFloat,
@@ -1650,7 +1714,7 @@ fun CanvasView(
             val focal3D = max(boxW, boxH) * zoom * resScale * 0.85f * fovScale
             val animTimeSec = effectiveTickFloat / max(1, project.fps).toFloat()
             val offKey = listOf(
-                rW, rH, camSettings.scene3DObjects, currentTimelineTick,
+                rW, rH, camSettings.scene3DObjects, camSettings.shadingMode, currentTimelineTick,
                 camSettings.autoInterpolate, camYaw3D, camPitch3D, camRoll3D,
                 camPanX3D, camPanY3D, focal3D, vpCx3D, vpCy3D, worldUnitScale,
                 (effectiveTickFloat * 20f).roundToInt()
@@ -1674,7 +1738,8 @@ fun CanvasView(
                         worldUnitScale = worldUnitScale,
                         tickFloat = effectiveTickFloat,
                         animTimeSec = animTimeSec,
-                        reuseBitmap = cacheHolder.offCanvas3DBitmap
+                        reuseBitmap = cacheHolder.offCanvas3DBitmap,
+                        shadingMode = camSettings.shadingMode
                     )
                     res?.first
                 }
@@ -1692,6 +1757,7 @@ fun CanvasView(
             stage3DMode,
             camSettings.scene3DObjects,
             camSettings.autoInterpolate,
+            camSettings.shadingMode,
             evaluatedCameraKf,
             currentTimelineTick,
             effectiveTickFloat,
@@ -1737,7 +1803,7 @@ fun CanvasView(
 
             for (obj in visible3DObjs) {
                 val objKey = listOf(
-                    obj, currentTimelineTick, camSettings.autoInterpolate,
+                    obj, camSettings.shadingMode, currentTimelineTick, camSettings.autoInterpolate,
                     rW, rH, view3DYaw, view3DPitch, focal, vpCx, vpCy, stageProjScale,
                     selectedId == obj.id, tickBucket
                 )
@@ -1764,7 +1830,8 @@ fun CanvasView(
                         selectedObjectId = if (selectedId == obj.id) obj.id else null,
                         tickFloat = effectiveTickFloat,
                         animTimeSec = animTimeSec,
-                        reuseBitmap = existing?.bitmap
+                        reuseBitmap = existing?.bitmap,
+                        shadingMode = camSettings.shadingMode
                     )
                 }
                 if (rendered != null) {
@@ -1940,6 +2007,7 @@ fun CanvasView(
             if (currentPoints.isEmpty()) return
             val sessionVpMat = AndroidMatrix(cacheHolder.activeSessionMatrix).apply {
                 postScale(cacheHolder.activeSessionVpScale, cacheHolder.activeSessionVpScale)
+                postTranslate(cacheHolder.activeSessionMarginPx.toFloat(), cacheHolder.activeSessionMarginPx.toFloat())
             }
             if (selectedTool == ToolType.ERASER) {
                 val eCanvas = cacheHolder.eraserWorkCanvas ?: return
@@ -2619,18 +2687,20 @@ fun CanvasView(
                                 }
 
                                 syncProjectionMatrices()
-                                cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale)
+                                cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale, vpMarginPx)
                                 if (curSelectedTool == ToolType.ERASER) {
                                     cacheHolder.beginEraserSession(
                                         sessionMatrix = projToScreenMatrix,
                                         sessionVpScale = vpScale,
+                                        sessionMarginPx = vpMarginPx,
                                         activeSelection = curActiveSel,
                                         densityMult = densityMult
                                     )
                                 } else {
                                     cacheHolder.beginActiveStrokeSession(
                                         sessionMatrix = projToScreenMatrix,
-                                        sessionVpScale = vpScale
+                                        sessionVpScale = vpScale,
+                                        sessionMarginPx = vpMarginPx
                                     )
                                 }
 
@@ -3057,7 +3127,7 @@ fun CanvasView(
                                         )
                                         val canCommitLocally = curActiveLayer?.isLocked != true && curActiveLayer?.isVisible != false
                                         if (canCommitLocally) {
-                                            cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale)
+                                            cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale, vpMarginPx)
                                             val targetBmp = cacheHolder.activeLayerBitmap?.takeIf { !it.isRecycled }
                                                 ?: cacheHolder.acquireOrReuseViewport(null, AndroidColor.TRANSPARENT).also {
                                                     cacheHolder.activeLayerBitmap = it
@@ -3079,6 +3149,7 @@ fun CanvasView(
                                                     }
                                                 }
                                                 commitMat.postScale(cacheHolder.vpScale, cacheHolder.vpScale)
+                                                commitMat.postTranslate(cacheHolder.vpMarginPx.toFloat(), cacheHolder.vpMarginPx.toFloat())
                                                 commitCanvas.save()
                                                 commitCanvas.concat(commitMat)
                                                 KodanimaGraphicsEngine.drawStrokeToCanvas(
@@ -3222,6 +3293,7 @@ fun CanvasView(
                             bgBitmap = cacheHolder.stage3DBgBitmap,
                             layers = combinedLayers,
                             layerBitmaps = cacheHolder.stage3DLayerBitmaps,
+                            offCanvasLayerBitmaps = cacheHolder.stage3DOffCanvasBitmaps,
                             objectEntries = cacheHolder.stage3DObjectEntries,
                             view3DYaw = view3DYaw,
                             view3DPitch = view3DPitch,
@@ -3401,8 +3473,15 @@ fun CanvasView(
                     overlayScratch.bitmapPaint.isFilterBitmap = screenPxPerProjPx < 4.0f
                     val drawVpW = cacheHolder.vpW.coerceAtLeast(1)
                     val drawVpH = cacheHolder.vpH.coerceAtLeast(1)
+                    val invVpScale = 1f / cacheHolder.vpScale.coerceAtLeast(0.01f)
+                    val marginScreen = cacheHolder.vpMarginPx * invVpScale
                     overlayScratch.srcRect.set(0, 0, drawVpW, drawVpH)
-                    overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
+                    overlayScratch.dstRectF.set(
+                        -marginScreen,
+                        -marginScreen,
+                        drawVpW * invVpScale - marginScreen,
+                        drawVpH * invVpScale - marginScreen
+                    )
 
                     val isBgTransparent = project.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE
                     val show3DBg = project.canvasBackground.show3DInCanvas
@@ -3495,7 +3574,7 @@ fun CanvasView(
                         } else if (clipBaseBmp != null) {
                             overlayScratch.layerBlendPaint.alpha = 255
                             KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
-                            val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
+                            val sc = nativeCanvas.saveLayer(overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
                             nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
                             nativeCanvas.restore()
                             nativeCanvas.save()
@@ -3541,7 +3620,7 @@ fun CanvasView(
                                 if (maskBmp != null && !maskBmp.isRecycled) {
                                     overlayScratch.layerBlendPaint.alpha = 255
                                     KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, advLayer.blendEffect)
-                                    val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
+                                    val sc = nativeCanvas.saveLayer(overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
                                     overlayScratch.srcRect.set(0, 0, adv.bitmap.width, adv.bitmap.height)
                                     nativeCanvas.drawBitmap(adv.bitmap, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
                                     overlayScratch.srcRect.set(0, 0, maskBmp.width, maskBmp.height)
@@ -3629,7 +3708,14 @@ fun CanvasView(
 
                             overlayScratch.bitmapPaint.isFilterBitmap = (canvasScaleX * safeZ) < 4.0f
                             overlayScratch.srcRect.set(0, 0, activeStrokeBmp.width, activeStrokeBmp.height)
-                            overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
+                            val invSessVp = 1f / cacheHolder.activeSessionVpScale.coerceAtLeast(0.01f)
+                            val sessMarginScreen = cacheHolder.activeSessionMarginPx * invSessVp
+                            overlayScratch.dstRectF.set(
+                                -sessMarginScreen,
+                                -sessMarginScreen,
+                                activeStrokeBmp.width * invSessVp - sessMarginScreen,
+                                activeStrokeBmp.height * invSessVp - sessMarginScreen
+                            )
                             if (activeIsClip && activeClipMaskBmp != null) {
                                 val invCached = AndroidMatrix()
                                 val hasCachedDelta = cacheHolder.hasCachedMatrix && cacheHolder.cachedProjToScreenMatrix.invert(invCached)
@@ -3643,7 +3729,15 @@ fun CanvasView(
                                     val cDelta = AndroidMatrix().apply { setConcat(liveMat, invCached) }
                                     nativeCanvas.concat(cDelta)
                                 }
+                                val invVpScaleMask = 1f / cacheHolder.vpScale.coerceAtLeast(0.01f)
+                                val marginScreenMask = cacheHolder.vpMarginPx * invVpScaleMask
                                 overlayScratch.srcRect.set(0, 0, activeClipMaskBmp.width, activeClipMaskBmp.height)
+                                overlayScratch.dstRectF.set(
+                                    -marginScreenMask,
+                                    -marginScreenMask,
+                                    activeClipMaskBmp.width * invVpScaleMask - marginScreenMask,
+                                    activeClipMaskBmp.height * invVpScaleMask - marginScreenMask
+                                )
                                 nativeCanvas.drawBitmap(activeClipMaskBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
                                 nativeCanvas.restore()
                                 nativeCanvas.restoreToCount(sc)
@@ -3680,8 +3774,15 @@ fun CanvasView(
                                     overlayScratch.deltaMatrixScratch.setConcat(liveMat, invCached)
                                     nativeCanvas.concat(overlayScratch.deltaMatrixScratch)
                                 }
+                                val invVpScaleMask = 1f / cacheHolder.vpScale.coerceAtLeast(0.01f)
+                                val marginScreenMask = cacheHolder.vpMarginPx * invVpScaleMask
                                 overlayScratch.srcRect.set(0, 0, activeClipMaskBmp.width, activeClipMaskBmp.height)
-                                overlayScratch.dstRectF.set(0f, 0f, size.width, size.height)
+                                overlayScratch.dstRectF.set(
+                                    -marginScreenMask,
+                                    -marginScreenMask,
+                                    activeClipMaskBmp.width * invVpScaleMask - marginScreenMask,
+                                    activeClipMaskBmp.height * invVpScaleMask - marginScreenMask
+                                )
                                 nativeCanvas.drawBitmap(activeClipMaskBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
                                 nativeCanvas.restore()
                                 nativeCanvas.restoreToCount(sc)
@@ -4840,10 +4941,10 @@ private fun drawCameraAndPostEffectsOverlay(
         val baseFrameW: Float
         val baseFrameH: Float
         if (canvasW / canvasH > camAsp) {
-            baseFrameH = canvasH * 0.88f
+            baseFrameH = canvasH * 1.0f
             baseFrameW = baseFrameH * camAsp
         } else {
-            baseFrameW = canvasW * 0.88f
+            baseFrameW = canvasW * 1.0f
             baseFrameH = baseFrameW / camAsp
         }
         val frameW = baseFrameW / evaluatedKf.zoom.coerceIn(0.25f, 6.0f)
@@ -5028,6 +5129,7 @@ private fun drawInteractive3DStageViewport(
     bgBitmap: Bitmap?,
     layers: List<Layer>,
     layerBitmaps: Map<String, Bitmap>,
+    offCanvasLayerBitmaps: Map<String, Bitmap>,
     objectEntries: Map<String, CanvasBitmapCache.Stage3DObjectCacheEntry>,
     view3DYaw: Float,
     view3DPitch: Float,
@@ -5067,32 +5169,34 @@ private fun drawInteractive3DStageViewport(
     val vpCx = canvasW * 0.5f + view3DPanX
     val vpCy = canvasH * 0.50f + view3DPanY
 
-    // 2. Studio Floor 3D Perspective XZ Grid
+    // 2. Studio Floor 3D Perspective XZ Grid (optional visibility so final renders/previews stay clean)
     val floorY = min(canvasW, canvasH) * 0.25f * view3DZoom
-    val gridHalf = min(canvasW, canvasH) * 0.62f * view3DZoom
-    val gridPaint = scratch.stageGridPaint
-    val gridSteps = 10
-    for (i in -gridSteps..gridSteps) {
-        val t = i.toFloat() / gridSteps.toFloat()
-        val pos = t * gridHalf
-        val edgeFade = (1f - abs(t) * 0.65f).coerceIn(0.25f, 1f)
-        val minorAlpha = (42f * edgeFade).roundToInt()
+    if (camSettings.showFloorGrid) {
+        val gridHalf = min(canvasW, canvasH) * 0.62f * view3DZoom
+        val gridPaint = scratch.stageGridPaint
+        val gridSteps = 10
+        for (i in -gridSteps..gridSteps) {
+            val t = i.toFloat() / gridSteps.toFloat()
+            val pos = t * gridHalf
+            val edgeFade = (1f - abs(t) * 0.65f).coerceIn(0.25f, 1f)
+            val minorAlpha = (42f * edgeFade).roundToInt()
 
-        gridPaint.color = if (i == 0) AndroidColor.argb(190, 229, 77, 72) else AndroidColor.argb(minorAlpha, 210, 218, 232)
-        gridPaint.strokeWidth = if (i == 0) 1.6f * screenDensity else 0.9f * screenDensity
-        val a1 = projectPoint3D(-gridHalf, floorY, pos, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        val b1 = projectPoint3D(gridHalf, floorY, pos, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        nativeCanvas.drawLine(a1.x, a1.y, b1.x, b1.y, gridPaint)
+            gridPaint.color = if (i == 0) AndroidColor.argb(190, 229, 77, 72) else AndroidColor.argb(minorAlpha, 210, 218, 232)
+            gridPaint.strokeWidth = if (i == 0) 1.6f * screenDensity else 0.9f * screenDensity
+            val a1 = projectPoint3D(-gridHalf, floorY, pos, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+            val b1 = projectPoint3D(gridHalf, floorY, pos, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+            nativeCanvas.drawLine(a1.x, a1.y, b1.x, b1.y, gridPaint)
 
-        gridPaint.color = if (i == 0) AndroidColor.argb(190, 86, 189, 98) else AndroidColor.argb(minorAlpha, 210, 218, 232)
-        gridPaint.strokeWidth = if (i == 0) 1.6f * screenDensity else 0.9f * screenDensity
-        val a2 = projectPoint3D(pos, floorY, -gridHalf, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        val b2 = projectPoint3D(pos, floorY, gridHalf, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-        nativeCanvas.drawLine(a2.x, a2.y, b2.x, b2.y, gridPaint)
+            gridPaint.color = if (i == 0) AndroidColor.argb(190, 86, 189, 98) else AndroidColor.argb(minorAlpha, 210, 218, 232)
+            gridPaint.strokeWidth = if (i == 0) 1.6f * screenDensity else 0.9f * screenDensity
+            val a2 = projectPoint3D(pos, floorY, -gridHalf, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+            val b2 = projectPoint3D(pos, floorY, gridHalf, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+            nativeCanvas.drawLine(a2.x, a2.y, b2.x, b2.y, gridPaint)
+        }
+        val originPt = projectPoint3D(0f, floorY, 0f, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+        scratch.stageOriginPaint.strokeWidth = 1.4f * screenDensity
+        nativeCanvas.drawCircle(originPt.x, originPt.y, 4.5f * screenDensity, scratch.stageOriginPaint)
     }
-    val originPt = projectPoint3D(0f, floorY, 0f, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
-    scratch.stageOriginPaint.strokeWidth = 1.4f * screenDensity
-    nativeCanvas.drawCircle(originPt.x, originPt.y, 4.5f * screenDensity, scratch.stageOriginPaint)
 
     // 3. Collect Background Plane (+Z) + Transparent Layer Planes (unified projection scale)
     val cardW = min(canvasW, canvasH) * 0.28f * view3DZoom
@@ -5144,6 +5248,25 @@ private fun drawInteractive3DStageViewport(
             max(max(pTL.y, pTR.y), max(pBR.y, pBL.y))
         )
         val showLabel = isSel || idx == layers.lastIndex || layers.size <= 3
+        val offBmp = offCanvasLayerBitmaps[layer.id]
+        if (offBmp != null && !offBmp.isRecycled) {
+            val ow = lw * 2f
+            val oh = lh * 2f
+            val oTL = projectPoint3D(lOffX - ow, lOffY - oh, wz + 0.8f, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+            val oTR = projectPoint3D(lOffX + ow, lOffY - oh, wz + 0.8f, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+            val oBR = projectPoint3D(lOffX + ow, lOffY + oh, wz + 0.8f, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+            val oBL = projectPoint3D(lOffX - ow, lOffY + oh, wz + 0.8f, cosY, sinY, cosP, sinP, focal, vpCx, vpCy)
+            planes.add(
+                Stage3DPlaneItem(
+                    zOrder = centerZ + 0.6f,
+                    label = "Fora do Canvas (${layer.name})",
+                    bitmap = offBmp,
+                    opacity = (layer.opacity * lTf.opacity * 0.92f).coerceIn(0f, 1f),
+                    isBackground = true,
+                    pTL = oTL, pTR = oTR, pBR = oBR, pBL = oBL
+                )
+            )
+        }
         planes.add(
             Stage3DPlaneItem(
                 zOrder = centerZ,
@@ -5383,8 +5506,6 @@ private fun drawInteractive3DStageViewport(
             layerBmpPaint.alpha = 255
             nativeCanvas.drawBitmap(bmp, scratch.srcRect, scratch.dstRectF, layerBmpPaint)
             if (stageSelection.type == StageTargetType.OBJECT_3D && stageSelection.id == obj.id) {
-                scratch.stageSelObjStrokePaint.strokeWidth = 2.0f * screenDensity
-                nativeCanvas.drawRect(b.minX, b.minY, b.maxX, b.maxY, scratch.stageSelObjStrokePaint)
                 nativeCanvas.drawText("★ ${obj.name}", b.minX, b.minY - 5f * screenDensity, labelPaint)
             }
         })

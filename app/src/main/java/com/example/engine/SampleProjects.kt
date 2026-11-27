@@ -1,6 +1,7 @@
 package com.example.engine
 
 import com.example.model.AnimationProject
+import com.example.model.Camera3DSettings
 import com.example.model.DrawingStroke
 import com.example.model.Frame
 import com.example.model.Layer
@@ -156,7 +157,11 @@ object SampleProjects {
             resolution = resolution,
             fps = fps,
             frames = listOf(Frame(layers = listOf(Layer(name = "Camada 1")))),
-            onionSkin = OnionSkinSettings(isEnabled = true)
+            onionSkin = OnionSkinSettings(isEnabled = true),
+            camera3D = Camera3DSettings(
+                captureWidth = resolution.width,
+                captureHeight = resolution.height
+            )
         )
     }
 }
