@@ -90,19 +90,14 @@ object TimelineTrackEngine {
     }
 
     fun evaluateSymbolEasing(rawT: Float, kf: SymbolInstanceKeyframe): Float {
-        val u = rawT.coerceIn(0f, 1f)
-        return when (kf.easing) {
-            CameraEasingCurve.LINEAR -> u
-            CameraEasingCurve.BEZIER_SUAVE -> {
-                val p1y = kf.bezierP1Y.coerceIn(0f, 1.5f)
-                val p2y = kf.bezierP2Y.coerceIn(-0.5f, 1f)
-                val inv = 1f - u
-                (3f * inv * inv * u * p1y + 3f * inv * u * u * p2y + u * u * u).coerceIn(-0.2f, 1.2f)
-            }
-            CameraEasingCurve.ACELERAR -> u * u * u
-            CameraEasingCurve.DESACELERAR -> 1f - (1f - u).pow(3)
-            CameraEasingCurve.DEGRAU -> 0f
-        }
+        return Camera3DEngine.applyEasing(
+            t = rawT,
+            curve = kf.easing,
+            p1x = kf.bezierP1X,
+            p1y = kf.bezierP1Y,
+            p2x = kf.bezierP2X,
+            p2y = kf.bezierP2Y
+        )
     }
 
     /**
@@ -165,17 +160,17 @@ object TimelineTrackEngine {
         instance: TimelineSymbolInstance,
         timelineTickFloat: Float
     ): Frame? {
-        if (symbol.frames.isEmpty()) return null
+        if (symbol.internalFrames.isEmpty()) return null
         val localTick = (timelineTickFloat - instance.startTick).toInt().coerceAtLeast(0)
-        val symTotalTicks = symbol.frames.sumOf { max(1, it.holdFrames) }.coerceAtLeast(1)
-        val wrappedTick = if (instance.loopPlayback) localTick % symTotalTicks else localTick.coerceAtMost(symTotalTicks - 1)
+        val symTotalTicks = symbol.internalFrames.sumOf { max(1, it.holdFrames) }.coerceAtLeast(1)
+        val wrappedTick = if (symbol.loopInternalAnimation) localTick % symTotalTicks else localTick.coerceAtMost(symTotalTicks - 1)
         var cursor = 0
-        for (f in symbol.frames) {
+        for (f in symbol.internalFrames) {
             val dur = max(1, f.holdFrames)
             if (wrappedTick < cursor + dur) return f
             cursor += dur
         }
-        return symbol.frames.last()
+        return symbol.internalFrames.last()
     }
 
     fun resolveCelAtTick(project: AnimationProject, layerIndex: Int, tick: Int): LayerCelSpan? {

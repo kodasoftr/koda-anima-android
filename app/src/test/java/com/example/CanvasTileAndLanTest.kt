@@ -30,9 +30,11 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class CanvasTileAndLanTest {
 
     private fun countNonTransparentPixels(bmp: Bitmap): Int {
@@ -333,5 +335,196 @@ class CanvasTileAndLanTest {
         } finally {
             scope.cancel()
         }
+    }
+
+    @Test
+    fun zeroFlicker_perTileFallbackAndCopyOnWriteStamping() {
+        val engine = CanvasTileEngine()
+        val mat = Matrix() // identity 1:1
+        val plan = engine.computeTilePlan(
+            projToScreenMatrix = mat,
+            containerWidth = 512f,
+            containerHeight = 256f,
+            screenPxPerProjPx = 1f,
+            nowMs = 3000L
+        )!!
+
+        val stroke1 = DrawingStroke(
+            id = "s1",
+            tool = ToolType.PEN,
+            color = Color.RED.toLong() and 0xFFFFFFFFL,
+            brushSize = 20f,
+            points = listOf(StrokePoint(60f, 128f), StrokePoint(180f, 128f))
+        )
+        val stroke2 = DrawingStroke(
+            id = "s2",
+            tool = ToolType.PEN,
+            color = Color.BLUE.toLong() and 0xFFFFFFFFL,
+            brushSize = 20f,
+            points = listOf(StrokePoint(320f, 128f), StrokePoint(440f, 128f))
+        )
+
+        // Materialize stroke1 in tile (0,0) under prevHash = 100
+        engine.stampStrokeIntoCachedTiles(
+            sliceTag = "active",
+            contentHash = 100,
+            stroke = stroke1,
+            densityMult = 1f,
+            layers = listOf(Layer(id = "l1", strokes = listOf(stroke1))),
+            projWidth = 512,
+            projHeight = 256,
+            activePlan = plan
+        )
+        val prevTile0 = engine.tileCache.get(TileKey("active", 100, plan.lodLevel, 0, 0))
+        assertNotNull("Tile (0,0) must be materialized synchronously for stroke1", prevTile0)
+        val prevTile0BmpRef = prevTile0!!.bitmap
+
+        // Materialize stroke2 in tile (1,0) under prevHash = 100 and confirm copy-on-write on overlap
+        engine.stampStrokeIntoCachedTiles(
+            sliceTag = "active",
+            contentHash = 100,
+            stroke = stroke2,
+            densityMult = 1f,
+            layers = listOf(Layer(id = "l1", strokes = listOf(stroke1, stroke2))),
+            projWidth = 512,
+            projHeight = 256,
+            activePlan = plan
+        )
+        val prevTile1 = engine.tileCache.get(TileKey("active", 100, plan.lodLevel, 1, 0))
+        assertNotNull("Previously empty tile (1,0) must be materialized synchronously for stroke2", prevTile1)
+
+        // Now simulate background worker having built ONLY tile (1,0) for newHash = 200 while tile (0,0) is still pending
+        val slice200 = TileSliceSpec.LayersSlice(
+            sliceTag = "active",
+            contentHash = 200,
+            layers = listOf(Layer(id = "l1", strokes = listOf(stroke1, stroke2))),
+            projWidth = 512,
+            projHeight = 256,
+            densityMult = 1f
+        )
+        val builtTile1 = engine.renderTile(slice200, TileKey("active", 200, plan.lodLevel, 1, 0), plan.lodScale)
+        engine.tileCache.put(builtTile1)
+
+        // Draw frame: tile (1,0) comes from hash=200 AND tile (0,0) falls back per-tile to hash=100 (NO disappearing!)
+        val outBmp = Bitmap.createBitmap(512, 256, Bitmap.Config.ARGB_8888)
+        val outCanvas = Canvas(outBmp)
+        engine.drawSliceTiles(
+            canvas = outCanvas,
+            liveProjToScreen = mat,
+            plan = plan,
+            sliceTag = "active",
+            contentHash = 200,
+            fallbackContentHash = 100,
+            useRenderNode = false
+        )
+        // Left side (tile 0,0) still has stroke1 pixels & right side (tile 1,0) has stroke2 pixels!
+        assertTrue("Left tile stroke must NOT vanish during partial hash rebuild", Color.alpha(outBmp.getPixel(120, 128)) > 0)
+        assertTrue("Right tile stroke must render from new hash", Color.alpha(outBmp.getPixel(380, 128)) > 0)
+        outBmp.recycle()
+
+        // Verify copy-on-write replaced old bitmap when re-stamping tile (0,0)
+        val stroke1Overlap = DrawingStroke(
+            id = "s1b",
+            tool = ToolType.PEN,
+            color = Color.GREEN.toLong() and 0xFFFFFFFFL,
+            brushSize = 14f,
+            points = listOf(StrokePoint(80f, 100f), StrokePoint(140f, 160f))
+        )
+        engine.stampStrokeIntoCachedTiles("active", 100, stroke1Overlap, 1f)
+        val cowTile0 = engine.tileCache.get(TileKey("active", 100, plan.lodLevel, 0, 0))!!
+        assertTrue("Copy-on-write must allocate a new Bitmap rather than mutating old RenderThread bitmap", cowTile0.bitmap !== prevTile0BmpRef)
+
+        engine.tileCache.drainQuarantineOnUiThread(forceAll = true)
+        engine.releaseAll()
+    }
+
+    @Test
+    fun rapidConsecutiveStrokes_chainedFallbackHashesPreventFlickerAndNativeGlFallbacksCleanly() {
+        val engine = CanvasTileEngine()
+        val mat = Matrix()
+        val plan = engine.computeTilePlan(
+            projToScreenMatrix = mat,
+            containerWidth = 512f,
+            containerHeight = 256f,
+            screenPxPerProjPx = 1f,
+            nowMs = 4000L
+        )!!
+
+        val strokeA = DrawingStroke(
+            id = "sa",
+            tool = ToolType.PEN,
+            color = Color.RED.toLong() and 0xFFFFFFFFL,
+            brushSize = 20f,
+            points = listOf(StrokePoint(60f, 128f), StrokePoint(180f, 128f))
+        )
+        // Stamp strokeA into tile (0,0) under hash=10
+        engine.stampStrokeIntoCachedTiles(
+            sliceTag = "active",
+            contentHash = 10,
+            stroke = strokeA,
+            densityMult = 1f,
+            layers = listOf(Layer(id = "l1", strokes = listOf(strokeA))),
+            projWidth = 512,
+            projHeight = 256,
+            activePlan = plan
+        )
+        // Rapidly start strokeB on tile (1,0) under hash=20 before hash=20 background worker finishes tile (0,0)
+        val strokeB = DrawingStroke(
+            id = "sb",
+            tool = ToolType.PEN,
+            color = Color.GREEN.toLong() and 0xFFFFFFFFL,
+            brushSize = 20f,
+            points = listOf(StrokePoint(340f, 128f), StrokePoint(420f, 128f))
+        )
+        engine.stampStrokeIntoCachedTiles(
+            sliceTag = "active",
+            contentHash = 20,
+            stroke = strokeB,
+            densityMult = 1f,
+            layers = listOf(Layer(id = "l1", strokes = listOf(strokeA, strokeB))),
+            projWidth = 512,
+            projHeight = 256,
+            activePlan = plan
+        )
+
+        // Now activeSpec is at hash=30 while neither tile (0,0) nor (1,0) for hash=30 is built yet.
+        // Chained fallback [20, 10] must preserve BOTH tile (0,0) from hash=10 and tile (1,0) from hash=20!
+        val outBmp = Bitmap.createBitmap(512, 256, Bitmap.Config.ARGB_8888)
+        val outCanvas = Canvas(outBmp)
+        engine.drawSliceTiles(
+            canvas = outCanvas,
+            liveProjToScreen = mat,
+            plan = plan,
+            sliceTag = "active",
+            contentHash = 30,
+            fallbackContentHashes = listOf(20, 10),
+            useRenderNode = false
+        )
+        assertTrue("Tile (0,0) must stay visible from chained fallback hash=10", Color.alpha(outBmp.getPixel(120, 128)) > 0)
+        assertTrue("Tile (1,0) must stay visible from chained fallback hash=20", Color.alpha(outBmp.getPixel(380, 128)) > 0)
+        outBmp.recycle()
+
+        // Verify NativeGL3DEngine probes safely without crashing on JVM and Camera3DEngine renders via fallback
+        assertFalse(com.example.engine.NativeGL3DEngine.isHardwareAvailable())
+        val (cubeUri, _) = com.example.engine.Mesh3DImporter.createBuiltInSceneAsset(com.example.engine.BuiltIn3DPrimitive.CUBE)
+        val res = com.example.engine.Camera3DEngine.renderSceneObjectsSoftware3D(
+            outW = 96,
+            outH = 96,
+            sceneObjects = listOf(com.example.model.SceneObject3D(id = "c1", meshAssetPath = cubeUri)),
+            frameIndex = 0,
+            autoInterpolate = false,
+            camYawDeg = 20f,
+            camPitchDeg = 15f,
+            camRollDeg = 0f,
+            camPanX = 0f,
+            camPanY = 0f,
+            focalPx = 240f,
+            vpCx = 48f,
+            vpCy = 48f
+        )
+        assertNotNull("Camera3DEngine must render cleanly via CPU fallback when EGL is unavailable", res)
+        res!!.first.recycle()
+
+        engine.releaseAll()
     }
 }

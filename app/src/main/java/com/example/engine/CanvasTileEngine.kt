@@ -15,6 +15,7 @@ import androidx.annotation.RequiresApi
 import com.example.model.DrawingStroke
 import com.example.model.Layer
 import com.example.model.OnionSkinSettings
+import com.example.model.ToolType
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -76,17 +77,19 @@ data class TilePlan(
 
 @RequiresApi(Build.VERSION_CODES.Q)
 private object RenderNodeTileHelper {
+    private val nodePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+
     fun buildOrGet(existingNode: Any?, bitmap: Bitmap, tileSizePx: Int): Any? {
         if (bitmap.isRecycled) return null
         val node = (existingNode as? RenderNode) ?: RenderNode("KodanimaTile").also {
             it.setPosition(0, 0, tileSizePx, tileSizePx)
-            it.setClipToBounds(true)
+            it.setClipToBounds(false)
         }
         if (!node.hasDisplayList()) {
             node.setPosition(0, 0, tileSizePx, tileSizePx)
             val rc = node.beginRecording(tileSizePx, tileSizePx)
             try {
-                rc.drawBitmap(bitmap, 0f, 0f, null)
+                rc.drawBitmap(bitmap, 0f, 0f, nodePaint)
             } finally {
                 node.endRecording()
             }
@@ -244,10 +247,12 @@ class PredictiveViewportTracker {
  */
 class CanvasTileCache(
     val maxBudgetBytes: Int = defaultBudgetBytes(),
-    val maxRenderNodes: Int = 192
+    val maxRenderNodes: Int = 256
 ) {
     private val map = LinkedHashMap<TileKey, CachedTile>(256, 0.75f, true)
     private val emptyTileKeys = LinkedHashMap<TileKey, Boolean>(512, 0.75f, true)
+    private val quarantinedTiles = ArrayDeque<Pair<Long, CachedTile>>()
+    private val quarantinedNodes = ArrayDeque<Pair<Long, Any>>()
     private var currentBytes: Int = 0
     private var currentRenderNodes: Int = 0
 
@@ -275,6 +280,15 @@ class CanvasTileCache(
         val iter = emptyTileKeys.keys.iterator()
         while (iter.hasNext()) {
             if (iter.next().sliceTag == sliceTag) iter.remove()
+        }
+    }
+
+    @Synchronized
+    fun clearEmptyForSliceHash(sliceTag: String, contentHash: Int) {
+        val iter = emptyTileKeys.keys.iterator()
+        while (iter.hasNext()) {
+            val k = iter.next()
+            if (k.sliceTag == sliceTag && k.contentHash == contentHash) iter.remove()
         }
     }
 
@@ -314,11 +328,10 @@ class CanvasTileCache(
 
     @Synchronized
     fun invalidateSliceRenderNodes(sliceTag: String, contentHash: Int) {
+        val now = safeUptimeMs()
         for ((k, v) in map) {
             if (k.sliceTag == sliceTag && k.contentHash == contentHash && v.renderNode != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    RenderNodeTileHelper.invalidate(v.renderNode)
-                }
+                quarantinedNodes.addLast(now to v.renderNode!!)
                 v.renderNode = null
                 currentRenderNodes = (currentRenderNodes - 1).coerceAtLeast(0)
             }
@@ -399,6 +412,76 @@ class CanvasTileCache(
         return candidates
     }
 
+    /**
+     * Finds fallback tiles for a SINGLE missing tile rectangle at the single closest LOD level
+     * (first checking [contentHash], then [fallbackContentHash]), avoiding double-alpha overlap.
+     */
+    @Synchronized
+    fun findFallbackTilesForSingleLod(
+        sliceTag: String,
+        contentHash: Int,
+        fallbackContentHash: Int?,
+        tileProjRect: RectF,
+        targetLodLevel: Int,
+        fallbackContentHashes: List<Int> = emptyList()
+    ): List<CachedTile> {
+        fun collectForHash(hash: Int): List<CachedTile> {
+            var bestLod = Int.MIN_VALUE
+            var bestDist = Int.MAX_VALUE
+            val matches = ArrayList<CachedTile>(4)
+            for ((k, tile) in map) {
+                if (k.sliceTag == sliceTag &&
+                    k.contentHash == hash &&
+                    k.lodLevel != targetLodLevel &&
+                    !tile.bitmap.isRecycled &&
+                    RectF.intersects(tile.projBounds, tileProjRect)
+                ) {
+                    val dist = abs(k.lodLevel - targetLodLevel)
+                    if (dist < bestDist || (dist == bestDist && k.lodLevel > bestLod)) {
+                        bestDist = dist
+                        bestLod = k.lodLevel
+                        matches.clear()
+                        matches.add(tile)
+                    } else if (k.lodLevel == bestLod) {
+                        matches.add(tile)
+                    }
+                }
+            }
+            return matches
+        }
+        val primary = collectForHash(contentHash)
+        if (primary.isNotEmpty()) return primary
+        if (fallbackContentHash != null && fallbackContentHash != contentHash) {
+            val hit = collectForHash(fallbackContentHash)
+            if (hit.isNotEmpty()) return hit
+        }
+        for (fbHash in fallbackContentHashes) {
+            if (fbHash == contentHash || fbHash == fallbackContentHash) continue
+            val hit = collectForHash(fbHash)
+            if (hit.isNotEmpty()) return hit
+        }
+        return emptyList()
+    }
+
+    @Synchronized
+    fun snapshotAllMatchingTilesAcrossLods(
+        sliceTag: String,
+        contentHash: Int,
+        boundsProj: RectF
+    ): List<CachedTile> {
+        val out = ArrayList<CachedTile>(8)
+        for ((k, tile) in map) {
+            if (k.sliceTag == sliceTag &&
+                k.contentHash == contentHash &&
+                !tile.bitmap.isRecycled &&
+                RectF.intersects(tile.projBounds, boundsProj)
+            ) {
+                out.add(tile)
+            }
+        }
+        return out
+    }
+
     @Synchronized
     fun snapshotMatchingTiles(
         sliceTag: String,
@@ -419,6 +502,28 @@ class CanvasTileCache(
         return out
     }
 
+    /**
+     * Releases quarantined bitmaps and RenderNodes ONLY on the UI thread after HWUI RenderThread
+     * has finished consuming prior frames, preventing mid-draw transparent tile flicker.
+     */
+    @Synchronized
+    fun drainQuarantineOnUiThread(nowMs: Long = safeUptimeMs(), forceAll: Boolean = false) {
+        while (quarantinedNodes.isNotEmpty()) {
+            val head = quarantinedNodes.first()
+            if (!forceAll && (nowMs - head.first) < QUARANTINE_MS && quarantinedNodes.size <= 96) break
+            quarantinedNodes.removeFirst()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                RenderNodeTileHelper.invalidate(head.second)
+            }
+        }
+        while (quarantinedTiles.isNotEmpty()) {
+            val head = quarantinedTiles.first()
+            if (!forceAll && (nowMs - head.first) < QUARANTINE_MS && quarantinedTiles.size <= 64) break
+            quarantinedTiles.removeFirst()
+            releaseTileResourcesImmediate(head.second)
+        }
+    }
+
     @Synchronized
     fun trimMemory(level: Int) {
         @Suppress("DEPRECATION")
@@ -433,12 +538,13 @@ class CanvasTileCache(
     @Synchronized
     fun clear() {
         for (tile in map.values) {
-            releaseTileResources(tile)
+            quarantinedTiles.addLast(0L to tile)
         }
         map.clear()
         emptyTileKeys.clear()
         currentBytes = 0
         currentRenderNodes = 0
+        drainQuarantineOnUiThread(forceAll = true)
     }
 
     private fun removeInternal(key: TileKey) {
@@ -450,19 +556,23 @@ class CanvasTileCache(
         if (tile.renderNode != null) {
             currentRenderNodes = (currentRenderNodes - 1).coerceAtLeast(0)
         }
-        releaseTileResources(tile)
+        quarantinedTiles.addLast(safeUptimeMs() to tile)
+        // Safety bound if background evicts many tiles without UI draws
+        while (quarantinedTiles.size > 192) {
+            val oldest = quarantinedTiles.removeFirst().second
+            KodanimaBitmapPool.release(oldest.bitmap)
+        }
     }
 
     private fun enforceLimitsLocked() {
         trimToBudget(maxBudgetBytes)
         if (currentRenderNodes > maxRenderNodes) {
+            val now = safeUptimeMs()
             val iter = map.entries.iterator()
             while (currentRenderNodes > maxRenderNodes && iter.hasNext()) {
                 val tile = iter.next().value
                 if (tile.renderNode != null) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        RenderNodeTileHelper.invalidate(tile.renderNode)
-                    }
+                    quarantinedNodes.addLast(now to tile.renderNode!!)
                     tile.renderNode = null
                     currentRenderNodes = (currentRenderNodes - 1).coerceAtLeast(0)
                 }
@@ -480,7 +590,7 @@ class CanvasTileCache(
         }
     }
 
-    private fun releaseTileResources(tile: CachedTile) {
+    private fun releaseTileResourcesImmediate(tile: CachedTile) {
         if (tile.renderNode != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             RenderNodeTileHelper.invalidate(tile.renderNode)
         }
@@ -488,10 +598,20 @@ class CanvasTileCache(
         KodanimaBitmapPool.release(tile.bitmap)
     }
 
+    private fun safeUptimeMs(): Long {
+        return try {
+            SystemClock.uptimeMillis()
+        } catch (_: Throwable) {
+            System.currentTimeMillis()
+        }
+    }
+
     companion object {
+        private const val QUARANTINE_MS = 220L
+
         fun defaultBudgetBytes(): Int {
             val poolCap = HardwareCapabilitiesEngine.currentProfile.bitmapPoolMaxBytes
-            return (poolCap * 0.65f).roundToInt().coerceIn(8 * 1024 * 1024, 48 * 1024 * 1024)
+            return (poolCap * 0.75f).roundToInt().coerceIn(12 * 1024 * 1024, 64 * 1024 * 1024)
         }
     }
 }
@@ -687,6 +807,37 @@ class CanvasTileEngine(
         )
     }
 
+    fun hasMissingTiles(plan: TilePlan, slices: List<TileSliceSpec>): Boolean {
+        if (slices.isEmpty()) return false
+        for (coord in plan.orderedCoords) {
+            for (spec in slices) {
+                val key = TileKey(
+                    sliceTag = spec.sliceTag,
+                    contentHash = spec.contentHash,
+                    lodLevel = plan.lodLevel,
+                    tileX = coord.tileX,
+                    tileY = coord.tileY
+                )
+                if (!tileCache.isKnownEmpty(key) && tileCache.get(key) == null) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fun hasAllVisibleTilesForSlice(plan: TilePlan, spec: TileSliceSpec): Boolean {
+        for (ty in plan.visibleTileRect.top..plan.visibleTileRect.bottom) {
+            for (tx in plan.visibleTileRect.left..plan.visibleTileRect.right) {
+                val key = TileKey(spec.sliceTag, spec.contentHash, plan.lodLevel, tx, ty)
+                if (!tileCache.isKnownEmpty(key) && tileCache.get(key) == null) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
     /**
      * Builds missing tiles for the given [slices] matching [plan].
      * Designed for execution on [KodanimaDispatchers.backgroundRender].
@@ -699,8 +850,12 @@ class CanvasTileEngine(
         onBatchReady: (() -> Unit)? = null
     ): Int {
         var builtCount = 0
+        var completedAllCoords = true
         for (coord in plan.orderedCoords) {
-            if (builtCount >= maxTilesPerPass) break
+            if (builtCount >= maxTilesPerPass) {
+                completedAllCoords = false
+                break
+            }
             val leftProj = coord.tileX * plan.tileProjSpan
             val topProj = coord.tileY * plan.tileProjSpan
             val rightProj = leftProj + plan.tileProjSpan
@@ -713,6 +868,10 @@ class CanvasTileEngine(
                 bottomProj + strokePad
             )
             for (spec in slices) {
+                if (builtCount >= maxTilesPerPass) {
+                    completedAllCoords = false
+                    break
+                }
                 val key = TileKey(
                     sliceTag = spec.sliceTag,
                     contentHash = spec.contentHash,
@@ -733,10 +892,12 @@ class CanvasTileEngine(
                 }
             }
         }
-        // Only prune old content hashes once the pass has built tiles so ACTION_UP transitions have 0 flicker
-        if (builtCount < maxTilesPerPass) {
+        // Only prune old content hashes once the entire visible+prefetch plan for the new hash is complete (0-flicker)
+        if (completedAllCoords && builtCount < maxTilesPerPass) {
             slices.forEach { spec ->
-                tileCache.pruneStaleContent(spec.sliceTag, spec.contentHash)
+                if (hasAllVisibleTilesForSlice(plan, spec)) {
+                    tileCache.pruneStaleContent(spec.sliceTag, spec.contentHash)
+                }
             }
         }
         if (builtCount > 0 && builtCount % 4 != 0) {
@@ -879,8 +1040,8 @@ class CanvasTileEngine(
     /**
      * Draws all cached tiles for [sliceTag] + [contentHash] intersecting [plan] directly onto [canvas]
      * under the caller's live project-to-screen transform ([liveProjToScreen]).
-     * Uses GPU RenderNode DisplayLists on API 29+ hardware-accelerated canvases, falling back cleanly
-     * to pooled Bitmap draws otherwise.
+     * Uses per-tile fallback resolution so partially built updates or LOD changes NEVER leave blank tiles
+     * or double-alpha overlap, and drains quarantined GPU/Bitmap resources safely on UI thread.
      */
     fun drawSliceTiles(
         canvas: Canvas,
@@ -890,59 +1051,70 @@ class CanvasTileEngine(
         contentHash: Int,
         paintOverride: Paint? = null,
         fallbackContentHash: Int? = null,
+        fallbackContentHashes: List<Int> = emptyList(),
         useRenderNode: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             HardwareCapabilitiesEngine.currentProfile.supportsRenderNode &&
             canvas.isHardwareAccelerated
     ) {
-        val exactTiles = tileCache.snapshotMatchingTiles(
-            sliceTag = sliceTag,
-            contentHash = contentHash,
-            lodLevel = plan.lodLevel,
-            tileRect = plan.prefetchTileRect
-        )
+        tileCache.drainQuarantineOnUiThread()
         val drawPaint = paintOverride ?: tileDrawPaint.apply {
             isFilterBitmap = true
         }
-
-        val expectedExact = (plan.visibleTileRect.width() + 1) * (plan.visibleTileRect.height() + 1)
-        val coveredVisible = exactTiles.count { t ->
-            t.key.tileX in plan.visibleTileRect.left..plan.visibleTileRect.right &&
-                t.key.tileY in plan.visibleTileRect.top..plan.visibleTileRect.bottom
-        }
+        val allowNode = useRenderNode && paintOverride == null
+        val prevHash = fallbackContentHash?.takeIf { it != contentHash }
+        val prevHashes = fallbackContentHashes.filter { it != contentHash && it != prevHash }
 
         canvas.save()
         canvas.concat(liveProjToScreen)
 
-        // Seamless previous-hash fallback when ACTION_UP just committed a stroke and background tiles are rebuilding
-        if (exactTiles.isEmpty() && fallbackContentHash != null && fallbackContentHash != contentHash) {
-            val prevExact = tileCache.snapshotMatchingTiles(
-                sliceTag = sliceTag,
-                contentHash = fallbackContentHash,
-                lodLevel = plan.lodLevel,
-                tileRect = plan.prefetchTileRect
-            )
-            if (prevExact.isNotEmpty()) {
-                for (pt in prevExact) {
-                    drawSingleCachedTile(canvas, pt, drawPaint, useRenderNode && paintOverride == null)
+        val tileSpan = plan.tileProjSpan
+        for (ty in plan.prefetchTileRect.top..plan.prefetchTileRect.bottom) {
+            for (tx in plan.prefetchTileRect.left..plan.prefetchTileRect.right) {
+                val exactKey = TileKey(sliceTag, contentHash, plan.lodLevel, tx, ty)
+                val exact = tileCache.get(exactKey)
+                if (exact != null) {
+                    drawSingleCachedTile(canvas, exact, drawPaint, allowNode)
+                    continue
+                }
+                if (tileCache.isKnownEmpty(exactKey)) {
+                    continue
+                }
+
+                // Exact tile is still building in background: fall back strictly for THIS tile coord
+                var prevExact = prevHash?.let {
+                    tileCache.get(TileKey(sliceTag, it, plan.lodLevel, tx, ty))
+                }
+                if (prevExact == null && prevHashes.isNotEmpty()) {
+                    for (fbH in prevHashes) {
+                        prevExact = tileCache.get(TileKey(sliceTag, fbH, plan.lodLevel, tx, ty))
+                        if (prevExact != null) break
+                    }
+                }
+                if (prevExact != null) {
+                    drawSingleCachedTile(canvas, prevExact, drawPaint, allowNode)
+                    continue
+                }
+
+                val leftProj = tx * tileSpan
+                val topProj = ty * tileSpan
+                val tileRectProj = RectF(leftProj, topProj, leftProj + tileSpan, topProj + tileSpan)
+                val lodFallbacks = tileCache.findFallbackTilesForSingleLod(
+                    sliceTag = sliceTag,
+                    contentHash = contentHash,
+                    fallbackContentHash = prevHash,
+                    tileProjRect = tileRectProj,
+                    targetLodLevel = plan.lodLevel,
+                    fallbackContentHashes = prevHashes
+                )
+                if (lodFallbacks.isNotEmpty()) {
+                    canvas.save()
+                    canvas.clipRect(tileRectProj)
+                    for (fb in lodFallbacks) {
+                        drawSingleCachedTile(canvas, fb, drawPaint, allowNode)
+                    }
+                    canvas.restore()
                 }
             }
-        }
-
-        // During rapid zoom transitions when target LOD tiles are still rasterizing, draw coarser/finer cached fallback tiles underneath
-        if (coveredVisible < expectedExact) {
-            val fallbacks = tileCache.findFallbackTiles(
-                sliceTag = sliceTag,
-                contentHash = contentHash,
-                targetRectProj = plan.visibleFrustumProj,
-                excludeLodLevel = plan.lodLevel
-            )
-            for (fb in fallbacks) {
-                drawSingleCachedTile(canvas, fb, drawPaint, useRenderNode && paintOverride == null)
-            }
-        }
-
-        for (tile in exactTiles) {
-            drawSingleCachedTile(canvas, tile, drawPaint, useRenderNode && paintOverride == null)
         }
 
         canvas.restore()
@@ -976,8 +1148,8 @@ class CanvasTileEngine(
     }
 
     /**
-     * Stamps a freshly completed stroke into already-cached overlapping tiles of [sliceTag] synchronously
-     * on ACTION_UP so there is zero 1-frame flicker while background tiles confirm.
+     * Copy-on-write synchronous stroke stamping & empty-tile materialization on ACTION_UP
+     * so strokes never vanish or blink while the background worker rasterizes the new contentHash.
      */
     fun stampStrokeIntoCachedTiles(
         sliceTag: String,
@@ -985,36 +1157,118 @@ class CanvasTileEngine(
         stroke: DrawingStroke,
         densityMult: Float
     ) {
+        stampStrokeIntoCachedTiles(
+            sliceTag = sliceTag,
+            contentHash = contentHash,
+            stroke = stroke,
+            densityMult = densityMult,
+            layers = null,
+            projWidth = 0,
+            projHeight = 0,
+            activePlan = null
+        )
+    }
+
+    fun stampStrokeIntoCachedTiles(
+        sliceTag: String,
+        contentHash: Int,
+        stroke: DrawingStroke,
+        densityMult: Float,
+        layers: List<Layer>? = null,
+        projWidth: Int = 0,
+        projHeight: Int = 0,
+        activePlan: TilePlan? = null
+    ) {
         if (stroke.points.isEmpty()) return
         val sMinX = if (stroke.minX != Float.MAX_VALUE) stroke.minX else stroke.points.minOf { it.x }
         val sMinY = if (stroke.minY != Float.MAX_VALUE) stroke.minY else stroke.points.minOf { it.y }
         val sMaxX = if (stroke.maxX != -Float.MAX_VALUE) stroke.maxX else stroke.points.maxOf { it.x }
         val sMaxY = if (stroke.maxY != -Float.MAX_VALUE) stroke.maxY else stroke.points.maxOf { it.y }
-        val pad = stroke.brushSize * 1.8f + 16f
+        val pad = stroke.brushSize * 1.8f + 24f
         val sBounds = RectF(sMinX - pad, sMinY - pad, sMaxX + pad, sMaxY + pad)
+
         tileCache.clearEmptyForSlice(sliceTag)
-        synchronized(tileCache) {
-            // Walk fallback candidates across all cached LODs for this slice+hash
-            val allFallback = tileCache.findFallbackTiles(
-                sliceTag = sliceTag,
-                contentHash = contentHash,
-                targetRectProj = sBounds,
-                excludeLodLevel = Int.MIN_VALUE
-            )
-            for (tile in allFallback) {
-                if (tile.bitmap.isRecycled) continue
-                val c = Canvas(tile.bitmap)
+        val existingTiles = tileCache.snapshotAllMatchingTilesAcrossLods(sliceTag, contentHash, sBounds)
+        val specForFullRender = if (layers != null && projWidth > 0 && projHeight > 0) {
+            TileSliceSpec.LayersSlice(sliceTag, contentHash, layers, projWidth, projHeight, densityMult)
+        } else null
+
+        for (oldTile in existingTiles) {
+            if (oldTile.bitmap.isRecycled) continue
+            val updatedTile = if (stroke.tool == ToolType.ERASER && specForFullRender != null) {
+                renderTile(
+                    spec = specForFullRender,
+                    key = oldTile.key,
+                    lodScale = oldTile.lodScale,
+                    tileSizePx = oldTile.bitmap.width,
+                    tileProjSpan = oldTile.projBounds.width()
+                )
+            } else {
+                // Copy-on-write: never mutate an existing tile's Bitmap in-place while HWUI RenderThread reads it
+                val w = oldTile.bitmap.width
+                val h = oldTile.bitmap.height
+                val copyBmp = KodanimaBitmapPool.acquire(w, h, Bitmap.Config.ARGB_8888, Color.TRANSPARENT)
+                val c = Canvas(copyBmp)
+                c.drawBitmap(oldTile.bitmap, 0f, 0f, null)
                 val mat = Matrix().apply {
-                    setTranslate(-tile.projBounds.left, -tile.projBounds.top)
-                    postScale(tile.lodScale, tile.lodScale)
+                    setTranslate(-oldTile.projBounds.left, -oldTile.projBounds.top)
+                    postScale(oldTile.lodScale, oldTile.lodScale)
                 }
                 c.save()
                 c.concat(mat)
                 KodanimaGraphicsEngine.drawStrokeToCanvas(stroke, c, 1.0f, null, densityMult)
                 c.restore()
-                if (tile.renderNode != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    RenderNodeTileHelper.invalidate(tile.renderNode)
-                    tile.renderNode = null
+                CachedTile(
+                    key = oldTile.key,
+                    bitmap = copyBmp,
+                    renderNode = null,
+                    projBounds = RectF(oldTile.projBounds),
+                    lodScale = oldTile.lodScale,
+                    byteSize = copyBmp.allocationByteCount
+                )
+            }
+            tileCache.put(updatedTile)
+        }
+
+        // Materialize previously-empty tiles touched by this stroke at active LOD so stroke #1 never blinks!
+        if (activePlan != null && stroke.tool != ToolType.ERASER) {
+            val span = activePlan.tileProjSpan
+            val minTx = max(activePlan.prefetchTileRect.left, floor(sBounds.left / span).toInt())
+            val maxTx = min(activePlan.prefetchTileRect.right, floor((sBounds.right - 0.001f) / span).toInt())
+            val minTy = max(activePlan.prefetchTileRect.top, floor(sBounds.top / span).toInt())
+            val maxTy = min(activePlan.prefetchTileRect.bottom, floor((sBounds.bottom - 0.001f) / span).toInt())
+            var materialized = 0
+            materializeLoop@ for (ty in minTy..maxTy) {
+                for (tx in minTx..maxTx) {
+                    if (materialized >= 64) break@materializeLoop
+                    val key = TileKey(sliceTag, contentHash, activePlan.lodLevel, tx, ty)
+                    if (tileCache.get(key) != null) continue
+                    val tile = if (specForFullRender != null) {
+                        renderTile(specForFullRender, key, activePlan.lodScale, activePlan.tileSizePx, span)
+                    } else {
+                        val leftP = tx * span
+                        val topP = ty * span
+                        val bmp = KodanimaBitmapPool.acquire(activePlan.tileSizePx, activePlan.tileSizePx, Bitmap.Config.ARGB_8888, Color.TRANSPARENT)
+                        val c = Canvas(bmp)
+                        val mat = Matrix().apply {
+                            setTranslate(-leftP, -topP)
+                            postScale(activePlan.lodScale, activePlan.lodScale)
+                        }
+                        c.save()
+                        c.concat(mat)
+                        KodanimaGraphicsEngine.drawStrokeToCanvas(stroke, c, 1.0f, null, densityMult)
+                        c.restore()
+                        CachedTile(
+                            key = key,
+                            bitmap = bmp,
+                            renderNode = null,
+                            projBounds = RectF(leftP, topP, leftP + span, topP + span),
+                            lodScale = activePlan.lodScale,
+                            byteSize = bmp.allocationByteCount
+                        )
+                    }
+                    tileCache.put(tile)
+                    materialized++
                 }
             }
         }

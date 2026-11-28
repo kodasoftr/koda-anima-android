@@ -86,6 +86,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.engine.Camera3DEngine
 import com.example.engine.Mesh3DImporter
+import com.example.engine.NativeGL3DEngine
 import com.example.engine.Studio3DPaintEngine
 import com.example.model.BrushPreset
 import com.example.model.Estudio3DPaintTool
@@ -1078,9 +1079,10 @@ fun Studio3DSplitNodesOverlay(
             return@LaunchedEffect
         }
         withContext(Dispatchers.Default) {
+            val glScale = if (NativeGL3DEngine.isHardwareAvailable()) 1.5f else 1f
             val res = Camera3DEngine.renderSceneObjectsSoftware3D(
-                outW = 480,
-                outH = 320,
+                outW = (480 * glScale).toInt(),
+                outH = (320 * glScale).toInt(),
                 sceneObjects = listOf(curObj),
                 frameIndex = 0,
                 autoInterpolate = true,
@@ -1089,10 +1091,10 @@ fun Studio3DSplitNodesOverlay(
                 camRollDeg = 0f,
                 camPanX = 0f,
                 camPanY = 0f,
-                focalPx = 360f,
-                vpCx = 240f,
-                vpCy = 160f,
-                worldUnitScale = 0.72f,
+                focalPx = 360f * glScale,
+                vpCx = 240f * glScale,
+                vpCy = 160f * glScale,
+                worldUnitScale = 0.72f * glScale,
                 selectedObjectId = null
             )
             withContext(Dispatchers.Main) {

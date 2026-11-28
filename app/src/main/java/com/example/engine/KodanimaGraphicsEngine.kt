@@ -16,6 +16,7 @@ import android.util.Base64
 import android.util.LruCache
 import android.graphics.LinearGradient
 import android.graphics.Shader
+import com.example.model.AnimationProject
 import com.example.model.BrushDynamicParams
 import com.example.model.BrushPreset
 import com.example.model.CanvasBackgroundSettings
@@ -28,6 +29,7 @@ import com.example.model.Layer
 import com.example.model.LayerBlendEffect
 import com.example.model.SkyBackdropMode
 import com.example.model.StrokePoint
+import com.example.model.TimelineSymbolType
 import com.example.model.ToolType
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -959,7 +961,7 @@ object KodanimaGraphicsEngine {
 
         val symById = project.symbols.associateBy { it.id }
         val scratch = scratchThreadLocal.get()!!
-        val paint = scratch.layerPaint
+        val paint = scratch.layerAlphaPaint
         val cx = targetWidth * 0.5f
         val cy = targetHeight * 0.5f
         val bmpW = targetWidth.coerceAtLeast(1)
@@ -967,20 +969,20 @@ object KodanimaGraphicsEngine {
 
         for (inst in activeInstances) {
             val sym = symById[inst.symbolId] ?: continue
-            if (sym.frames.isEmpty()) continue
+            if (sym.internalFrames.isEmpty()) continue
             val evalTf = TimelineTrackEngine.evaluateSymbolInstanceAtTick(inst, tickFloat)
             val internalFrame = TimelineTrackEngine.resolveSymbolInternalFrame(sym, inst, tickFloat) ?: continue
             val internalLayers = composeOrderedFrameLayers(internalFrame)
             if (internalLayers.isEmpty()) continue
 
-            val fx = sym.effects
+            val fx = inst.effects
             val effAlpha = (evalTf.opacity * fx.opacity).coerceIn(0f, 1f)
             if (effAlpha <= 0.005f) continue
 
-            val needsOffscreenBuffer = sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && (
+            val needsOffscreenBuffer = sym.type == TimelineSymbolType.EFFECTS && (
                 fx.glowRadius > 0.5f ||
                     fx.blurRadius > 0.5f ||
-                    fx.dropShadow ||
+                    fx.dropShadowRadius > 0.2f ||
                     fx.tintStrength > 0.02f ||
                     fx.blendEffect != LayerBlendEffect.NORMAL ||
                     effAlpha < 0.99f
@@ -1019,9 +1021,9 @@ object KodanimaGraphicsEngine {
                         allowOutOfBounds = false
                     )
 
-                    val tintFiltered = if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && fx.tintStrength > 0.02f) {
+                    val tintFiltered = if (sym.type == TimelineSymbolType.EFFECTS && fx.tintStrength > 0.02f) {
                         val s = fx.tintStrength.coerceIn(0f, 1f)
-                        val tCol = fx.tintColor.toInt()
+                        val tCol = fx.tintColorArgb.toInt()
                         val tr = ((tCol ushr 16) and 0xFF) / 255f
                         val tg = ((tCol ushr 8) and 0xFF) / 255f
                         val tb = (tCol and 0xFF) / 255f
@@ -1040,16 +1042,16 @@ object KodanimaGraphicsEngine {
                     canvas.concat(tfMatrix)
 
                     // Optional Drop Shadow behind Symbol
-                    if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && fx.dropShadow) {
+                    if (sym.type == TimelineSymbolType.EFFECTS && fx.dropShadowRadius > 0.2f) {
                         paint.reset()
                         paint.isFilterBitmap = true
                         paint.alpha = (effAlpha * 140f).roundToInt().coerceIn(0, 255)
-                        paint.colorFilter = android.graphics.PorterDuffColorFilter(fx.dropShadowColor.toInt(), PorterDuff.Mode.SRC_IN)
-                        canvas.drawBitmap(symBmp, fx.shadowOffsetX, fx.shadowOffsetY, paint)
+                        paint.colorFilter = android.graphics.PorterDuffColorFilter(fx.dropShadowColorArgb.toInt(), PorterDuff.Mode.SRC_IN)
+                        canvas.drawBitmap(symBmp, fx.dropShadowOffsetX, fx.dropShadowOffsetY, paint)
                     }
 
                     // Optional Glow Halo behind Symbol
-                    if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && fx.glowRadius > 0.5f) {
+                    if (sym.type == TimelineSymbolType.EFFECTS && fx.glowRadius > 0.5f) {
                         val downFactor = (1f + fx.glowRadius * 0.25f).coerceIn(1.5f, 8f)
                         val dw = (bmpW / downFactor).roundToInt().coerceIn(16, bmpW)
                         val dh = (bmpH / downFactor).roundToInt().coerceIn(16, bmpH)
@@ -1058,7 +1060,7 @@ object KodanimaGraphicsEngine {
                             val gc = Canvas(glowBmp)
                             paint.reset()
                             paint.isFilterBitmap = true
-                            paint.colorFilter = android.graphics.PorterDuffColorFilter(fx.glowColor.toInt(), PorterDuff.Mode.SRC_IN)
+                            paint.colorFilter = android.graphics.PorterDuffColorFilter(fx.glowColorArgb.toInt(), PorterDuff.Mode.SRC_IN)
                             gc.drawBitmap(symBmp, null, android.graphics.Rect(0, 0, dw, dh), paint)
                             paint.colorFilter = null
                             paint.alpha = (effAlpha * 175f).roundToInt().coerceIn(0, 255)
@@ -1076,9 +1078,9 @@ object KodanimaGraphicsEngine {
                     paint.isAntiAlias = true
                     paint.alpha = (effAlpha * 255f).roundToInt().coerceIn(0, 255)
                     paint.colorFilter = tintFiltered
-                    applyLayerBlendMode(paint, if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS) fx.blendEffect else LayerBlendEffect.NORMAL)
+                    applyLayerBlendMode(paint, if (sym.type == TimelineSymbolType.EFFECTS) fx.blendEffect else LayerBlendEffect.NORMAL)
 
-                    if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && fx.blurRadius > 0.5f) {
+                    if (sym.type == TimelineSymbolType.EFFECTS && fx.blurRadius > 0.5f) {
                         val downFactor = (1f + fx.blurRadius * 0.35f).coerceIn(1.5f, 10f)
                         val bw = (bmpW / downFactor).roundToInt().coerceIn(12, bmpW)
                         val bh = (bmpH / downFactor).roundToInt().coerceIn(12, bmpH)

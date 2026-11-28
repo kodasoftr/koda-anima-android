@@ -66,7 +66,8 @@ data class HardwareRenderProfile(
     val maxUndoHistory: Int = 30,
     val preferTightSaveLayerBounds: Boolean = true,
     val avoidShadowLayerOnActiveCanvas: Boolean = true,
-    val supportsRenderNode: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+    val supportsRenderNode: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
+    val supportsNativeOpenGLES3D: Boolean = false
 )
 
 /**
@@ -221,7 +222,8 @@ object HardwareCapabilitiesEngine {
             maxUndoHistory = maxUndo,
             preferTightSaveLayerBounds = true,
             avoidShadowLayerOnActiveCanvas = gpuFamily.isTileBasedDeferred || isLowRam,
-            supportsRenderNode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+            supportsRenderNode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
+            supportsNativeOpenGLES3D = NativeGL3DEngine.isHardwareAvailable()
         )
     }
 

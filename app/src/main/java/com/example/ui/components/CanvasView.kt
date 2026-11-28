@@ -90,6 +90,7 @@ import com.example.engine.KodanimaBitmapPool
 import com.example.engine.KodanimaDispatchers
 import com.example.engine.KodanimaGraphicsEngine
 import com.example.engine.MediaAssetManager
+import com.example.engine.NativeGL3DEngine
 import com.example.engine.PredictiveViewportTracker
 import com.example.engine.Studio3DPaintEngine
 import com.example.engine.ProjectedObjectBounds
@@ -389,6 +390,13 @@ private data class LayerSliceCacheKey(
     val hiddenStrokeIds: Set<String> = emptySet(),
     val replacementStrokes: List<DrawingStroke> = emptyList(),
     val vpMatrixSignature: List<Float> = emptyList()
+)
+
+private data class OptimisticActiveFallback(
+    val layerId: String?,
+    val fallbackHashes: List<Int>,
+    val strokeId: String,
+    val seenInVm: Boolean = false
 )
 
 private class CanvasOverlayScratch {
@@ -865,7 +873,7 @@ fun CanvasView(
     val latestTilePlanRef = remember { AtomicReference<TilePlan?>(null) }
     val latestTileSlicesRef = remember { AtomicReference<List<TileSliceSpec>>(emptyList()) }
     val tileBuildTrigger = remember { Channel<Unit>(Channel.CONFLATED) }
-    val optimisticActiveFallbackRef = remember { AtomicReference<Triple<String?, Int, Int>?>(null) }
+    val optimisticActiveFallbackRef = remember { AtomicReference<OptimisticActiveFallback?>(null) }
     DisposableEffect(Unit) {
         onDispose {
             tileEngine.releaseAll()
@@ -1441,9 +1449,17 @@ fun CanvasView(
             val fb = optimisticActiveFallbackRef.get()
             if (fb != null) {
                 val curLayerId = activeLayerObj?.id
-                val curCount = activeLayerObj?.strokes?.size ?: 0
-                if (fb.first != curLayerId || curCount < fb.third) {
-                    optimisticActiveFallbackRef.set(null)
+                val vmHasStroke = activeLayerObj?.strokes?.any { it.id == fb.strokeId } == true
+                when {
+                    curLayerId != fb.layerId -> optimisticActiveFallbackRef.set(null)
+                    !fb.seenInVm && vmHasStroke -> optimisticActiveFallbackRef.set(fb.copy(seenInVm = true))
+                    fb.seenInVm && !vmHasStroke -> optimisticActiveFallbackRef.set(null)
+                    fb.seenInVm && activeSpec.contentHash !in fb.fallbackHashes -> {
+                        val curPlan = latestTilePlanRef.get()
+                        if (curPlan != null && tileEngine.hasAllVisibleTilesForSlice(curPlan, activeSpec)) {
+                            optimisticActiveFallbackRef.set(null)
+                        }
+                    }
                 }
             }
         }
@@ -1468,9 +1484,8 @@ fun CanvasView(
         // Continuous non-cancelling GPU tile rasterization worker on backgroundRender pool
         LaunchedEffect(Unit) {
             for (ignored in tileBuildTrigger) {
-                var builtTotal = 0
                 var pass = 0
-                while (pass < 4) {
+                while (pass < 32) {
                     val plan = latestTilePlanRef.get() ?: break
                     val slices = latestTileSlicesRef.get()
                     if (slices.isEmpty()) break
@@ -1478,19 +1493,17 @@ fun CanvasView(
                         tileEngine.ensureTilesForPlan(
                             plan = plan,
                             slices = slices,
-                            maxTilesPerPass = 16,
+                            maxTilesPerPass = 8,
                             onBatchReady = null
                         )
                     }
-                    builtTotal += built
                     if (built > 0) {
                         activeStrokeVersion++
                     }
-                    if (built < 16) break
+                    val latestPlan = latestTilePlanRef.get() ?: plan
+                    val latestSlices = latestTileSlicesRef.get()
+                    if (built < 8 && !tileEngine.hasMissingTiles(latestPlan, latestSlices)) break
                     pass++
-                }
-                if (builtTotal > 0) {
-                    activeStrokeVersion++
                 }
             }
         }
@@ -1612,7 +1625,7 @@ fun CanvasView(
                 if (staleObjIds.isNotEmpty()) activeStrokeVersion++
                 return@LaunchedEffect
             }
-            val maxStageDim = 680f
+            val maxStageDim = if (NativeGL3DEngine.isHardwareAvailable()) 1080f else 680f
             val scaleDown = min(1f, maxStageDim / max(containerWidth, containerHeight).coerceAtLeast(1f))
             val rW = (containerWidth * scaleDown).roundToInt().coerceAtLeast(64)
             val rH = (containerHeight * scaleDown).roundToInt().coerceAtLeast(64)
@@ -1673,7 +1686,7 @@ fun CanvasView(
                             minY = b.minY * invScale,
                             maxX = b.maxX * invScale,
                             maxY = b.maxY * invScale,
-                            avgDepth = b.avgDepth - focal * 0.8f
+                            avgDepth = b.avgDepth * invScale - focal
                         )
                     } else null
                     cacheHolder.stage3DObjectEntries[obj.id] = CanvasBitmapCache.Stage3DObjectCacheEntry(
@@ -2980,15 +2993,41 @@ fun CanvasView(
                                         val canCommitLocally = curActiveLayer?.isLocked != true && curActiveLayer?.isVisible != false
                                         if (canCommitLocally) {
                                             val prevHash = curActiveSpecHash
-                                            val prevCount = curActiveLayer?.strokes?.size ?: 0
+                                            val optimisticLayers = if (curEffectiveActiveSlice.isNotEmpty()) {
+                                                val lastIdx = curEffectiveActiveSlice.lastIndex
+                                                curEffectiveActiveSlice.mapIndexed { idx, l ->
+                                                    if (idx == lastIdx) l.copy(strokes = l.strokes + completedStroke) else l
+                                                }
+                                            } else null
+                                            val activePlanForStamp = latestTilePlanRef.get() ?: run {
+                                                syncProjectionMatrices()
+                                                val sppNow = (boxW / projWidth) * liveTf.zoom.coerceAtLeast(0.05f)
+                                                tileEngine.computeTilePlan(projToScreenMatrix, containerWidth, containerHeight, sppNow)?.also {
+                                                    latestTilePlanRef.set(it)
+                                                }
+                                            }
                                             tileEngine.stampStrokeIntoCachedTiles(
                                                 sliceTag = "active",
                                                 contentHash = prevHash,
                                                 stroke = completedStroke,
-                                                densityMult = densityMult
+                                                densityMult = densityMult,
+                                                layers = optimisticLayers,
+                                                projWidth = project.resolution.width,
+                                                projHeight = project.resolution.height,
+                                                activePlan = activePlanForStamp
                                             )
+                                            val prevFb = optimisticActiveFallbackRef.get()
+                                            val chainedHashes = (listOf(prevHash) +
+                                                (prevFb?.takeIf { it.layerId == curActiveLayer?.id }?.fallbackHashes ?: emptyList()))
+                                                .distinct()
+                                                .take(4)
                                             optimisticActiveFallbackRef.set(
-                                                Triple(curActiveLayer?.id, prevHash, prevCount + 1)
+                                                OptimisticActiveFallback(
+                                                    layerId = curActiveLayer?.id,
+                                                    fallbackHashes = chainedHashes,
+                                                    strokeId = completedStroke.id,
+                                                    seenInVm = false
+                                                )
                                             )
                                             curOnStrokeCompleted(completedStroke)
                                         }
@@ -3300,7 +3339,9 @@ fun CanvasView(
                     )
                     if (livePlan != null) {
                         latestTilePlanRef.set(livePlan)
-                        tileBuildTrigger.trySend(Unit)
+                        if (tileEngine.hasMissingTiles(livePlan, latestTileSlicesRef.get())) {
+                            tileBuildTrigger.trySend(Unit)
+                        }
                     }
 
                     val isBgTransparent = project.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE
@@ -3380,9 +3421,9 @@ fun CanvasView(
                     // Active layer (isolated viewport eraser buffer when erasing, or cached world-space GPU tiles)
                     val isUsingEraserBuf = isDrawingActive && selectedTool == ToolType.ERASER &&
                         cacheHolder.eraserWorkBitmap != null && !cacheHolder.eraserWorkBitmap!!.isRecycled
-                    val activeFallbackHash = optimisticActiveFallbackRef.get()?.takeIf {
-                        it.first == activeLayerObj?.id
-                    }?.second
+                    val activeFallbackHashes = optimisticActiveFallbackRef.get()?.takeIf {
+                        it.layerId == activeLayerObj?.id
+                    }?.fallbackHashes ?: emptyList()
 
                     if (activeLayerObj?.isVisible != false) {
                         if (isUsingEraserBuf) {
@@ -3438,7 +3479,7 @@ fun CanvasView(
                                     plan = livePlan,
                                     sliceTag = "active",
                                     contentHash = activeSpec.contentHash,
-                                    fallbackContentHash = activeFallbackHash
+                                    fallbackContentHashes = activeFallbackHashes
                                 )
                             } else if (!activeIsClip) {
                                 overlayScratch.layerBlendPaint.alpha = 255
@@ -3450,7 +3491,7 @@ fun CanvasView(
                                     plan = livePlan,
                                     sliceTag = "active",
                                     contentHash = activeSpec.contentHash,
-                                    fallbackContentHash = activeFallbackHash
+                                    fallbackContentHashes = activeFallbackHashes
                                 )
                                 nativeCanvas.restoreToCount(sc)
                             } else if (clipBaseSpec != null) {
@@ -3463,7 +3504,7 @@ fun CanvasView(
                                     plan = livePlan,
                                     sliceTag = "active",
                                     contentHash = activeSpec.contentHash,
-                                    fallbackContentHash = activeFallbackHash
+                                    fallbackContentHashes = activeFallbackHashes
                                 )
                                 tileEngine.drawSliceTiles(
                                     canvas = nativeCanvas,
@@ -4726,7 +4767,7 @@ private fun projectPoint3D(
     val rz = wx * sinY + wz * cosY
     val ry = wy * cosP - rz * sinP
     val zz = wy * sinP + rz * cosP
-    val denom = (focal + zz).coerceAtLeast(180f)
+    val denom = (focal + zz).coerceAtLeast(24f)
     val persp = focal / denom
     return Projected3DPt(cx + rx * persp, cy + ry * persp, zz)
 }

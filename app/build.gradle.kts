@@ -16,8 +16,8 @@ android {
     applicationId = "br.com.kodasoft.kodanima"
     minSdk = 24
     targetSdk = 36
-    versionCode = 30
-    versionName = "3.0"
+    versionCode = 47
+    versionName = "4.7"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

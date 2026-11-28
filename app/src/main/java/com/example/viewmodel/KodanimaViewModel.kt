@@ -2112,6 +2112,9 @@ class KodanimaViewModel : ViewModel() {
                 }
                 toggleStudio3DSplitNodes()
             }
+            ShortcutAction.CREATE_SYMBOL -> {
+                _uiState.update { it.copy(statusMessage = "Atalho Criar Símbolo (F8)") }
+            }
         }
         return true
     }

@@ -83,6 +83,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.engine.Camera3DEngine
+import com.example.engine.NativeGL3DEngine
 import com.example.engine.Studio3DPaintEngine
 import com.example.model.BrushDynamicParams
 import com.example.model.BrushPreset
@@ -182,8 +183,13 @@ fun Studio3DUvPaintScreen(
         val viewWPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
         val viewHPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
 
-        val renderW = if (isInteracting) 420 else 640
-        val renderH = ((renderW.toFloat() * (viewHPx / viewWPx)).toInt()).coerceIn(280, 900)
+        val hasGl3D = remember { NativeGL3DEngine.isHardwareAvailable() }
+        val renderW = if (hasGl3D) {
+            if (isInteracting) 720 else 1080
+        } else {
+            if (isInteracting) 420 else 640
+        }
+        val renderH = ((renderW.toFloat() * (viewHPx / viewWPx)).toInt()).coerceIn(280, if (hasGl3D) 1440 else 900)
         val vpScaleX = renderW.toFloat() / viewWPx
         val vpScaleY = renderH.toFloat() / viewHPx
         val baseUnitScale = (minOf(renderW, renderH) / 560f).coerceIn(0.45f, 1.35f)

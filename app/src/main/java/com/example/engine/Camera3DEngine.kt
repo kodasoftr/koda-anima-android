@@ -513,10 +513,36 @@ object Camera3DEngine {
         tickFloat: Float = frameIndex.toFloat(),
         animTimeSec: Float = 0f,
         reuseBitmap: Bitmap? = null,
-        shadingMode: StageShadingMode = StageShadingMode.RENDERED
+        shadingMode: StageShadingMode = StageShadingMode.RENDERED,
+        preferHardwareGl: Boolean = true
     ): Pair<Bitmap, Map<String, ProjectedObjectBounds>>? {
         val visibleObjs = sceneObjects.filter { it.isVisible && it.meshAssetPath.isNotBlank() }
         if (visibleObjs.isEmpty() || outW <= 0 || outH <= 0) return null
+
+        if (preferHardwareGl && NativeGL3DEngine.isHardwareAvailable()) {
+            NativeGL3DEngine.renderSceneObjects(
+                outW = outW,
+                outH = outH,
+                sceneObjects = visibleObjs,
+                autoInterpolate = autoInterpolate,
+                camYawDeg = camYawDeg,
+                camPitchDeg = camPitchDeg,
+                camRollDeg = camRollDeg,
+                camPanX = camPanX,
+                camPanY = camPanY,
+                focalPx = focalPx,
+                vpCx = vpCx,
+                vpCy = vpCy,
+                worldUnitScale = worldUnitScale,
+                zNearLimit = zNearLimit,
+                zFarLimit = zFarLimit,
+                selectedObjectId = selectedObjectId,
+                tickFloat = tickFloat,
+                animTimeSec = animTimeSec,
+                reuseBitmap = reuseBitmap,
+                shadingMode = shadingMode
+            )?.let { return it }
+        }
 
         val totalPx = outW * outH
         val scratch = rasterScratchThreadLocal.get()!!
@@ -626,11 +652,20 @@ object Camera3DEngine {
                 )
             } else baseSlot
 
+            val defaultContornoColor = 0xFF10131CL
             val effOutlineEnabled = if (shadingMode == StageShadingMode.RENDERED) {
-                if (ng.enabled && outlineNode != null) outlineNode.paramB > 0.15f else obj.outline.enabled
+                if (ng.enabled && outlineNode != null) (outlineNode.paramB > 0.15f) || obj.outline.enabled else obj.outline.enabled
             } else false
-            val effOutlineWidth = if (ng.enabled && outlineNode != null) outlineNode.paramA else obj.outline.width
-            val effOutlineColor = if (ng.enabled && outlineNode != null) outlineNode.colorArgb.toInt() else obj.outline.colorArgb.toInt()
+            val effOutlineWidth = if (ng.enabled && outlineNode != null) {
+                if (obj.outline.enabled && outlineNode.paramA == 2.0f && obj.outline.width > 2.0f) obj.outline.width else outlineNode.paramA
+            } else obj.outline.width
+            val effOutlineColor = if (ng.enabled && outlineNode != null) {
+                if (obj.outline.enabled && outlineNode.colorArgb == defaultContornoColor && obj.outline.colorArgb != defaultContornoColor) {
+                    obj.outline.colorArgb.toInt()
+                } else {
+                    outlineNode.colorArgb.toInt()
+                }
+            } else obj.outline.colorArgb.toInt()
 
             val oxRad = Math.toRadians(objTf.rotX.toDouble())
             val oyRad = Math.toRadians(objTf.rotY.toDouble())
@@ -1628,7 +1663,7 @@ object Camera3DEngine {
                     vpCy = cyOut,
                     worldUnitScale = worldUnitScale,
                     zNearLimit = -Float.MAX_VALUE,
-                    zFarLimit = frontZThreshold,
+                    zFarLimit = frontZThreshold - 0.001f,
                     tickFloat = tickFloat,
                     animTimeSec = animTimeSec,
                     reuseBitmap = pooledObjBmp,
