@@ -139,6 +139,7 @@ enum class ShortcutAction(
     NEXT_FRAME("Próximo Quadro", "Animação & Timeline", KeyEvent.KEYCODE_DPAD_RIGHT),
     TOGGLE_ONION_SKIN("Casca de Cebola (Onion Skin)", "Animação & Timeline", KeyEvent.KEYCODE_O),
     ADD_FRAME("Adicionar Novo Quadro", "Animação & Timeline", KeyEvent.KEYCODE_N, defaultCtrl = true),
+    CREATE_SYMBOL("Criar Símbolo (F8)", "Animação & Timeline", KeyEvent.KEYCODE_F8),
     CLEAR_FRAME("Limpar Quadro Atual", "Animação & Timeline", KeyEvent.KEYCODE_FORWARD_DEL, defaultCtrl = true),
 
     UNDO("Desfazer", "Edição & Arquivo", KeyEvent.KEYCODE_Z, defaultCtrl = true),
@@ -205,6 +206,7 @@ object ShortcutRegistry {
         KeyEvent.KEYCODE_LEFT_BRACKET to "[",
         KeyEvent.KEYCODE_RIGHT_BRACKET to "]",
         KeyEvent.KEYCODE_F7 to "F7",
+        KeyEvent.KEYCODE_F8 to "F8",
         KeyEvent.KEYCODE_F12 to "F12",
         KeyEvent.KEYCODE_A to "A",
         KeyEvent.KEYCODE_B to "B",
@@ -259,6 +261,7 @@ object ShortcutRegistry {
             KeyEvent.KEYCODE_PERIOD -> "."
             KeyEvent.KEYCODE_ESCAPE -> "Esc"
             KeyEvent.KEYCODE_F7 -> "F7"
+            KeyEvent.KEYCODE_F8 -> "F8"
             KeyEvent.KEYCODE_F12 -> "F12"
             else -> {
                 selectableQuickKeys.firstOrNull { it.first == keyCode }?.second

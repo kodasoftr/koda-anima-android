@@ -638,6 +638,7 @@ object FbxAndMax3DParser {
             val rawUvs = extractFloatTriples(uvElem?.firstChild("UV")?.props?.firstOrNull())
             val uvIndices = (uvElem?.firstChild("UVIndex")?.props?.firstOrNull() as? FbxProp.IntArrayVal)?.v
             val uvMapping = uvElem?.firstChild("MappingInformationType")?.stringProp(0) ?: ""
+            val uvRefMode = uvElem?.firstChild("ReferenceInformationType")?.stringProp(0) ?: ""
 
             val normElem = gNode.firstChild("LayerElementNormal")
             val rawNorms = extractFloatTriples(normElem?.firstChild("Normals")?.props?.firstOrNull())
@@ -654,8 +655,9 @@ object FbxAndMax3DParser {
 
             val polyVertList = ArrayList<Int>(4)
             var polyVertCounter = 0
+            var polyIdxCounter = 0
 
-            fun emitCorner(vertIdx: Int, cornerSeq: Int): Int {
+            fun emitCorner(vertIdx: Int, cornerSeq: Int, polySeq: Int): Int {
                 val safeVi = vertIdx.coerceIn(0, rawVertCount - 1)
                 val outIdx = outVerts.size / 3
                 outVerts.add(rawVerts[safeVi * 3])
@@ -663,13 +665,19 @@ object FbxAndMax3DParser {
                 outVerts.add(rawVerts[safeVi * 3 + 2])
 
                 if (rawUvs != null && rawUvCount > 0) {
-                    val rawUvIndex = when {
-                        uvIndices != null && cornerSeq < uvIndices.size -> {
-                            val idxVal = uvIndices[cornerSeq]
-                            if (idxVal >= 0) idxVal else safeVi
-                        }
+                    val mapKeyIdx = when {
                         uvMapping.contains("ByPolygonVertex", ignoreCase = true) -> cornerSeq
+                        uvMapping.contains("ByPolygon", ignoreCase = true) -> polySeq
+                        uvMapping.contains("AllSame", ignoreCase = true) -> 0
+                        uvMapping.contains("ByVertice", ignoreCase = true) || uvMapping.contains("ByVertex", ignoreCase = true) -> safeVi
+                        uvIndices != null -> cornerSeq
                         else -> safeVi
+                    }
+                    val rawUvIndex = if (uvIndices != null && (uvRefMode.contains("IndexToDirect", ignoreCase = true) || uvRefMode.isBlank())) {
+                        val idxVal = uvIndices.getOrNull(mapKeyIdx) ?: safeVi
+                        if (idxVal >= 0) idxVal else safeVi
+                    } else {
+                        mapKeyIdx
                     }
                     val uvIdx = rawUvIndex.coerceIn(0, rawUvCount - 1)
                     outUvs.add(rawUvs[uvIdx * 2])
@@ -679,10 +687,11 @@ object FbxAndMax3DParser {
                 }
 
                 if (rawNorms != null && rawNormCount > 0) {
-                    val nIdx = if (normMapping.contains("ByPolygonVertex", ignoreCase = true)) {
-                        cornerSeq
-                    } else {
-                        safeVi
+                    val nIdx = when {
+                        normMapping.contains("ByPolygonVertex", ignoreCase = true) -> cornerSeq
+                        normMapping.contains("ByPolygon", ignoreCase = true) -> polySeq
+                        normMapping.contains("AllSame", ignoreCase = true) -> 0
+                        else -> safeVi
                     }.coerceIn(0, rawNormCount - 1)
                     outNorms.add(rawNorms[nIdx * 3])
                     outNorms.add(rawNorms[nIdx * 3 + 1])
@@ -696,7 +705,7 @@ object FbxAndMax3DParser {
             for (rawI in polyIdx) {
                 val isEnd = rawI < 0
                 val vi = if (isEnd) (-rawI - 1) else rawI
-                polyVertList.add(emitCorner(vi, polyVertCounter))
+                polyVertList.add(emitCorner(vi, polyVertCounter, polyIdxCounter))
                 polyVertCounter++
                 if (isEnd) {
                     if (polyVertList.size >= 3) {
@@ -707,6 +716,7 @@ object FbxAndMax3DParser {
                         }
                     }
                     polyVertList.clear()
+                    polyIdxCounter++
                 }
             }
 
@@ -809,9 +819,13 @@ object FbxAndMax3DParser {
             val vDoubles = extractSectionArray(sec, "Vertices:") ?: continue
             val pDoubles = extractSectionArray(sec, "PolygonVertexIndex:") ?: continue
             if (vDoubles.size < 9 || pDoubles.isEmpty()) continue
-            val uvDoubles = extractSectionArray(sec, "UV:")
-            val uvIdxDoubles = extractSectionArray(sec, "UVIndex:")
-            val isUvByPolyVert = Regex("MappingInformationType:\\s*\"ByPolygonVertex\"", RegexOption.IGNORE_CASE).containsMatchIn(sec)
+            val uvBlock = extractBalancedBlock(sec, "LayerElementUV:") ?: sec
+            val uvDoubles = extractSectionArray(uvBlock, "UV:")
+            val uvIdxDoubles = extractSectionArray(uvBlock, "UVIndex:")
+            val uvMappingType = Regex("MappingInformationType:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
+                .find(uvBlock)?.groupValues?.getOrNull(1) ?: ""
+            val uvRefType = Regex("ReferenceInformationType:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
+                .find(uvBlock)?.groupValues?.getOrNull(1) ?: ""
 
             val rawVerts = FloatArray(vDoubles.size) { vDoubles[it].toFloat() }
             val vCount = rawVerts.size / 3
@@ -822,6 +836,7 @@ object FbxAndMax3DParser {
             val outIndices = ArrayList<Int>()
             val poly = ArrayList<Int>(4)
             var cornerSeq = 0
+            var polySeq = 0
 
             for (rawD in pDoubles) {
                 val rawI = rawD.toInt()
@@ -832,13 +847,19 @@ object FbxAndMax3DParser {
                 outVerts.add(rawVerts[vi * 3 + 1])
                 outVerts.add(rawVerts[vi * 3 + 2])
                 if (uvDoubles != null && uvCount > 0) {
-                    val rawUvi = when {
-                        uvIdxDoubles != null && cornerSeq < uvIdxDoubles.size -> {
-                            val idxVal = uvIdxDoubles[cornerSeq].toInt()
-                            if (idxVal >= 0) idxVal else vi
-                        }
-                        isUvByPolyVert -> cornerSeq
+                    val mapKey = when {
+                        uvMappingType.contains("ByPolygonVertex", ignoreCase = true) -> cornerSeq
+                        uvMappingType.contains("ByPolygon", ignoreCase = true) -> polySeq
+                        uvMappingType.contains("AllSame", ignoreCase = true) -> 0
+                        uvMappingType.contains("ByVertice", ignoreCase = true) || uvMappingType.contains("ByVertex", ignoreCase = true) -> vi
+                        uvIdxDoubles != null -> cornerSeq
                         else -> vi
+                    }
+                    val rawUvi = if (uvIdxDoubles != null && (uvRefType.contains("IndexToDirect", ignoreCase = true) || uvRefType.isBlank())) {
+                        val idxVal = uvIdxDoubles.getOrNull(mapKey)?.toInt() ?: vi
+                        if (idxVal >= 0) idxVal else vi
+                    } else {
+                        mapKey
                     }
                     val uvi = rawUvi.coerceIn(0, uvCount - 1)
                     outUvs.add(uvDoubles[uvi * 2].toFloat())
@@ -855,6 +876,7 @@ object FbxAndMax3DParser {
                         }
                     }
                     poly.clear()
+                    polySeq++
                 }
             }
             if (outIndices.size < 3) continue
@@ -900,6 +922,26 @@ object FbxAndMax3DParser {
         }
         if (start >= 0) raw.substring(start).toDoubleOrNull()?.let { out.add(it) }
         return out
+    }
+
+    private fun extractBalancedBlock(section: String, headerKey: String): String? {
+        val idx = section.indexOf(headerKey)
+        if (idx < 0) return null
+        val openPos = section.indexOf('{', idx)
+        if (openPos < 0) return null
+        var depth = 0
+        for (i in openPos until section.length) {
+            when (section[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        return section.substring(idx, i + 1)
+                    }
+                }
+            }
+        }
+        return section.substring(idx)
     }
 
     // -------------------------------------------------------------------------

@@ -176,6 +176,21 @@ object FileImportExportManager {
 
         root.put("frames", framesArray)
 
+        if (project.symbols.isNotEmpty()) {
+            val symArr = JSONArray()
+            for (sym in project.symbols) {
+                symArr.put(symbolDefinitionToJson(sym))
+            }
+            root.put("symbols", symArr)
+        }
+        if (project.symbolInstances.isNotEmpty()) {
+            val instArr = JSONArray()
+            for (inst in project.symbolInstances) {
+                instArr.put(symbolInstanceToJson(inst))
+            }
+            root.put("symbolInstances", instArr)
+        }
+
         return if (compact) root.toString() else root.toString(2)
     }
 
@@ -346,6 +361,23 @@ object FileImportExportManager {
             )
         } else CanvasBackgroundSettings()
 
+        val symbolsParsed = mutableListOf<com.example.model.TimelineSymbolDefinition>()
+        val symArr = root.optJSONArray("symbols")
+        if (symArr != null) {
+            for (i in 0 until symArr.length()) {
+                val so = symArr.optJSONObject(i) ?: continue
+                symbolsParsed.add(jsonToSymbolDefinition(so))
+            }
+        }
+        val symbolInstancesParsed = mutableListOf<com.example.model.TimelineSymbolInstance>()
+        val instArr = root.optJSONArray("symbolInstances")
+        if (instArr != null) {
+            for (i in 0 until instArr.length()) {
+                val io = instArr.optJSONObject(i) ?: continue
+                symbolInstancesParsed.add(jsonToSymbolInstance(io))
+            }
+        }
+
         return AnimationProject(
             id = id,
             name = name,
@@ -357,6 +389,8 @@ object FileImportExportManager {
             camera3D = camera3D,
             canvasBackground = canvasBackground,
             lastActiveFrameIndex = savedActiveFrame,
+            symbols = symbolsParsed,
+            symbolInstances = symbolInstancesParsed,
             createdAt = createdAt,
             updatedAt = updatedAt
         )
@@ -677,6 +711,7 @@ object FileImportExportManager {
             put("showFloorGrid", cam.showFloorGrid)
             put("shadingMode", cam.shadingMode.name)
             put("transformSpace", cam.transformSpace.name)
+            put("isDetachedFromLayers", cam.isDetachedFromLayers)
             val kArr = JSONArray()
             cam.keyframes.forEach { kf ->
                 kArr.put(JSONObject().apply {
@@ -849,7 +884,193 @@ object FileImportExportManager {
             scene3DObjects = sceneObjsParsed,
             showFloorGrid = camObjParsed.optBoolean("showFloorGrid", true),
             shadingMode = shadingMode,
-            transformSpace = transformSpace
+            transformSpace = transformSpace,
+            isDetachedFromLayers = camObjParsed.optBoolean("isDetachedFromLayers", false)
+        )
+    }
+
+    private fun symbolDefinitionToJson(sym: com.example.model.TimelineSymbolDefinition): JSONObject {
+        return JSONObject().apply {
+            put("id", sym.id)
+            put("name", sym.name)
+            put("type", sym.type.name)
+            put("totalInternalTicks", sym.totalInternalTicks)
+            put("loopInternalAnimation", sym.loopInternalAnimation)
+            put("createdAt", sym.createdAt)
+            val fArr = JSONArray()
+            for (f in sym.internalFrames) {
+                val fo = JSONObject().apply {
+                    put("id", f.id)
+                    put("holdFrames", f.holdFrames)
+                    val la = JSONArray()
+                    for (l in f.layers) la.put(layerToJson(l))
+                    put("layers", la)
+                    if (f.localLayers.isNotEmpty()) {
+                        val lla = JSONArray()
+                        for (ll in f.localLayers) lla.put(layerToJson(ll))
+                        put("localLayers", lla)
+                    }
+                }
+                fArr.put(fo)
+            }
+            put("internalFrames", fArr)
+        }
+    }
+
+    private fun jsonToSymbolDefinition(so: JSONObject): com.example.model.TimelineSymbolDefinition {
+        val symType = try {
+            com.example.model.TimelineSymbolType.valueOf(so.optString("type", com.example.model.TimelineSymbolType.COMMON.name))
+        } catch (_: Exception) {
+            com.example.model.TimelineSymbolType.COMMON
+        }
+        val fList = ArrayList<Frame>()
+        val fArr = so.optJSONArray("internalFrames")
+        if (fArr != null) {
+            for (fi in 0 until fArr.length()) {
+                val fo = fArr.optJSONObject(fi) ?: continue
+                val layersList = ArrayList<Layer>()
+                val lArr = fo.optJSONArray("layers")
+                if (lArr != null) {
+                    for (li in 0 until lArr.length()) {
+                        lArr.optJSONObject(li)?.let { layersList.add(jsonToLayer(it, li)) }
+                    }
+                }
+                val localList = ArrayList<Layer>()
+                val llArr = fo.optJSONArray("localLayers")
+                if (llArr != null) {
+                    for (li in 0 until llArr.length()) {
+                        llArr.optJSONObject(li)?.let { localList.add(jsonToLayer(it, li, defaultNamePrefix = "Subcamada")) }
+                    }
+                }
+                fList.add(
+                    Frame(
+                        id = fo.optString("id", java.util.UUID.randomUUID().toString()),
+                        layers = if (layersList.isEmpty()) listOf(Layer()) else layersList,
+                        holdFrames = fo.optInt("holdFrames", 1).coerceAtLeast(1),
+                        localLayers = localList
+                    )
+                )
+            }
+        }
+        val safeFrames = if (fList.isEmpty()) listOf(Frame()) else fList
+        val calcTicks = safeFrames.sumOf { it.holdFrames.coerceAtLeast(1) }.coerceAtLeast(1)
+        return com.example.model.TimelineSymbolDefinition(
+            id = so.optString("id", java.util.UUID.randomUUID().toString()),
+            name = so.optString("name", "Símbolo"),
+            type = symType,
+            internalFrames = safeFrames,
+            totalInternalTicks = so.optInt("totalInternalTicks", calcTicks).coerceAtLeast(1),
+            loopInternalAnimation = so.optBoolean("loopInternalAnimation", true),
+            createdAt = so.optLong("createdAt", System.currentTimeMillis())
+        )
+    }
+
+    private fun symbolInstanceToJson(inst: com.example.model.TimelineSymbolInstance): JSONObject {
+        return JSONObject().apply {
+            put("id", inst.id)
+            put("symbolId", inst.symbolId)
+            put("name", inst.name)
+            put("startTick", inst.startTick)
+            put("durationTicks", inst.durationTicks)
+            put("autoInterpolate", inst.autoInterpolate)
+            put("isVisible", inst.isVisible)
+            val ef = inst.effects
+            put("effects", JSONObject().apply {
+                put("opacity", ef.opacity.toDouble())
+                put("tintColorArgb", ef.tintColorArgb)
+                put("tintStrength", ef.tintStrength.toDouble())
+                put("glowRadius", ef.glowRadius.toDouble())
+                put("glowColorArgb", ef.glowColorArgb)
+                put("blurRadius", ef.blurRadius.toDouble())
+                put("dropShadowRadius", ef.dropShadowRadius.toDouble())
+                put("dropShadowOffsetX", ef.dropShadowOffsetX.toDouble())
+                put("dropShadowOffsetY", ef.dropShadowOffsetY.toDouble())
+                put("dropShadowColorArgb", ef.dropShadowColorArgb)
+                put("blendEffect", ef.blendEffect.name)
+            })
+            val kArr = JSONArray()
+            inst.keyframes.forEach { kf ->
+                kArr.put(JSONObject().apply {
+                    put("frameIndex", kf.frameIndex)
+                    put("x", kf.x.toDouble())
+                    put("y", kf.y.toDouble())
+                    put("scaleX", kf.scaleX.toDouble())
+                    put("scaleY", kf.scaleY.toDouble())
+                    put("rotationZ", kf.rotationZ.toDouble())
+                    put("opacity", kf.opacity.toDouble())
+                    put("glowRadius", kf.glowRadius.toDouble())
+                    put("blurRadius", kf.blurRadius.toDouble())
+                    put("easing", kf.easing.name)
+                    put("bezierP1X", kf.bezierP1X.toDouble())
+                    put("bezierP1Y", kf.bezierP1Y.toDouble())
+                    put("bezierP2X", kf.bezierP2X.toDouble())
+                    put("bezierP2Y", kf.bezierP2Y.toDouble())
+                    put("holdTicks", kf.holdTicks)
+                })
+            }
+            put("keyframes", kArr)
+        }
+    }
+
+    private fun jsonToSymbolInstance(io: JSONObject): com.example.model.TimelineSymbolInstance {
+        val eo = io.optJSONObject("effects")
+        val effects = if (eo != null) {
+            val blend = try {
+                LayerBlendEffect.valueOf(eo.optString("blendEffect", LayerBlendEffect.NORMAL.name))
+            } catch (_: Exception) { LayerBlendEffect.NORMAL }
+            com.example.model.TimelineSymbolEffectSettings(
+                opacity = eo.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f),
+                tintColorArgb = eo.optLong("tintColorArgb", 0xFFFFFFFFL),
+                tintStrength = eo.optDouble("tintStrength", 0.0).toFloat().coerceIn(0f, 1f),
+                glowRadius = eo.optDouble("glowRadius", 0.0).toFloat().coerceIn(0f, 48f),
+                glowColorArgb = eo.optLong("glowColorArgb", 0xFF00E5FFL),
+                blurRadius = eo.optDouble("blurRadius", 0.0).toFloat().coerceIn(0f, 32f),
+                dropShadowRadius = eo.optDouble("dropShadowRadius", 0.0).toFloat().coerceIn(0f, 32f),
+                dropShadowOffsetX = eo.optDouble("dropShadowOffsetX", 4.0).toFloat(),
+                dropShadowOffsetY = eo.optDouble("dropShadowOffsetY", 4.0).toFloat(),
+                dropShadowColorArgb = eo.optLong("dropShadowColorArgb", 0xAA000000L),
+                blendEffect = blend
+            )
+        } else com.example.model.TimelineSymbolEffectSettings()
+        val kArr = io.optJSONArray("keyframes")
+        val kList = ArrayList<com.example.model.SymbolInstanceKeyframe>()
+        if (kArr != null) {
+            for (k in 0 until kArr.length()) {
+                val ko = kArr.optJSONObject(k) ?: continue
+                val easing = try {
+                    CameraEasingCurve.valueOf(ko.optString("easing", CameraEasingCurve.BEZIER_SUAVE.name))
+                } catch (_: Exception) { CameraEasingCurve.BEZIER_SUAVE }
+                kList.add(
+                    com.example.model.SymbolInstanceKeyframe(
+                        frameIndex = ko.optInt("frameIndex", 0).coerceAtLeast(0),
+                        x = ko.optDouble("x", 0.0).toFloat(),
+                        y = ko.optDouble("y", 0.0).toFloat(),
+                        scaleX = ko.optDouble("scaleX", 1.0).toFloat().coerceIn(0.05f, 20f),
+                        scaleY = ko.optDouble("scaleY", 1.0).toFloat().coerceIn(0.05f, 20f),
+                        rotationZ = ko.optDouble("rotationZ", 0.0).toFloat(),
+                        opacity = ko.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f),
+                        glowRadius = ko.optDouble("glowRadius", 0.0).toFloat().coerceIn(0f, 48f),
+                        blurRadius = ko.optDouble("blurRadius", 0.0).toFloat().coerceIn(0f, 32f),
+                        easing = easing,
+                        bezierP1X = ko.optDouble("bezierP1X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
+                        bezierP1Y = ko.optDouble("bezierP1Y", 0.1).toFloat().coerceIn(-0.4f, 1.4f),
+                        bezierP2X = ko.optDouble("bezierP2X", 0.25).toFloat().coerceIn(0.01f, 0.99f),
+                        bezierP2Y = ko.optDouble("bezierP2Y", 1.0).toFloat().coerceIn(-0.4f, 1.4f),
+                        holdTicks = ko.optInt("holdTicks", 1).coerceIn(1, 240)
+                    )
+                )
+            }
+        }
+        return com.example.model.TimelineSymbolInstance(
+            id = io.optString("id", java.util.UUID.randomUUID().toString()),
+            symbolId = io.optString("symbolId", ""),
+            name = io.optString("name", "Símbolo"),
+            startTick = io.optInt("startTick", 0).coerceAtLeast(0),
+            durationTicks = io.optInt("durationTicks", 1).coerceAtLeast(1),
+            autoInterpolate = io.optBoolean("autoInterpolate", true),
+            isVisible = io.optBoolean("isVisible", true),
+            effects = effects,
+            keyframes = if (kList.isEmpty()) listOf(com.example.model.SymbolInstanceKeyframe(frameIndex = 0)) else kList
         )
     }
 

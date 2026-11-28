@@ -419,8 +419,10 @@ object Studio3DPaintEngine {
             Estudio3DPaintTool.PINCEL, Estudio3DPaintTool.BORRACHA -> {
                 val canvas = Canvas(bmp)
                 val toolType = if (tool == Estudio3DPaintTool.BORRACHA) ToolType.ERASER else ToolType.BRUSH
-                // Avoid long jumps across UV seam edges (e.g. u wrapping 0.98 -> 0.02)
-                val isSeamJump = hypot(u1 - u0, v1 - v0) > 0.42f
+                // Avoid connecting strokes that wrap across UV seam edges (e.g. u wrapping 0.98 -> 0.02)
+                val isUWrap = kotlin.math.abs(u1 - u0) > 0.72f && ((u0 < 0.15f && u1 > 0.85f) || (u0 > 0.85f && u1 < 0.15f))
+                val isVWrap = kotlin.math.abs(v1 - v0) > 0.72f && ((v0 < 0.15f && v1 > 0.85f) || (v0 > 0.85f && v1 < 0.15f))
+                val isSeamJump = isUWrap || isVWrap
                 val pts = if (isSeamJump) {
                     listOf(StrokePoint(x1, y1, 1.0f))
                 } else {

@@ -149,6 +149,54 @@ class MultiplayerStudioEngine(
             if (roomHostIp.isNotBlank() && roomHostIp in localIps) return true
             return false
         }
+
+        private val DISALLOWED_RASTER_KEYS = listOf(
+            "\"pixelsBase64\"",
+            "\"bakedTextureBase64\"",
+            "\"bytesBase64\"",
+            "\"textureBase64\"",
+            "\"bitmapBase64\"",
+            "\"imageBase64\""
+        )
+
+        /**
+         * Verifies that high-frequency LAN canvas sync packets carry pure vector geometry / layer ops
+         * and zero heavy raster bitmap blobs.
+         */
+        fun isVectorOnlySyncPayload(jsonLine: String): Boolean {
+            if (jsonLine.isBlank()) return false
+            for (forbidden in DISALLOWED_RASTER_KEYS) {
+                if (jsonLine.contains(forbidden)) return false
+            }
+            return try {
+                val obj = JSONObject(jsonLine)
+                when (obj.optString("type")) {
+                    "STROKE", "STROKE_PREVIEW", "CURSOR", "UNDO_STROKE", "REDO_STROKE",
+                    "ADD_LAYER", "MOVE_LAYER", "ADD_FRAME", "CLEAR_FRAME",
+                    "SYNC_FRAME_LOCAL_LAYERS", "PING", "PONG" -> true
+                    else -> false
+                }
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        /**
+         * Uniformly decimates dense live-preview strokes above [maxPoints] for low-latency LAN transmission
+         * while preserving exact endpoints and brush parameters (committed STROKE packets remain 100% lossless).
+         */
+        fun decimateStrokePreview(stroke: DrawingStroke, maxPoints: Int = 200): DrawingStroke {
+            val pts = stroke.points
+            if (pts.size <= maxPoints || maxPoints < 4) return stroke
+            val out = ArrayList<StrokePoint>(maxPoints)
+            val lastIdx = pts.lastIndex
+            val step = lastIdx.toFloat() / (maxPoints - 1).toFloat()
+            for (i in 0 until maxPoints - 1) {
+                out.add(pts[(i * step).roundToInt().coerceIn(0, lastIdx)])
+            }
+            out.add(pts[lastIdx])
+            return stroke.copy(points = out)
+        }
     }
 
     // Callbacks
@@ -250,15 +298,89 @@ class MultiplayerStudioEngine(
     private val knownPeers = ConcurrentHashMap<String, KnownPeer>()
     private val seenEventIds = ConcurrentHashMap<String, Long>()
     private val lastPeerPreviewSeq = ConcurrentHashMap<String, Long>()
+    private data class IncomingLiveStroke(
+        val peerId: String,
+        val frameIndex: Int,
+        val layerIndex: Int,
+        val stroke: DrawingStroke?,
+        val isLocalLayer: Boolean
+    )
+
     private val committedStrokeIds = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val outgoingPreviewSeq = AtomicLong(0L)
     private val outboundQueueDepth = AtomicInteger(0)
     private val sessionSendChannel = Channel<Pair<String, String>>(capacity = 512)
     private var sessionSenderJob: Job? = null
+    private val hostPeerSendChannels = ConcurrentHashMap<String, Channel<Pair<String, String>>>()
+    private val hostPeerSenderJobs = ConcurrentHashMap<String, Job>()
+    private val hostPeerQueueDepths = ConcurrentHashMap<String, AtomicInteger>()
+    private val pendingIncomingCursors = ConcurrentHashMap<String, RemotePeerCursor>()
+    private val pendingIncomingLiveStrokes = ConcurrentHashMap<String, IncomingLiveStroke>()
+    private val incomingCoalesceSignal = Channel<Unit>(Channel.CONFLATED)
+    private var incomingCoalesceJob: Job? = null
     @Volatile
     private var activeRoomInfo: RemoteRoomInfo? = null
     @Volatile
     private var latestHostProject: AnimationProject? = null
+
+    private fun ensureIncomingCoalescerStarted() {
+        if (incomingCoalesceJob?.isActive == true) return
+        incomingCoalesceJob = scope.launch(Dispatchers.Main.immediate) {
+            for (ignored in incomingCoalesceSignal) {
+                if (pendingIncomingCursors.isNotEmpty()) {
+                    val keys = pendingIncomingCursors.keys.toList()
+                    for (k in keys) {
+                        val cursor = pendingIncomingCursors.remove(k) ?: continue
+                        onRemoteCursorUpdated?.invoke(cursor)
+                    }
+                }
+                if (pendingIncomingLiveStrokes.isNotEmpty()) {
+                    val keys = pendingIncomingLiveStrokes.keys.toList()
+                    for (k in keys) {
+                        val live = pendingIncomingLiveStrokes.remove(k) ?: continue
+                        onRemoteLiveStrokeUpdated?.invoke(
+                            live.peerId,
+                            live.frameIndex,
+                            live.layerIndex,
+                            live.stroke,
+                            live.isLocalLayer
+                        )
+                    }
+                }
+                delay(16L)
+            }
+        }
+    }
+
+    private fun launchHostPeerSender(connId: String, writer: BufferedWriter) {
+        val chan = Channel<Pair<String, String>>(capacity = 256)
+        val depth = AtomicInteger(0)
+        hostPeerSendChannels[connId] = chan
+        hostPeerQueueDepths[connId] = depth
+        hostPeerSenderJobs[connId]?.cancel()
+        hostPeerSenderJobs[connId] = scope.launch(KodanimaDispatchers.networkIo) {
+            for ((type, line) in chan) {
+                val rem = depth.decrementAndGet().coerceAtLeast(0)
+                if ((type == "CURSOR" || type == "STROKE_PREVIEW") && rem > 3) continue
+                if (type == "CAMERA3D_SYNC" && rem > 5) continue
+                try {
+                    writeLineThreadSafe(writer, line)
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+    }
+
+    private fun enqueueHostPeerPacket(connId: String, type: String, line: String): Boolean {
+        val chan = hostPeerSendChannels[connId] ?: return false
+        val depth = hostPeerQueueDepths[connId]
+        val curDepth = depth?.get() ?: 0
+        if ((type == "CURSOR" || type == "STROKE_PREVIEW") && curDepth > 6) return true
+        val ok = chan.trySend(type to line).isSuccess
+        if (ok) depth?.incrementAndGet()
+        return true
+    }
 
     fun bindContext(context: Context) {
         appContext = context.applicationContext
@@ -1458,6 +1580,7 @@ class MultiplayerStudioEngine(
 
                     hostClientWriters[connId] = writer
                     hostClientCloseHandles[connId] = client.closeHandle
+                    launchHostPeerSender(connId, writer)
                     val connectedGuest = ConnectedFriendInfo(
                         id = client.user.id,
                         name = client.user.name,
@@ -1513,31 +1636,34 @@ class MultiplayerStudioEngine(
                         val stroke = parseStrokeFromJson(packet.getJSONObject("stroke"))
                         committedStrokeIds.add(stroke.id)
                         if (committedStrokeIds.size > 4096) committedStrokeIds.clear()
+                        if (stroke.authorId.isNotBlank()) {
+                            pendingIncomingLiveStrokes.remove(stroke.authorId)
+                        }
                         withContext(Dispatchers.Main) {
                             onStrokeReceived?.invoke(frameIndex, layerIndex, stroke, isLocalLayer)
                         }
-                        broadcastToOtherPeers(connId, line)
+                        broadcastToOtherPeers(connId, line, "STROKE")
                     }
                     "CLEAR_FRAME" -> {
                         val frameIndex = packet.getInt("frameIndex")
                         withContext(Dispatchers.Main) {
                             onClearFrameReceived?.invoke(frameIndex)
                         }
-                        broadcastToOtherPeers(connId, line)
+                        broadcastToOtherPeers(connId, line, "CLEAR_FRAME")
                     }
                     "ADD_FRAME" -> {
                         val insertAt = packet.getInt("insertAt")
                         withContext(Dispatchers.Main) {
                             onAddFrameReceived?.invoke(insertAt)
                         }
-                        broadcastToOtherPeers(connId, line)
+                        broadcastToOtherPeers(connId, line, "ADD_FRAME")
                     }
                     "ADD_LAYER" -> {
                         val layerName = packet.optString("layerName", "Camada")
                         withContext(Dispatchers.Main) {
                             onAddLayerReceived?.invoke(layerName)
                         }
-                        broadcastToOtherPeers(connId, line)
+                        broadcastToOtherPeers(connId, line, "ADD_LAYER")
                     }
                     "MOVE_LAYER" -> {
                         val fromIndex = packet.optInt("fromIndex", -1)
@@ -1546,7 +1672,7 @@ class MultiplayerStudioEngine(
                             withContext(Dispatchers.Main) {
                                 onMoveLayerReceived?.invoke(fromIndex, toIndex)
                             }
-                            broadcastToOtherPeers(connId, line)
+                            broadcastToOtherPeers(connId, line, "MOVE_LAYER")
                         }
                     }
                     "SYNC_FRAME_LOCAL_LAYERS" -> {
@@ -1562,7 +1688,7 @@ class MultiplayerStudioEngine(
                         withContext(Dispatchers.Main) {
                             onFrameLocalLayersReceived?.invoke(frameIndex, list)
                         }
-                        broadcastToOtherPeers(connId, line)
+                        broadcastToOtherPeers(connId, line, "SYNC_FRAME_LOCAL_LAYERS")
                     }
                     "CURSOR" -> {
                         val cursor = RemotePeerCursor(
@@ -1574,10 +1700,10 @@ class MultiplayerStudioEngine(
                             y = packet.getDouble("y").toFloat(),
                             isDrawing = packet.optBoolean("isDrawing", false)
                         )
-                        withContext(Dispatchers.Main) {
-                            onRemoteCursorUpdated?.invoke(cursor)
-                        }
-                        broadcastToOtherPeers(connId, line)
+                        ensureIncomingCoalescerStarted()
+                        pendingIncomingCursors[cursor.peerId] = cursor
+                        incomingCoalesceSignal.trySend(Unit)
+                        broadcastToOtherPeers(connId, line, "CURSOR")
                     }
                     "STROKE_PREVIEW" -> {
                         val peerId = packet.optString("peerId", "")
@@ -1593,11 +1719,17 @@ class MultiplayerStudioEngine(
                             val isAlreadyCommitted = stroke != null && stroke.id in committedStrokeIds
                             if (!isOutOfOrder && !isAlreadyCommitted) {
                                 if (seq > 0L) lastPeerPreviewSeq[peerId] = seq
-                                withContext(Dispatchers.Main) {
-                                    onRemoteLiveStrokeUpdated?.invoke(peerId, frameIndex, layerIndex, stroke, isLocalLayer)
-                                }
+                                ensureIncomingCoalescerStarted()
+                                pendingIncomingLiveStrokes[peerId] = IncomingLiveStroke(
+                                    peerId = peerId,
+                                    frameIndex = frameIndex,
+                                    layerIndex = layerIndex,
+                                    stroke = stroke,
+                                    isLocalLayer = isLocalLayer
+                                )
+                                incomingCoalesceSignal.trySend(Unit)
                             }
-                            broadcastToOtherPeers(connId, line)
+                            broadcastToOtherPeers(connId, line, "STROKE_PREVIEW")
                         }
                     }
                     "BRUSH_DEF" -> {
@@ -1724,6 +1856,9 @@ class MultiplayerStudioEngine(
             }
         } catch (_: Exception) {
         } finally {
+            hostPeerSenderJobs.remove(connId)?.cancel()
+            hostPeerSendChannels.remove(connId)?.close()
+            hostPeerQueueDepths.remove(connId)
             hostClientWriters.remove(connId)
             hostClientCloseHandles.remove(connId)
             val leftPeer = hostConnectedPeers.remove(connId)
@@ -1794,12 +1929,14 @@ class MultiplayerStudioEngine(
         }
     }
 
-    private fun broadcastToOtherPeers(excludeConnId: String, line: String) {
+    private fun broadcastToOtherPeers(excludeConnId: String, line: String, type: String = "DATA") {
         hostClientWriters.forEach { (id, writer) ->
             if (id != excludeConnId) {
-                try {
-                    writeLineThreadSafe(writer, line)
-                } catch (_: Exception) {}
+                if (!enqueueHostPeerPacket(id, type, line)) {
+                    try {
+                        writeLineThreadSafe(writer, line)
+                    } catch (_: Exception) {}
+                }
             }
         }
     }
@@ -1945,6 +2082,9 @@ class MultiplayerStudioEngine(
                                 val stroke = parseStrokeFromJson(packet.getJSONObject("stroke"))
                                 committedStrokeIds.add(stroke.id)
                                 if (committedStrokeIds.size > 4096) committedStrokeIds.clear()
+                                if (stroke.authorId.isNotBlank()) {
+                                    pendingIncomingLiveStrokes.remove(stroke.authorId)
+                                }
                                 withContext(Dispatchers.Main) {
                                     onStrokeReceived?.invoke(frameIndex, layerIndex, stroke, isLocalLayer)
                                 }
@@ -2000,9 +2140,9 @@ class MultiplayerStudioEngine(
                                     y = packet.getDouble("y").toFloat(),
                                     isDrawing = packet.optBoolean("isDrawing", false)
                                 )
-                                withContext(Dispatchers.Main) {
-                                    onRemoteCursorUpdated?.invoke(cursor)
-                                }
+                                ensureIncomingCoalescerStarted()
+                                pendingIncomingCursors[cursor.peerId] = cursor
+                                incomingCoalesceSignal.trySend(Unit)
                             }
                             "STROKE_PREVIEW" -> {
                                 val peerId = packet.optString("peerId", "")
@@ -2018,9 +2158,15 @@ class MultiplayerStudioEngine(
                                     val isAlreadyCommitted = stroke != null && stroke.id in committedStrokeIds
                                     if (!isOutOfOrder && !isAlreadyCommitted) {
                                         if (seq > 0L) lastPeerPreviewSeq[peerId] = seq
-                                        withContext(Dispatchers.Main) {
-                                            onRemoteLiveStrokeUpdated?.invoke(peerId, frameIndex, layerIndex, stroke, isLocalLayer)
-                                        }
+                                        ensureIncomingCoalescerStarted()
+                                        pendingIncomingLiveStrokes[peerId] = IncomingLiveStroke(
+                                            peerId = peerId,
+                                            frameIndex = frameIndex,
+                                            layerIndex = layerIndex,
+                                            stroke = stroke,
+                                            isLocalLayer = isLocalLayer
+                                        )
+                                        incomingCoalesceSignal.trySend(Unit)
                                     }
                                 }
                             }
@@ -2207,13 +2353,17 @@ class MultiplayerStudioEngine(
         sessionSenderJob = scope.launch(KodanimaDispatchers.networkIo) {
             for ((type, packet) in sessionSendChannel) {
                 val remaining = outboundQueueDepth.decrementAndGet().coerceAtLeast(0)
-                // Coalesce stale cursor / rapid 3D camera updates under congested Wi-Fi while preserving strokes/undo/assets
-                if ((type == "CURSOR" && remaining > 12) || (type == "CAMERA3D_SYNC" && remaining > 6)) continue
+                // Coalesce stale cursor / preview / rapid 3D camera updates under congested Wi-Fi while preserving strokes/undo/layers
+                if (((type == "CURSOR" || type == "STROKE_PREVIEW") && remaining > 3) ||
+                    (type == "CAMERA3D_SYNC" && remaining > 6)
+                ) continue
                 clientWriter?.let { w ->
                     try { writeLineThreadSafe(w, packet) } catch (_: Exception) {}
                 }
-                hostClientWriters.values.forEach { w ->
-                    try { writeLineThreadSafe(w, packet) } catch (_: Exception) {}
+                hostClientWriters.forEach { (id, w) ->
+                    if (!enqueueHostPeerPacket(id, type, packet)) {
+                        try { writeLineThreadSafe(w, packet) } catch (_: Exception) {}
+                    }
                 }
             }
         }
@@ -2222,7 +2372,7 @@ class MultiplayerStudioEngine(
     private fun broadcastSessionPacket(packet: String, type: String = "DATA") {
         if (clientWriter == null && hostClientWriters.isEmpty()) return
         ensureSessionSenderStarted()
-        if (type == "CURSOR" && outboundQueueDepth.get() > 16) return
+        if ((type == "CURSOR" || type == "STROKE_PREVIEW") && outboundQueueDepth.get() > 6) return
         if (sessionSendChannel.trySend(type to packet).isSuccess) {
             outboundQueueDepth.incrementAndGet()
         }
@@ -2315,6 +2465,7 @@ class MultiplayerStudioEngine(
         isLocalLayer: Boolean = false
     ) {
         if (clientWriter == null && hostClientWriters.isEmpty()) return
+        val compactStroke = stroke?.let { decimateStrokePreview(it, maxPoints = 200) }
         val packet = JSONObject().apply {
             put("type", "STROKE_PREVIEW")
             put("peerId", peerId)
@@ -2322,8 +2473,8 @@ class MultiplayerStudioEngine(
             put("layerIndex", layerIndex)
             if (isLocalLayer) put("isLocalLayer", true)
             put("seq", outgoingPreviewSeq.incrementAndGet())
-            if (stroke != null) {
-                put("stroke", strokeToJson(stroke))
+            if (compactStroke != null) {
+                put("stroke", strokeToJson(compactStroke))
             }
         }.toString()
         broadcastSessionPacket(packet, "STROKE_PREVIEW")
@@ -2360,7 +2511,7 @@ class MultiplayerStudioEngine(
             if (isLocalLayer) put("isLocalLayer", true)
             put("strokeIds", JSONArray(strokeIds))
         }.toString()
-        broadcastSessionPacket(packet)
+        broadcastSessionPacket(packet, "UNDO_STROKE")
     }
 
     fun sendRedoRestoreStrokes(
@@ -2381,7 +2532,7 @@ class MultiplayerStudioEngine(
             if (isLocalLayer) put("isLocalLayer", true)
             put("strokes", arr)
         }.toString()
-        broadcastSessionPacket(packet)
+        broadcastSessionPacket(packet, "REDO_STROKE")
     }
 
     fun sendCursorIconUpdate(user: UserAccount) {
@@ -2496,6 +2647,15 @@ class MultiplayerStudioEngine(
         clientCloseHandle = null
         clientWriter = null
 
+        incomingCoalesceJob?.cancel()
+        incomingCoalesceJob = null
+        pendingIncomingCursors.clear()
+        pendingIncomingLiveStrokes.clear()
+        hostPeerSenderJobs.values.forEach { it.cancel() }
+        hostPeerSenderJobs.clear()
+        hostPeerSendChannels.values.forEach { it.close() }
+        hostPeerSendChannels.clear()
+        hostPeerQueueDepths.clear()
         hostClientWriters.values.forEach { w -> try { w.close() } catch (_: Exception) {} }
         hostClientWriters.clear()
         hostClientCloseHandles.values.forEach { closeFn -> try { closeFn() } catch (_: Exception) {} }

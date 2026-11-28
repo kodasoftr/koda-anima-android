@@ -82,15 +82,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.engine.Camera3DEngine
+import com.example.engine.CanvasTileEngine
 import com.example.engine.CursorBitmapWithHotspot
 import com.example.engine.CursorHelper
 import com.example.engine.HardwareCapabilitiesEngine
 import com.example.engine.KodanimaBitmapPool
+import com.example.engine.KodanimaDispatchers
 import com.example.engine.KodanimaGraphicsEngine
 import com.example.engine.MediaAssetManager
+import com.example.engine.PredictiveViewportTracker
 import com.example.engine.Studio3DPaintEngine
 import com.example.engine.ProjectedObjectBounds
 import com.example.engine.SelectionGeometryHelper
+import com.example.engine.TilePlan
+import com.example.engine.TileSliceSpec
 import com.example.engine.TimelineTrackEngine
 import com.example.model.AnimationProject
 import com.example.model.BezierNode
@@ -124,8 +129,10 @@ import com.example.model.TabletDriverSettings
 import com.example.model.ToolType
 import com.example.model.sampleCubicBezierNodesToStrokePoints
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -138,16 +145,10 @@ import kotlin.math.sqrt
 import kotlin.math.tan
 
 /**
- * Holds pooled offscreen GPU/RAM bitmaps for O(1) drawing, erasing, onion skinning,
- * and RenderThread 120 FPS zoom/pan/rotate without re-rasterizing committed strokes.
+ * Holds pooled offscreen GPU/RAM bitmaps for active incremental stroke/eraser buffers,
+ * Stage 3D layer cards, and Canvas 3D backdrops while world-space tile caching is driven by [CanvasTileEngine].
  */
 private class CanvasBitmapCache {
-    data class AdvancedCachedLayer(
-        val layer: Layer,
-        val bitmap: Bitmap,
-        val key: LayerSliceCacheKey
-    )
-
     data class Stage3DObjectCacheEntry(
         val bitmap: Bitmap,
         val bounds: ProjectedObjectBounds?,
@@ -157,34 +158,14 @@ private class CanvasBitmapCache {
     var cacheW: Int = 0
     var cacheH: Int = 0
 
-    // Full-viewport screen-resolution off-canvas caches (with overscan margin >= 4px for zero edge clipping)
+    // Viewport-sized active stroke / eraser buffers with 40px predictive overscan
     var vpW: Int = 0
     var vpH: Int = 0
     var vpScale: Float = 1f
     var vpMarginPx: Int = 0
-    val cachedProjToScreenMatrix: AndroidMatrix = AndroidMatrix()
-    var hasCachedMatrix: Boolean = false
     val activeSessionMatrix: AndroidMatrix = AndroidMatrix()
     var activeSessionVpScale: Float = 1f
     var activeSessionMarginPx: Int = 0
-
-    var onionBitmap: Bitmap? = null
-    var onionKey: Any? = null
-
-    var belowLayersBitmap: Bitmap? = null
-    var belowKey: Any? = null
-
-    var clipBaseBitmap: Bitmap? = null
-    var clipBaseKey: Any? = null
-
-    var activeLayerBitmap: Bitmap? = null
-    var activeKey: Any? = null
-
-    var aboveLayersBitmap: Bitmap? = null
-    var aboveKey: Any? = null
-
-    val aboveAdvancedLayers: MutableList<AdvancedCachedLayer> = mutableListOf()
-    var aboveAdvancedIsActive: Boolean = false
 
     var eraserWorkBitmap: Bitmap? = null
     var eraserWorkCanvas: AndroidCanvas? = null
@@ -249,47 +230,55 @@ private class CanvasBitmapCache {
         sessionMatrix: AndroidMatrix,
         sessionVpScale: Float,
         sessionMarginPx: Int = vpMarginPx,
+        activeLayers: List<Layer>,
+        projWidth: Int,
+        projHeight: Int,
+        containerWidth: Float,
+        containerHeight: Float,
+        zoom: Float,
         activeSelection: SelectionRegion = SelectionRegion(),
         densityMult: Float = 1.0f
     ) {
         activeSessionMatrix.set(sessionMatrix)
         activeSessionVpScale = sessionVpScale
         activeSessionMarginPx = sessionMarginPx
-        val base = activeLayerBitmap
         val dst = acquireOrReuseViewport(eraserWorkBitmap, AndroidColor.TRANSPARENT)
         eraserWorkBitmap = dst
         val c = eraserWorkCanvas ?: AndroidCanvas(dst)
         c.setBitmap(dst)
         eraserWorkCanvas = c
-        if (base != null && !base.isRecycled) {
-            val invCached = AndroidMatrix()
-            if (hasCachedMatrix && cachedProjToScreenMatrix.invert(invCached)) {
-                val delta = AndroidMatrix()
-                delta.setConcat(sessionMatrix, invCached)
-                val vpToScreen = AndroidMatrix().apply {
-                    setTranslate(-vpMarginPx.toFloat(), -vpMarginPx.toFloat())
-                    postScale(1f / vpScale.coerceAtLeast(0.01f), 1f / vpScale.coerceAtLeast(0.01f))
-                }
-                val screenToVp = AndroidMatrix().apply {
-                    setScale(sessionVpScale, sessionVpScale)
-                    postTranslate(sessionMarginPx.toFloat(), sessionMarginPx.toFloat())
-                }
-                val finalMat = AndroidMatrix()
-                finalMat.setConcat(delta, vpToScreen)
-                finalMat.postConcat(screenToVp)
-                c.save()
-                c.concat(finalMat)
-                c.drawBitmap(base, 0f, 0f, null)
-                c.restore()
-            } else {
-                c.drawBitmap(base, 0f, 0f, null)
-            }
+
+        val overscanScreenPx = (sessionMarginPx / sessionVpScale.coerceAtLeast(0.01f))
+            .coerceAtLeast(PredictiveViewportTracker.MAX_PREDICTIVE_OVERSCAN_PX)
+        val visibleBounds = KodanimaGraphicsEngine.computeOverscannedVisibleProjectBounds(
+            projToScreenMatrix = sessionMatrix,
+            containerWidth = containerWidth,
+            containerHeight = containerHeight,
+            screenOverscanPx = overscanScreenPx,
+            zoom = zoom.coerceAtLeast(0.05f)
+        )
+        val vpMat = AndroidMatrix(sessionMatrix).apply {
+            postScale(sessionVpScale, sessionVpScale)
+            postTranslate(sessionMarginPx.toFloat(), sessionMarginPx.toFloat())
+        }
+        if (activeLayers.isNotEmpty() && activeLayers[0].isVisible) {
+            c.save()
+            c.concat(vpMat)
+            KodanimaGraphicsEngine.drawLayerToCanvas(
+                layer = activeLayers[0],
+                canvas = c,
+                targetWidth = projWidth,
+                targetHeight = projHeight,
+                alphaMultiplier = 1.0f,
+                colorFilterOverride = null,
+                visibleBounds = visibleBounds,
+                extraStrokes = null,
+                densityMultiplier = densityMult,
+                allowOutOfBounds = true
+            )
+            c.restore()
         }
         if (activeSelection.isActive && activeSelection.capturedStrokes.isNotEmpty()) {
-            val vpMat = AndroidMatrix(sessionMatrix).apply {
-                postScale(sessionVpScale, sessionVpScale)
-                postTranslate(sessionMarginPx.toFloat(), sessionMarginPx.toFloat())
-            }
             c.save()
             c.concat(vpMat)
             c.translate(activeSelection.offsetX, activeSelection.offsetY)
@@ -334,52 +323,6 @@ private class CanvasBitmapCache {
         activeStrokeCanvas = null
     }
 
-    fun sampleEyedropperPixel(projX: Float, projY: Float): Long {
-        if (vpW <= 0 || vpH <= 0) return 0xFFFFFFFFL
-        val pts = floatArrayOf(projX, projY)
-        if (hasCachedMatrix) {
-            cachedProjToScreenMatrix.mapPoints(pts)
-        }
-        val sx = (pts[0] * vpScale + vpMarginPx).roundToInt().coerceIn(0, vpW - 1)
-        val sy = (pts[1] * vpScale + vpMarginPx).roundToInt().coerceIn(0, vpH - 1)
-        var argb = AndroidColor.WHITE
-        belowLayersBitmap?.takeIf { !it.isRecycled && sx < it.width && sy < it.height }?.let { bmp ->
-            argb = blendOver(argb, bmp.getPixel(sx, sy))
-        }
-        activeLayerBitmap?.takeIf { !it.isRecycled && sx < it.width && sy < it.height }?.let { bmp ->
-            argb = blendOver(argb, bmp.getPixel(sx, sy))
-        }
-        if (aboveAdvancedIsActive) {
-            aboveAdvancedLayers.forEach { adv ->
-                if (adv.layer.isVisible && !adv.bitmap.isRecycled && sx < adv.bitmap.width && sy < adv.bitmap.height) {
-                    argb = blendOver(argb, adv.bitmap.getPixel(sx, sy))
-                }
-            }
-        } else {
-            aboveLayersBitmap?.takeIf { !it.isRecycled && sx < it.width && sy < it.height }?.let { bmp ->
-                argb = blendOver(argb, bmp.getPixel(sx, sy))
-            }
-        }
-        return argb.toLong() and 0xFFFFFFFFL
-    }
-
-    private fun blendOver(dst: Int, src: Int): Int {
-        val sa = (src ushr 24) and 0xFF
-        if (sa == 0) return dst
-        if (sa == 255) return src
-        val invSa = 255 - sa
-        val r = (((src ushr 16) and 0xFF) * sa + ((dst ushr 16) and 0xFF) * invSa) / 255
-        val g = (((src ushr 8) and 0xFF) * sa + ((dst ushr 8) and 0xFF) * invSa) / 255
-        val b = ((src and 0xFF) * sa + (dst and 0xFF) * invSa) / 255
-        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-    }
-
-    fun clearAboveAdvanced() {
-        aboveAdvancedLayers.forEach { KodanimaBitmapPool.release(it.bitmap) }
-        aboveAdvancedLayers.clear()
-        aboveAdvancedIsActive = false
-    }
-
     fun releaseStage3D() {
         stage3DLayerBitmaps.values.forEach { KodanimaBitmapPool.release(it) }
         stage3DLayerBitmaps.clear()
@@ -416,13 +359,6 @@ private class CanvasBitmapCache {
     }
 
     fun releaseViewportLayers() {
-        KodanimaBitmapPool.release(onionBitmap); onionBitmap = null; onionKey = null
-        KodanimaBitmapPool.release(belowLayersBitmap); belowLayersBitmap = null; belowKey = null
-        KodanimaBitmapPool.release(clipBaseBitmap); clipBaseBitmap = null; clipBaseKey = null
-        KodanimaBitmapPool.release(activeLayerBitmap); activeLayerBitmap = null; activeKey = null
-        KodanimaBitmapPool.release(aboveLayersBitmap); aboveLayersBitmap = null; aboveKey = null
-        clearAboveAdvanced()
-        hasCachedMatrix = false
         endActiveSessions()
         vpW = 0
         vpH = 0
@@ -443,18 +379,6 @@ private class LiveViewportTransform(
     var panX: Float = 0f,
     var panY: Float = 0f,
     var rotation: Float = 0f
-)
-
-private data class OnionCacheKey(
-    val timelineTick: Int,
-    val enabled: Boolean,
-    val settings: OnionSkinSettings,
-    val prevLayers: List<List<Layer>>,
-    val nextLayers: List<List<Layer>>,
-    val w: Int,
-    val h: Int,
-    val densityMult: Float,
-    val vpMatrixSignature: List<Float> = emptyList()
 )
 
 private data class LayerSliceCacheKey(
@@ -935,10 +859,16 @@ fun CanvasView(
         }
     }
 
-    // Offscreen GPU-backed bitmap cache holder
+    // Offscreen GPU-backed bitmap cache holder + world-space GPU RenderNode Tile Engine
     val cacheHolder = remember { CanvasBitmapCache() }
+    val tileEngine = remember { CanvasTileEngine() }
+    val latestTilePlanRef = remember { AtomicReference<TilePlan?>(null) }
+    val latestTileSlicesRef = remember { AtomicReference<List<TileSliceSpec>>(emptyList()) }
+    val tileBuildTrigger = remember { Channel<Unit>(Channel.CONFLATED) }
+    val optimisticActiveFallbackRef = remember { AtomicReference<Triple<String?, Int, Int>?>(null) }
     DisposableEffect(Unit) {
         onDispose {
+            tileEngine.releaseAll()
             cacheHolder.releaseAll()
         }
     }
@@ -1378,294 +1308,191 @@ fun CanvasView(
             Camera3DEngine.evaluateCameraAtTick(camSettings, effectiveTickFloat)
         }
 
-        // Screen-resolution off-canvas viewport sizing with >= 4px overscan margin (zero edge clipping)
+        // Screen-resolution off-canvas active stroke/eraser buffers with 40px predictive overscan
         val vpLongest = max(containerWidth, containerHeight).coerceAtLeast(1f)
         val vpScale = if (vpLongest > maxCacheDim) maxCacheDim.toFloat() / vpLongest else 1.0f
-        val vpDims = KodanimaGraphicsEngine.computeViewportCacheDimensions(containerWidth, containerHeight, vpScale)
+        val vpDims = KodanimaGraphicsEngine.computeViewportCacheDimensions(
+            containerWidth = containerWidth,
+            containerHeight = containerHeight,
+            vpScale = vpScale,
+            overscanScreenPx = PredictiveViewportTracker.MAX_PREDICTIVE_OVERSCAN_PX
+        )
         val vpCacheW = vpDims.cacheWidth
         val vpCacheH = vpDims.cacheHeight
         val vpMarginPx = vpDims.marginPx
-        val overscanScreenPx = vpMarginPx / vpScale.coerceAtLeast(0.01f)
 
-        var settledTransformSnap by remember {
-            mutableStateOf(Triple(zoom, panX, panY) to rotation)
-        }
-        LaunchedEffect(isTransforming, zoom, panX, panY, rotation, boxW, boxH, mirrorHorizontal) {
-            if (!isTransforming) {
-                if (cacheHolder.hasCachedMatrix) {
-                    kotlinx.coroutines.delay(24L)
-                }
-                settledTransformSnap = Triple(zoom, panX, panY) to rotation
-            }
-        }
-
-        // Rebuild full-viewport screen-resolution layer & onion caches culled with overscan margin
-        LaunchedEffect(
-            vpCacheW,
-            vpCacheH,
-            vpMarginPx,
-            vpScale,
-            settledTransformSnap,
-            boxW,
-            boxH,
-            projWidth,
-            projHeight,
-            mirrorHorizontal,
+        // Partition frame layers cleanly into GPU tile slices decoupled from Pan / Rotation
+        val onionSlicesData = remember(
             currentTimelineTick,
-            currentFrameIndex,
-            activeGlobalLayerIdx,
-            currFrame,
             onionSkinEnabled,
             project.onionSkin,
-            densityMult,
-            activeSelection.isActive,
-            activeSelection.hiddenSourceStrokeIds,
-            activeSelection.outsideReplacementStrokes
+            project.resolution,
+            densityMult
         ) {
-            if (containerWidth <= 2f || containerHeight <= 2f) return@LaunchedEffect
-            cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale, vpMarginPx)
-
-            val (snapZ, snapPx, snapPy) = settledTransformSnap.first
-            val snapRot = settledTransformSnap.second
-            val safeZ = snapZ.coerceAtLeast(0.05f)
-            val snapProjToScreen = AndroidMatrix().apply {
-                setScale(boxW / projWidth, boxH / projHeight)
-                postTranslate(-boxW * 0.5f, -boxH * 0.5f)
-                postScale(if (mirrorHorizontal) -safeZ else safeZ, safeZ)
-                postRotate(snapRot)
-                postTranslate(halfContainerW + snapPx, halfContainerH + snapPy)
-            }
-            val visibleProjBounds = KodanimaGraphicsEngine.computeOverscannedVisibleProjectBounds(
-                projToScreenMatrix = snapProjToScreen,
-                containerWidth = containerWidth,
-                containerHeight = containerHeight,
-                screenOverscanPx = overscanScreenPx,
-                zoom = safeZ
-            )
-            val vpMat = AndroidMatrix(snapProjToScreen).apply {
-                postScale(vpScale, vpScale)
-                postTranslate(vpMarginPx.toFloat(), vpMarginPx.toFloat())
-            }
-            val matValues = FloatArray(9).also { snapProjToScreen.getValues(it) }.toList()
-            cacheHolder.cachedProjToScreenMatrix.set(snapProjToScreen)
-            cacheHolder.hasCachedMatrix = true
-
-            // 1. Onion Skin Cache (culled to screen, unbounded off-canvas)
             val prevCount = project.onionSkin.prevFramesCount
             val nextCount = project.onionSkin.nextFramesCount
-            val prevList = if (onionSkinEnabled && project.onionSkin.isEnabled && prevCount > 0) {
+            val enabled = onionSkinEnabled && project.onionSkin.isEnabled
+            val prevList = if (enabled && prevCount > 0) {
                 (prevCount downTo 1).map { step ->
                     TimelineTrackEngine.resolveOnionSkinLayersAtTick(project, currentTimelineTick, -step)
                 }
             } else emptyList()
-            val nextList = if (onionSkinEnabled && project.onionSkin.isEnabled && nextCount > 0) {
+            val nextList = if (enabled && nextCount > 0) {
                 (1..nextCount).map { step ->
                     TimelineTrackEngine.resolveOnionSkinLayersAtTick(project, currentTimelineTick, step)
                 }
             } else emptyList()
-
-            val oKey = OnionCacheKey(
-                currentTimelineTick,
-                onionSkinEnabled && project.onionSkin.isEnabled,
-                project.onionSkin,
-                prevList,
-                nextList,
-                vpCacheW,
-                vpCacheH,
-                densityMult,
-                matValues
+            val oHash = listOf(currentTimelineTick, enabled, project.onionSkin, prevList, nextList, project.resolution.width, project.resolution.height, densityMult).hashCode()
+            TileSliceSpec.OnionSlice(
+                contentHash = oHash,
+                settings = project.onionSkin.copy(isEnabled = enabled),
+                prevLayers = prevList,
+                nextLayers = nextList,
+                projWidth = project.resolution.width,
+                projHeight = project.resolution.height,
+                densityMult = densityMult
             )
-            if (cacheHolder.onionKey != oKey) {
-                val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.onionBitmap, AndroidColor.TRANSPARENT)
-                if (oKey.enabled && (prevList.any { it.isNotEmpty() } || nextList.any { it.isNotEmpty() })) {
-                    val c = AndroidCanvas(bmp)
-                    c.save()
-                    c.concat(vpMat)
-                    val onionOpacity = project.onionSkin.opacity
+        }
 
-                    val prevFilter = KodanimaGraphicsEngine.createOnionSkinColorFilter(project.onionSkin.prevColor)
-                    prevList.forEachIndexed { idx, fLayers ->
-                        val step = prevCount - idx
-                        val alpha = (onionOpacity * (1f - (step - 1) * 0.25f)).coerceAtLeast(0.1f)
-                        for (l in fLayers) {
-                            if (l.isVisible) {
-                                KodanimaGraphicsEngine.drawLayerToCanvas(
-                                    l, c, project.resolution.width, project.resolution.height,
-                                    alpha, prevFilter, visibleProjBounds, null, densityMult,
-                                    allowOutOfBounds = true
-                                )
-                            }
-                        }
-                    }
-
-                    val nextFilter = KodanimaGraphicsEngine.createOnionSkinColorFilter(project.onionSkin.nextColor)
-                    nextList.forEachIndexed { idx, fLayers ->
-                        val step = idx + 1
-                        val alpha = (onionOpacity * (1f - (step - 1) * 0.25f)).coerceAtLeast(0.1f)
-                        for (l in fLayers) {
-                            if (l.isVisible) {
-                                KodanimaGraphicsEngine.drawLayerToCanvas(
-                                    l, c, project.resolution.width, project.resolution.height,
-                                    alpha, nextFilter, visibleProjBounds, null, densityMult,
-                                    allowOutOfBounds = true
-                                )
-                            }
-                        }
-                    }
-                    c.restore()
-                }
-                cacheHolder.onionBitmap = bmp
-                cacheHolder.onionKey = oKey
-            }
-
-            // 2. Viewport Frame Layers (Below, Clip Base, Active, Above)
-            val belowSlice = if (combinedLayers.isNotEmpty() && activeGlobalLayerIdx > 0) {
+        val belowSlice = remember(combinedLayers, activeGlobalLayerIdx) {
+            if (combinedLayers.isNotEmpty() && activeGlobalLayerIdx > 0) {
                 combinedLayers.subList(0, activeGlobalLayerIdx)
             } else emptyList()
-            val activeSlice = if (activeGlobalLayerIdx in combinedLayers.indices) {
+        }
+        val activeSlice = remember(combinedLayers, activeGlobalLayerIdx) {
+            if (activeGlobalLayerIdx in combinedLayers.indices) {
                 listOf(combinedLayers[activeGlobalLayerIdx])
             } else emptyList()
-            val aboveSlice = if (activeGlobalLayerIdx + 1 < combinedLayers.size) {
+        }
+        val aboveSlice = remember(combinedLayers, activeGlobalLayerIdx) {
+            if (activeGlobalLayerIdx + 1 < combinedLayers.size) {
                 combinedLayers.subList(activeGlobalLayerIdx + 1, combinedLayers.size)
             } else emptyList()
+        }
 
-            val bKey = LayerSliceCacheKey(belowSlice, vpCacheW, vpCacheH, densityMult, vpMatrixSignature = matValues)
-            if (cacheHolder.belowKey != bKey) {
-                val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.belowLayersBitmap, AndroidColor.TRANSPARENT)
-                if (belowSlice.isNotEmpty()) {
-                    val c = AndroidCanvas(bmp)
-                    KodanimaGraphicsEngine.drawLayersStackToCanvas(
-                        layers = belowSlice,
-                        canvas = c,
-                        targetWidth = project.resolution.width,
-                        targetHeight = project.resolution.height,
-                        visibleBounds = visibleProjBounds,
-                        densityMultiplier = densityMult,
-                        allowOutOfBounds = true,
-                        viewportMatrix = vpMat,
-                        viewportWidth = vpCacheW,
-                        viewportHeight = vpCacheH
-                    )
-                }
-                cacheHolder.belowLayersBitmap = bmp
-                cacheHolder.belowKey = bKey
-            }
-
-            val rawActiveLayer = activeSlice.firstOrNull()
-            val clipBaseLayer = if (rawActiveLayer != null && rawActiveLayer.isClippingMask) {
+        val rawActiveLayer = activeSlice.firstOrNull()
+        val clipBaseLayer = remember(rawActiveLayer, belowSlice) {
+            if (rawActiveLayer != null && rawActiveLayer.isClippingMask) {
                 belowSlice.lastOrNull { !it.isClippingMask && it.isVisible && it.opacity > 0f }
             } else null
-            val cbSlice = if (clipBaseLayer != null) listOf(clipBaseLayer) else emptyList()
-            val cbKey = LayerSliceCacheKey(cbSlice, vpCacheW, vpCacheH, densityMult, vpMatrixSignature = matValues)
-            if (cacheHolder.clipBaseKey != cbKey) {
-                if (cbSlice.isNotEmpty()) {
-                    val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.clipBaseBitmap, AndroidColor.TRANSPARENT)
-                    val c = AndroidCanvas(bmp)
-                    c.save()
-                    c.concat(vpMat)
-                    KodanimaGraphicsEngine.drawLayerToCanvas(
-                        cbSlice[0], c, project.resolution.width, project.resolution.height,
-                        1.0f, null, visibleProjBounds, null, densityMult, allowOutOfBounds = true
-                    )
-                    c.restore()
-                    cacheHolder.clipBaseBitmap = bmp
-                } else {
-                    KodanimaBitmapPool.release(cacheHolder.clipBaseBitmap)
-                    cacheHolder.clipBaseBitmap = null
-                }
-                cacheHolder.clipBaseKey = cbKey
-            }
+        }
+        val cbSlice = remember(clipBaseLayer) {
+            if (clipBaseLayer != null) listOf(clipBaseLayer) else emptyList()
+        }
 
-            val hideIds = if (activeSelection.isActive) activeSelection.hiddenSourceStrokeIds else emptySet()
-            val outsideRepl = if (activeSelection.isActive) activeSelection.outsideReplacementStrokes else emptyList()
-            val effectiveActiveSlice = if (rawActiveLayer != null && (hideIds.isNotEmpty() || outsideRepl.isNotEmpty())) {
+        val hideIds = if (activeSelection.isActive) activeSelection.hiddenSourceStrokeIds else emptySet()
+        val outsideRepl = if (activeSelection.isActive) activeSelection.outsideReplacementStrokes else emptyList()
+        val effectiveActiveSlice = remember(rawActiveLayer, activeSlice, hideIds, outsideRepl) {
+            if (rawActiveLayer != null && (hideIds.isNotEmpty() || outsideRepl.isNotEmpty())) {
                 listOf(rawActiveLayer.copy(strokes = rawActiveLayer.strokes.filter { it.id !in hideIds } + outsideRepl))
             } else {
                 activeSlice
             }
-            val aKey = LayerSliceCacheKey(effectiveActiveSlice, vpCacheW, vpCacheH, densityMult, hideIds, outsideRepl, matValues)
-            if (cacheHolder.activeKey != aKey) {
-                val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.activeLayerBitmap, AndroidColor.TRANSPARENT)
-                if (effectiveActiveSlice.isNotEmpty()) {
-                    val l = effectiveActiveSlice[0]
-                    if (l.isVisible) {
-                        val c = AndroidCanvas(bmp)
-                        c.save()
-                        c.concat(vpMat)
-                        KodanimaGraphicsEngine.drawLayerToCanvas(
-                            l, c, project.resolution.width, project.resolution.height,
-                            1.0f, null, visibleProjBounds, null, densityMult, allowOutOfBounds = true
-                        )
-                        c.restore()
-                    }
-                }
-                cacheHolder.activeLayerBitmap = bmp
-                cacheHolder.activeKey = aKey
-            }
+        }
+        val aboveNeedsAdvanced = remember(aboveSlice) {
+            aboveSlice.any { it.isClippingMask || it.blendEffect != LayerBlendEffect.NORMAL }
+        }
 
-            val aboveNeedsAdvanced = aboveSlice.any {
-                it.isClippingMask || it.blendEffect != LayerBlendEffect.NORMAL
+        val belowSpec = remember(belowSlice, project.resolution, densityMult) {
+            val h = listOf(belowSlice, project.resolution.width, project.resolution.height, densityMult).hashCode()
+            TileSliceSpec.LayersSlice("below", h, belowSlice, project.resolution.width, project.resolution.height, densityMult)
+        }
+        val clipBaseSpec = remember(cbSlice, project.resolution, densityMult) {
+            if (cbSlice.isEmpty()) null else {
+                val h = listOf(cbSlice, project.resolution.width, project.resolution.height, densityMult).hashCode()
+                TileSliceSpec.LayersSlice("clipBase", h, cbSlice, project.resolution.width, project.resolution.height, densityMult)
             }
-            if (!aboveNeedsAdvanced) {
-                if (cacheHolder.aboveAdvancedIsActive) {
-                    cacheHolder.clearAboveAdvanced()
-                }
-                val abKey = LayerSliceCacheKey(aboveSlice, vpCacheW, vpCacheH, densityMult, vpMatrixSignature = matValues)
-                if (cacheHolder.aboveKey != abKey) {
-                    val bmp = cacheHolder.acquireOrReuseViewport(cacheHolder.aboveLayersBitmap, AndroidColor.TRANSPARENT)
-                    if (aboveSlice.isNotEmpty()) {
-                        val c = AndroidCanvas(bmp)
-                        c.save()
-                        c.concat(vpMat)
-                        for (l in aboveSlice) {
-                            if (l.isVisible) {
-                                KodanimaGraphicsEngine.drawLayerToCanvas(
-                                    l, c, project.resolution.width, project.resolution.height,
-                                    1.0f, null, visibleProjBounds, null, densityMult, allowOutOfBounds = true
-                                )
-                            }
-                        }
-                        c.restore()
-                    }
-                    cacheHolder.aboveLayersBitmap = bmp
-                    cacheHolder.aboveKey = abKey
-                }
-            } else {
-                cacheHolder.aboveKey = null
-                val oldList = cacheHolder.aboveAdvancedLayers.toList()
-                val nextList = ArrayList<CanvasBitmapCache.AdvancedCachedLayer>(aboveSlice.size)
-                for (idx in aboveSlice.indices) {
-                    val l = aboveSlice[idx]
-                    val lKey = LayerSliceCacheKey(listOf(l), vpCacheW, vpCacheH, densityMult, vpMatrixSignature = matValues)
-                    val reused = oldList.getOrNull(idx)
-                    if (reused != null && reused.key == lKey && !reused.bitmap.isRecycled) {
-                        nextList.add(reused)
-                    } else {
-                        val bmp = KodanimaBitmapPool.acquire(vpCacheW, vpCacheH, Bitmap.Config.ARGB_8888, AndroidColor.TRANSPARENT)
-                        if (l.isVisible && l.opacity > 0f) {
-                            val c = AndroidCanvas(bmp)
-                            c.save()
-                            c.concat(vpMat)
-                            KodanimaGraphicsEngine.drawLayerToCanvas(
-                                l, c, project.resolution.width, project.resolution.height,
-                                1.0f, null, visibleProjBounds, null, densityMult, allowOutOfBounds = true
-                            )
-                            c.restore()
-                        }
-                        nextList.add(CanvasBitmapCache.AdvancedCachedLayer(l, bmp, lKey))
-                    }
-                }
-                val keptBmps = nextList.map { it.bitmap }.toSet()
-                oldList.forEach { old ->
-                    if (old.bitmap !in keptBmps) {
-                        KodanimaBitmapPool.release(old.bitmap)
-                    }
-                }
-                cacheHolder.aboveAdvancedLayers.clear()
-                cacheHolder.aboveAdvancedLayers.addAll(nextList)
-                cacheHolder.aboveAdvancedIsActive = true
+        }
+        val activeSpec = remember(effectiveActiveSlice, project.resolution, densityMult) {
+            val h = listOf(effectiveActiveSlice, project.resolution.width, project.resolution.height, densityMult).hashCode()
+            TileSliceSpec.LayersSlice("active", h, effectiveActiveSlice, project.resolution.width, project.resolution.height, densityMult)
+        }
+        val aboveSimpleSpec = remember(aboveSlice, aboveNeedsAdvanced, project.resolution, densityMult) {
+            if (aboveNeedsAdvanced || aboveSlice.isEmpty()) null else {
+                val h = listOf(aboveSlice, project.resolution.width, project.resolution.height, densityMult).hashCode()
+                TileSliceSpec.LayersSlice("above", h, aboveSlice, project.resolution.width, project.resolution.height, densityMult)
             }
-            activeStrokeVersion++
+        }
+        val aboveAdvancedSpecs = remember(aboveSlice, aboveNeedsAdvanced, project.resolution, densityMult) {
+            if (!aboveNeedsAdvanced || aboveSlice.isEmpty()) emptyList() else {
+                aboveSlice.map { l ->
+                    val single = listOf(l)
+                    val h = listOf(single, project.resolution.width, project.resolution.height, densityMult).hashCode()
+                    l to TileSliceSpec.LayersSlice("above_${l.id}", h, single, project.resolution.width, project.resolution.height, densityMult)
+                }
+            }
+        }
+
+        val allTileSlices = remember(
+            onionSlicesData, belowSpec, clipBaseSpec, activeSpec, aboveSimpleSpec, aboveAdvancedSpecs
+        ) {
+            buildList {
+                if (onionSlicesData.settings.isEnabled) add(onionSlicesData)
+                if (belowSpec.layers.isNotEmpty()) add(belowSpec)
+                if (clipBaseSpec != null) add(clipBaseSpec)
+                if (activeSpec.layers.isNotEmpty()) add(activeSpec)
+                if (aboveSimpleSpec != null) add(aboveSimpleSpec)
+                aboveAdvancedSpecs.forEach { add(it.second) }
+            }
+        }
+
+        SideEffect {
+            latestTileSlicesRef.set(allTileSlices)
+            val fb = optimisticActiveFallbackRef.get()
+            if (fb != null) {
+                val curLayerId = activeLayerObj?.id
+                val curCount = activeLayerObj?.strokes?.size ?: 0
+                if (fb.first != curLayerId || curCount < fb.third) {
+                    optimisticActiveFallbackRef.set(null)
+                }
+            }
+        }
+
+        LaunchedEffect(allTileSlices, containerWidth, containerHeight, zoom, panX, panY, rotation, mirrorHorizontal) {
+            if (isCameraSideView3D || containerWidth <= 2f || containerHeight <= 2f) return@LaunchedEffect
+            val safeZ = zoom.coerceAtLeast(0.05f)
+            val mat = AndroidMatrix().apply {
+                setScale(boxW / projWidth, boxH / projHeight)
+                postTranslate(-boxW * 0.5f, -boxH * 0.5f)
+                postScale(if (mirrorHorizontal) -safeZ else safeZ, safeZ)
+                postRotate(rotation)
+                postTranslate(halfContainerW + panX, halfContainerH + panY)
+            }
+            val spp = (boxW / projWidth) * safeZ
+            tileEngine.computeTilePlan(mat, containerWidth, containerHeight, spp)?.let { plan ->
+                latestTilePlanRef.set(plan)
+            }
+            tileBuildTrigger.trySend(Unit)
+        }
+
+        // Continuous non-cancelling GPU tile rasterization worker on backgroundRender pool
+        LaunchedEffect(Unit) {
+            for (ignored in tileBuildTrigger) {
+                var builtTotal = 0
+                var pass = 0
+                while (pass < 4) {
+                    val plan = latestTilePlanRef.get() ?: break
+                    val slices = latestTileSlicesRef.get()
+                    if (slices.isEmpty()) break
+                    val built = withContext(KodanimaDispatchers.backgroundRender) {
+                        tileEngine.ensureTilesForPlan(
+                            plan = plan,
+                            slices = slices,
+                            maxTilesPerPass = 16,
+                            onBatchReady = null
+                        )
+                    }
+                    builtTotal += built
+                    if (built > 0) {
+                        activeStrokeVersion++
+                    }
+                    if (built < 16) break
+                    pass++
+                }
+                if (builtTotal > 0) {
+                    activeStrokeVersion++
+                }
+            }
         }
 
         // Background-thread 3D rasterization for off-canvas backdrop (matches active camera angle & framing at 60fps UI)
@@ -1923,6 +1750,9 @@ fun CanvasView(
         val curActiveSelClip by rememberUpdatedState(activeSelectionClipPoly)
         val curPerspSettings by rememberUpdatedState(perspectiveRulerSettings)
         val curTabletSettings by rememberUpdatedState(tabletSettings)
+        val curEffectiveActiveSlice by rememberUpdatedState(effectiveActiveSlice)
+        val curActiveSpecHash by rememberUpdatedState(activeSpec.contentHash)
+        val curCombinedLayers by rememberUpdatedState(combinedLayers)
         val curOnTransformChange by rememberUpdatedState(onTransformChange)
         val curOnCameraDelta by rememberUpdatedState(onCameraTransformDelta)
         val curCamNavTarget by rememberUpdatedState(cameraViewportNavTarget)
@@ -2305,6 +2135,7 @@ fun CanvasView(
                                                 liveTf.panX += compensatedPanX
                                                 liveTf.panY += compensatedPanY
                                                 liveTf.rotation += angleDiff
+                                                tileEngine.recordTransformDelta(compensatedPanX, compensatedPanY, effZoomFactor)
                                                 curOnTransformChange(effZoomFactor, compensatedPanX, compensatedPanY, angleDiff)
                                             }
                                         }
@@ -2639,7 +2470,20 @@ fun CanvasView(
                                 }
 
                                 if (curSelectedTool == ToolType.EYEDROPPER) {
-                                    curOnEyedropper(cacheHolder.sampleEyedropperPixel(projPt.x, projPt.y))
+                                    val baseBg = if (project.canvasBackground.style == CanvasBackgroundStyle.SOLIDO) {
+                                        project.canvasBackground.primaryColor.toInt()
+                                    } else AndroidColor.WHITE
+                                    curOnEyedropper(
+                                        tileEngine.sampleProjectPixelAt(
+                                            layers = curCombinedLayers,
+                                            projWidth = project.resolution.width,
+                                            projHeight = project.resolution.height,
+                                            projX = projPt.x,
+                                            projY = projPt.y,
+                                            densityMult = densityMult,
+                                            baseBackgroundColor = baseBg
+                                        )
+                                    )
                                     isDrawingActive = false
                                     return@pointerInteropFilter true
                                 }
@@ -2693,6 +2537,12 @@ fun CanvasView(
                                         sessionMatrix = projToScreenMatrix,
                                         sessionVpScale = vpScale,
                                         sessionMarginPx = vpMarginPx,
+                                        activeLayers = curEffectiveActiveSlice,
+                                        projWidth = project.resolution.width,
+                                        projHeight = project.resolution.height,
+                                        containerWidth = containerWidth,
+                                        containerHeight = containerHeight,
+                                        zoom = liveTf.zoom,
                                         activeSelection = curActiveSel,
                                         densityMult = densityMult
                                     )
@@ -2851,6 +2701,7 @@ fun CanvasView(
                                     val dy = motionEvent.y - lastMiddlePanPos.y
                                     liveTf.panX += dx
                                     liveTf.panY += dy
+                                    tileEngine.recordTransformDelta(dx, dy, 1f)
                                     curOnTransformChange(1.0f, dx, dy, 0f)
                                     lastMiddlePanPos = Offset(motionEvent.x, motionEvent.y)
                                     return@pointerInteropFilter true
@@ -2860,6 +2711,7 @@ fun CanvasView(
                                     val dy = motionEvent.y - lastCamCanvasPanPos.y
                                     liveTf.panX += dx
                                     liveTf.panY += dy
+                                    tileEngine.recordTransformDelta(dx, dy, 1f)
                                     curOnTransformChange(1.0f, dx, dy, 0f)
                                     lastCamCanvasPanPos = Offset(motionEvent.x, motionEvent.y)
                                     return@pointerInteropFilter true
@@ -3127,40 +2979,17 @@ fun CanvasView(
                                         )
                                         val canCommitLocally = curActiveLayer?.isLocked != true && curActiveLayer?.isVisible != false
                                         if (canCommitLocally) {
-                                            cacheHolder.ensureViewportSize(vpCacheW, vpCacheH, vpScale, vpMarginPx)
-                                            val targetBmp = cacheHolder.activeLayerBitmap?.takeIf { !it.isRecycled }
-                                                ?: cacheHolder.acquireOrReuseViewport(null, AndroidColor.TRANSPARENT).also {
-                                                    cacheHolder.activeLayerBitmap = it
-                                                }
-                                            val commitCanvas = AndroidCanvas(targetBmp)
-                                            val eraserBuf = cacheHolder.eraserWorkBitmap
-                                            if (curSelectedTool == ToolType.ERASER && eraserBuf != null && !eraserBuf.isRecycled) {
-                                                flushIncrementalRaster()
-                                                commitCanvas.drawBitmap(eraserBuf, 0f, 0f, overlayScratch.srcCopyPaint)
-                                                cacheHolder.cachedProjToScreenMatrix.set(cacheHolder.activeSessionMatrix)
-                                                cacheHolder.hasCachedMatrix = true
-                                            } else {
-                                                val commitMat = if (cacheHolder.hasCachedMatrix) {
-                                                    AndroidMatrix(cacheHolder.cachedProjToScreenMatrix)
-                                                } else {
-                                                    AndroidMatrix(cacheHolder.activeSessionMatrix).also {
-                                                        cacheHolder.cachedProjToScreenMatrix.set(it)
-                                                        cacheHolder.hasCachedMatrix = true
-                                                    }
-                                                }
-                                                commitMat.postScale(cacheHolder.vpScale, cacheHolder.vpScale)
-                                                commitMat.postTranslate(cacheHolder.vpMarginPx.toFloat(), cacheHolder.vpMarginPx.toFloat())
-                                                commitCanvas.save()
-                                                commitCanvas.concat(commitMat)
-                                                KodanimaGraphicsEngine.drawStrokeToCanvas(
-                                                    completedStroke,
-                                                    commitCanvas,
-                                                    1.0f,
-                                                    null,
-                                                    densityMult
-                                                )
-                                                commitCanvas.restore()
-                                            }
+                                            val prevHash = curActiveSpecHash
+                                            val prevCount = curActiveLayer?.strokes?.size ?: 0
+                                            tileEngine.stampStrokeIntoCachedTiles(
+                                                sliceTag = "active",
+                                                contentHash = prevHash,
+                                                stroke = completedStroke,
+                                                densityMult = densityMult
+                                            )
+                                            optimisticActiveFallbackRef.set(
+                                                Triple(curActiveLayer?.id, prevHash, prevCount + 1)
+                                            )
                                             curOnStrokeCompleted(completedStroke)
                                         }
                                     }
@@ -3242,6 +3071,7 @@ fun CanvasView(
                                         liveTf.zoom = nextZoom
                                         liveTf.panX += compX
                                         liveTf.panY += compY
+                                        tileEngine.recordTransformDelta(compX, compY, effFactor)
                                         curOnTransformChange(effFactor, compX, compY, 0f)
                                         return@pointerInteropFilter true
                                     }
@@ -3443,7 +3273,7 @@ fun CanvasView(
                     }
                 }
 
-                // Layer 1: Full-Viewport Unclipped Cached GPU Layer Compositing (screen-resolution, unbounded off-canvas drawing)
+                // Layer 1: GPU-Accelerated World-Space Tile Compositing (RenderNode DisplayLists + Predictive Pan + Zoom Culling)
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
@@ -3460,28 +3290,18 @@ fun CanvasView(
                         postRotate(rotation)
                         postTranslate(halfContainerW + panX, halfContainerH + panY)
                     }
-                    val invCached = overlayScratch.invMatrixScratch
-                    val hasDelta = cacheHolder.hasCachedMatrix && cacheHolder.cachedProjToScreenMatrix.invert(invCached)
-                    val deltaMat = overlayScratch.deltaMatrixScratch
-                    if (hasDelta) {
-                        deltaMat.setConcat(liveMat, invCached)
-                    } else {
-                        deltaMat.reset()
-                    }
-
-                    val screenPxPerProjPx = (boxW / projWidth) * zoom
+                    val screenPxPerProjPx = (boxW / projWidth) * safeZ
                     overlayScratch.bitmapPaint.isFilterBitmap = screenPxPerProjPx < 4.0f
-                    val drawVpW = cacheHolder.vpW.coerceAtLeast(1)
-                    val drawVpH = cacheHolder.vpH.coerceAtLeast(1)
-                    val invVpScale = 1f / cacheHolder.vpScale.coerceAtLeast(0.01f)
-                    val marginScreen = cacheHolder.vpMarginPx * invVpScale
-                    overlayScratch.srcRect.set(0, 0, drawVpW, drawVpH)
-                    overlayScratch.dstRectF.set(
-                        -marginScreen,
-                        -marginScreen,
-                        drawVpW * invVpScale - marginScreen,
-                        drawVpH * invVpScale - marginScreen
+                    val livePlan = tileEngine.computeTilePlan(
+                        projToScreenMatrix = liveMat,
+                        containerWidth = size.width,
+                        containerHeight = size.height,
+                        screenPxPerProjPx = screenPxPerProjPx
                     )
+                    if (livePlan != null) {
+                        latestTilePlanRef.set(livePlan)
+                        tileBuildTrigger.trySend(Unit)
+                    }
 
                     val isBgTransparent = project.canvasBackground.style == CanvasBackgroundStyle.TRANSPARENTE
                     val show3DBg = project.canvasBackground.show3DInCanvas
@@ -3489,25 +3309,33 @@ fun CanvasView(
                     val activeBlend = activeLayerObj?.blendEffect ?: LayerBlendEffect.NORMAL
                     val needsLayerStackBlend = activeIsClip ||
                         activeBlend != LayerBlendEffect.NORMAL ||
-                        cacheHolder.aboveAdvancedIsActive
+                        aboveNeedsAdvanced
 
                     var layerStackSaveCount = -1
                     if (needsLayerStackBlend && (effectiveFloatingRefBelow || isBgTransparent || show3DBg)) {
                         layerStackSaveCount = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
                     }
 
-                    nativeCanvas.save()
-                    if (hasDelta) nativeCanvas.concat(deltaMat)
-
-                    cacheHolder.onionBitmap?.takeIf { !it.isRecycled && onionSkinEnabled && project.onionSkin.isEnabled }?.let { bmp ->
-                        overlayScratch.srcRect.set(0, 0, bmp.width, bmp.height)
-                        nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                    if (livePlan != null) {
+                        if (onionSlicesData.settings.isEnabled) {
+                            tileEngine.drawSliceTiles(
+                                canvas = nativeCanvas,
+                                liveProjToScreen = liveMat,
+                                plan = livePlan,
+                                sliceTag = "onion",
+                                contentHash = onionSlicesData.contentHash
+                            )
+                        }
+                        if (belowSpec.layers.isNotEmpty()) {
+                            tileEngine.drawSliceTiles(
+                                canvas = nativeCanvas,
+                                liveProjToScreen = liveMat,
+                                plan = livePlan,
+                                sliceTag = "below",
+                                contentHash = belowSpec.contentHash
+                            )
+                        }
                     }
-                    cacheHolder.belowLayersBitmap?.takeIf { !it.isRecycled }?.let { bmp ->
-                        overlayScratch.srcRect.set(0, 0, bmp.width, bmp.height)
-                        nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
-                    }
-                    nativeCanvas.restore()
 
                     if (gridRulerSettings.isEnabled && gridRulerSettings.renderBehindActiveLayer) {
                         nativeCanvas.save()
@@ -3549,88 +3377,176 @@ fun CanvasView(
                         nativeCanvas.restore()
                     }
 
-                    // Active layer (isolated viewport eraser buffer when erasing, or cached committed layer)
-                    val isUsingEraserBuf = isDrawingActive && selectedTool == ToolType.ERASER && cacheHolder.eraserWorkBitmap != null
-                    val activeBmp = if (isUsingEraserBuf) cacheHolder.eraserWorkBitmap else cacheHolder.activeLayerBitmap
-                    val clipBaseBmp = cacheHolder.clipBaseBitmap?.takeIf { !it.isRecycled }
+                    // Active layer (isolated viewport eraser buffer when erasing, or cached world-space GPU tiles)
+                    val isUsingEraserBuf = isDrawingActive && selectedTool == ToolType.ERASER &&
+                        cacheHolder.eraserWorkBitmap != null && !cacheHolder.eraserWorkBitmap!!.isRecycled
+                    val activeFallbackHash = optimisticActiveFallbackRef.get()?.takeIf {
+                        it.first == activeLayerObj?.id
+                    }?.second
 
-                    if (activeBmp != null && !activeBmp.isRecycled && (activeLayerObj?.isVisible != false)) {
-                        val invActive = AndroidMatrix()
-                        val useActiveDelta = if (isUsingEraserBuf && cacheHolder.activeSessionMatrix.invert(invActive)) {
-                            overlayScratch.vpMatrixScratch.setConcat(liveMat, invActive)
-                            true
-                        } else hasDelta
-                        val activeMat = if (isUsingEraserBuf && useActiveDelta) overlayScratch.vpMatrixScratch else deltaMat
-                        overlayScratch.srcRect.set(0, 0, activeBmp.width, activeBmp.height)
+                    if (activeLayerObj?.isVisible != false) {
+                        if (isUsingEraserBuf) {
+                            val activeBmp = cacheHolder.eraserWorkBitmap!!
+                            val invSess = overlayScratch.invMatrixScratch
+                            val hasSessDelta = cacheHolder.activeSessionMatrix.invert(invSess)
+                            val activeMat = overlayScratch.vpMatrixScratch
+                            if (hasSessDelta) activeMat.setConcat(liveMat, invSess) else activeMat.reset()
+                            val invVpScale = 1f / cacheHolder.activeSessionVpScale.coerceAtLeast(0.01f)
+                            val marginScreen = cacheHolder.activeSessionMarginPx * invVpScale
+                            overlayScratch.srcRect.set(0, 0, activeBmp.width, activeBmp.height)
+                            overlayScratch.dstRectF.set(
+                                -marginScreen,
+                                -marginScreen,
+                                activeBmp.width * invVpScale - marginScreen,
+                                activeBmp.height * invVpScale - marginScreen
+                            )
 
-                        nativeCanvas.save()
-                        if (useActiveDelta) nativeCanvas.concat(activeMat)
-                        if (!activeIsClip && activeBlend == LayerBlendEffect.NORMAL) {
-                            nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
-                        } else if (!activeIsClip) {
-                            overlayScratch.layerBlendPaint.alpha = 255
-                            KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
-                            nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
-                        } else if (clipBaseBmp != null) {
-                            overlayScratch.layerBlendPaint.alpha = 255
-                            KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
-                            val sc = nativeCanvas.saveLayer(overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
-                            nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
-                            nativeCanvas.restore()
                             nativeCanvas.save()
-                            if (hasDelta) nativeCanvas.concat(deltaMat)
-                            overlayScratch.srcRect.set(0, 0, clipBaseBmp.width, clipBaseBmp.height)
-                            nativeCanvas.drawBitmap(clipBaseBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
-                            nativeCanvas.restoreToCount(sc)
+                            if (hasSessDelta) nativeCanvas.concat(activeMat)
+                            if (!activeIsClip && activeBlend == LayerBlendEffect.NORMAL) {
+                                nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                            } else if (!activeIsClip) {
+                                overlayScratch.layerBlendPaint.alpha = 255
+                                KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
+                                nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
+                            } else if (clipBaseSpec != null && livePlan != null) {
+                                nativeCanvas.restore()
+                                overlayScratch.layerBlendPaint.alpha = 255
+                                KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
+                                val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
+                                nativeCanvas.save()
+                                if (hasSessDelta) nativeCanvas.concat(activeMat)
+                                nativeCanvas.drawBitmap(activeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                                nativeCanvas.restore()
+                                tileEngine.drawSliceTiles(
+                                    canvas = nativeCanvas,
+                                    liveProjToScreen = liveMat,
+                                    plan = livePlan,
+                                    sliceTag = "clipBase",
+                                    contentHash = clipBaseSpec.contentHash,
+                                    paintOverride = overlayScratch.clipDstInPaint
+                                )
+                                nativeCanvas.restoreToCount(sc)
+                                nativeCanvas.save()
+                            }
+                            nativeCanvas.restore()
+                        } else if (livePlan != null && activeSpec.layers.isNotEmpty()) {
+                            if (!activeIsClip && activeBlend == LayerBlendEffect.NORMAL) {
+                                tileEngine.drawSliceTiles(
+                                    canvas = nativeCanvas,
+                                    liveProjToScreen = liveMat,
+                                    plan = livePlan,
+                                    sliceTag = "active",
+                                    contentHash = activeSpec.contentHash,
+                                    fallbackContentHash = activeFallbackHash
+                                )
+                            } else if (!activeIsClip) {
+                                overlayScratch.layerBlendPaint.alpha = 255
+                                KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
+                                val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
+                                tileEngine.drawSliceTiles(
+                                    canvas = nativeCanvas,
+                                    liveProjToScreen = liveMat,
+                                    plan = livePlan,
+                                    sliceTag = "active",
+                                    contentHash = activeSpec.contentHash,
+                                    fallbackContentHash = activeFallbackHash
+                                )
+                                nativeCanvas.restoreToCount(sc)
+                            } else if (clipBaseSpec != null) {
+                                overlayScratch.layerBlendPaint.alpha = 255
+                                KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, activeBlend)
+                                val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
+                                tileEngine.drawSliceTiles(
+                                    canvas = nativeCanvas,
+                                    liveProjToScreen = liveMat,
+                                    plan = livePlan,
+                                    sliceTag = "active",
+                                    contentHash = activeSpec.contentHash,
+                                    fallbackContentHash = activeFallbackHash
+                                )
+                                tileEngine.drawSliceTiles(
+                                    canvas = nativeCanvas,
+                                    liveProjToScreen = liveMat,
+                                    plan = livePlan,
+                                    sliceTag = "clipBase",
+                                    contentHash = clipBaseSpec.contentHash,
+                                    paintOverride = overlayScratch.clipDstInPaint
+                                )
+                                nativeCanvas.restoreToCount(sc)
+                            }
                         }
-                        nativeCanvas.restore()
                     }
 
-                    nativeCanvas.save()
-                    if (hasDelta) nativeCanvas.concat(deltaMat)
-                    if (!cacheHolder.aboveAdvancedIsActive) {
-                        cacheHolder.aboveLayersBitmap?.takeIf { !it.isRecycled }?.let { bmp ->
-                            overlayScratch.srcRect.set(0, 0, bmp.width, bmp.height)
-                            nativeCanvas.drawBitmap(bmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
-                        }
-                    } else {
-                        var lastNonClippedBmp: Bitmap? = when {
-                            activeLayerObj != null && !activeLayerObj.isClippingMask && activeLayerObj.isVisible && activeLayerObj.opacity > 0f -> activeBmp
-                            activeLayerObj != null && activeLayerObj.isClippingMask -> clipBaseBmp
-                            else -> null
-                        }
-                        cacheHolder.aboveAdvancedLayers.forEach { adv ->
-                            val advLayer = adv.layer
-                            if (!advLayer.isClippingMask) {
-                                if (!advLayer.isVisible || advLayer.opacity <= 0f || adv.bitmap.isRecycled) {
-                                    lastNonClippedBmp = null
-                                } else {
-                                    lastNonClippedBmp = adv.bitmap
-                                    overlayScratch.srcRect.set(0, 0, adv.bitmap.width, adv.bitmap.height)
-                                    if (advLayer.blendEffect == LayerBlendEffect.NORMAL) {
-                                        nativeCanvas.drawBitmap(adv.bitmap, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
+                    // Above layers
+                    if (livePlan != null) {
+                        if (!aboveNeedsAdvanced && aboveSimpleSpec != null) {
+                            tileEngine.drawSliceTiles(
+                                canvas = nativeCanvas,
+                                liveProjToScreen = liveMat,
+                                plan = livePlan,
+                                sliceTag = "above",
+                                contentHash = aboveSimpleSpec.contentHash
+                            )
+                        } else if (aboveNeedsAdvanced) {
+                            var lastNonClippedSpec: TileSliceSpec.LayersSlice? = when {
+                                activeLayerObj != null && !activeLayerObj.isClippingMask && activeLayerObj.isVisible && activeLayerObj.opacity > 0f -> activeSpec
+                                activeLayerObj != null && activeLayerObj.isClippingMask -> clipBaseSpec
+                                else -> null
+                            }
+                            aboveAdvancedSpecs.forEach { (advLayer, advSpec) ->
+                                if (!advLayer.isClippingMask) {
+                                    if (!advLayer.isVisible || advLayer.opacity <= 0f) {
+                                        lastNonClippedSpec = null
                                     } else {
-                                        overlayScratch.layerBlendPaint.alpha = 255
-                                        KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, advLayer.blendEffect)
-                                        nativeCanvas.drawBitmap(adv.bitmap, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
+                                        lastNonClippedSpec = advSpec
+                                        if (advLayer.blendEffect == LayerBlendEffect.NORMAL) {
+                                            tileEngine.drawSliceTiles(
+                                                canvas = nativeCanvas,
+                                                liveProjToScreen = liveMat,
+                                                plan = livePlan,
+                                                sliceTag = advSpec.sliceTag,
+                                                contentHash = advSpec.contentHash
+                                            )
+                                        } else {
+                                            overlayScratch.layerBlendPaint.alpha = 255
+                                            KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, advLayer.blendEffect)
+                                            val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
+                                            tileEngine.drawSliceTiles(
+                                                canvas = nativeCanvas,
+                                                liveProjToScreen = liveMat,
+                                                plan = livePlan,
+                                                sliceTag = advSpec.sliceTag,
+                                                contentHash = advSpec.contentHash
+                                            )
+                                            nativeCanvas.restoreToCount(sc)
+                                        }
                                     }
-                                }
-                            } else if (advLayer.isVisible && advLayer.opacity > 0f && !adv.bitmap.isRecycled) {
-                                val maskBmp = lastNonClippedBmp
-                                if (maskBmp != null && !maskBmp.isRecycled) {
+                                } else if (advLayer.isVisible && advLayer.opacity > 0f && lastNonClippedSpec != null) {
+                                    val maskSpec = lastNonClippedSpec!!
                                     overlayScratch.layerBlendPaint.alpha = 255
                                     KodanimaGraphicsEngine.applyLayerBlendMode(overlayScratch.layerBlendPaint, advLayer.blendEffect)
-                                    val sc = nativeCanvas.saveLayer(overlayScratch.dstRectF, overlayScratch.layerBlendPaint)
-                                    overlayScratch.srcRect.set(0, 0, adv.bitmap.width, adv.bitmap.height)
-                                    nativeCanvas.drawBitmap(adv.bitmap, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
-                                    overlayScratch.srcRect.set(0, 0, maskBmp.width, maskBmp.height)
-                                    nativeCanvas.drawBitmap(maskBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
+                                    val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, overlayScratch.layerBlendPaint)
+                                    tileEngine.drawSliceTiles(
+                                        canvas = nativeCanvas,
+                                        liveProjToScreen = liveMat,
+                                        plan = livePlan,
+                                        sliceTag = advSpec.sliceTag,
+                                        contentHash = advSpec.contentHash
+                                    )
+                                    tileEngine.drawSliceTiles(
+                                        canvas = nativeCanvas,
+                                        liveProjToScreen = liveMat,
+                                        plan = livePlan,
+                                        sliceTag = maskSpec.sliceTag,
+                                        contentHash = maskSpec.contentHash,
+                                        paintOverride = overlayScratch.clipDstInPaint
+                                    )
                                     nativeCanvas.restoreToCount(sc)
                                 }
                             }
                         }
                     }
-                    nativeCanvas.restore()
 
                     if (layerStackSaveCount != -1) {
                         nativeCanvas.restoreToCount(layerStackSaveCount)
@@ -3659,7 +3575,7 @@ fun CanvasView(
                         postTranslate(halfContainerW + panX, halfContainerH + panY)
                     }
                     val activeIsClip = activeLayerObj?.isClippingMask == true
-                    val activeClipMaskBmp = if (activeIsClip) cacheHolder.clipBaseBitmap?.takeIf { !it.isRecycled } else null
+                    val activeClipPlan = if (activeIsClip && clipBaseSpec != null) latestTilePlanRef.get() else null
 
                     // Render captured strokes of an active selection BEFORE the live stroke
                     val hideCapturedForLiveEraser = isDrawingActive && selectedTool == ToolType.ERASER
@@ -3716,30 +3632,20 @@ fun CanvasView(
                                 activeStrokeBmp.width * invSessVp - sessMarginScreen,
                                 activeStrokeBmp.height * invSessVp - sessMarginScreen
                             )
-                            if (activeIsClip && activeClipMaskBmp != null) {
-                                val invCached = AndroidMatrix()
-                                val hasCachedDelta = cacheHolder.hasCachedMatrix && cacheHolder.cachedProjToScreenMatrix.invert(invCached)
+                            if (activeIsClip && clipBaseSpec != null && activeClipPlan != null) {
                                 val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
                                 nativeCanvas.save()
                                 if (hasSessDelta) nativeCanvas.concat(sessDelta)
                                 nativeCanvas.drawBitmap(activeStrokeBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.bitmapPaint)
                                 nativeCanvas.restore()
-                                nativeCanvas.save()
-                                if (hasCachedDelta) {
-                                    val cDelta = AndroidMatrix().apply { setConcat(liveMat, invCached) }
-                                    nativeCanvas.concat(cDelta)
-                                }
-                                val invVpScaleMask = 1f / cacheHolder.vpScale.coerceAtLeast(0.01f)
-                                val marginScreenMask = cacheHolder.vpMarginPx * invVpScaleMask
-                                overlayScratch.srcRect.set(0, 0, activeClipMaskBmp.width, activeClipMaskBmp.height)
-                                overlayScratch.dstRectF.set(
-                                    -marginScreenMask,
-                                    -marginScreenMask,
-                                    activeClipMaskBmp.width * invVpScaleMask - marginScreenMask,
-                                    activeClipMaskBmp.height * invVpScaleMask - marginScreenMask
+                                tileEngine.drawSliceTiles(
+                                    canvas = nativeCanvas,
+                                    liveProjToScreen = liveMat,
+                                    plan = activeClipPlan,
+                                    sliceTag = "clipBase",
+                                    contentHash = clipBaseSpec.contentHash,
+                                    paintOverride = overlayScratch.clipDstInPaint
                                 )
-                                nativeCanvas.drawBitmap(activeClipMaskBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
-                                nativeCanvas.restore()
                                 nativeCanvas.restoreToCount(sc)
                             } else if (!activeIsClip) {
                                 nativeCanvas.save()
@@ -3761,30 +3667,20 @@ fun CanvasView(
                                 clipBoundsWidth = projWidth,
                                 clipBoundsHeight = projHeight
                             )
-                            if (activeIsClip && activeClipMaskBmp != null) {
-                                val invCached = overlayScratch.invMatrixScratch
-                                val hasCachedDelta = cacheHolder.hasCachedMatrix && cacheHolder.cachedProjToScreenMatrix.invert(invCached)
+                            if (activeIsClip && clipBaseSpec != null && activeClipPlan != null) {
                                 val sc = nativeCanvas.saveLayer(0f, 0f, size.width, size.height, null)
                                 nativeCanvas.save()
                                 nativeCanvas.concat(liveMat)
                                 KodanimaGraphicsEngine.drawStrokeToCanvas(previewStroke, nativeCanvas, 1.0f, null, densityMult)
                                 nativeCanvas.restore()
-                                nativeCanvas.save()
-                                if (hasCachedDelta) {
-                                    overlayScratch.deltaMatrixScratch.setConcat(liveMat, invCached)
-                                    nativeCanvas.concat(overlayScratch.deltaMatrixScratch)
-                                }
-                                val invVpScaleMask = 1f / cacheHolder.vpScale.coerceAtLeast(0.01f)
-                                val marginScreenMask = cacheHolder.vpMarginPx * invVpScaleMask
-                                overlayScratch.srcRect.set(0, 0, activeClipMaskBmp.width, activeClipMaskBmp.height)
-                                overlayScratch.dstRectF.set(
-                                    -marginScreenMask,
-                                    -marginScreenMask,
-                                    activeClipMaskBmp.width * invVpScaleMask - marginScreenMask,
-                                    activeClipMaskBmp.height * invVpScaleMask - marginScreenMask
+                                tileEngine.drawSliceTiles(
+                                    canvas = nativeCanvas,
+                                    liveProjToScreen = liveMat,
+                                    plan = activeClipPlan,
+                                    sliceTag = "clipBase",
+                                    contentHash = clipBaseSpec.contentHash,
+                                    paintOverride = overlayScratch.clipDstInPaint
                                 )
-                                nativeCanvas.drawBitmap(activeClipMaskBmp, overlayScratch.srcRect, overlayScratch.dstRectF, overlayScratch.clipDstInPaint)
-                                nativeCanvas.restore()
                                 nativeCanvas.restoreToCount(sc)
                             } else if (!activeIsClip) {
                                 nativeCanvas.save()

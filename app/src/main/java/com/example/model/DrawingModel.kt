@@ -324,6 +324,73 @@ data class CanvasBackgroundSettings(
     val canvas3DRenderMode: Canvas3DBackgroundRenderMode = Canvas3DBackgroundRenderMode.STATIC_2D_CACHE
 )
 
+enum class TimelineSymbolType(val labelPt: String) {
+    COMMON("Símbolo Comum"),
+    EFFECTS("Símbolo com Efeitos")
+}
+
+data class TimelineSymbolEffectSettings(
+    val opacity: Float = 1.0f,
+    val tintColorArgb: Long = 0xFFFFFFFFL,
+    val tintStrength: Float = 0.0f,
+    val glowRadius: Float = 0.0f,
+    val glowColorArgb: Long = 0xFF00E5FFL,
+    val blurRadius: Float = 0.0f,
+    val dropShadowRadius: Float = 0.0f,
+    val dropShadowOffsetX: Float = 4.0f,
+    val dropShadowOffsetY: Float = 4.0f,
+    val dropShadowColorArgb: Long = 0xAA000000L,
+    val blendEffect: LayerBlendEffect = LayerBlendEffect.NORMAL
+) {
+    fun hasVisualEffects(): Boolean =
+        opacity < 0.995f ||
+            tintStrength > 0.01f ||
+            glowRadius > 0.2f ||
+            blurRadius > 0.2f ||
+            dropShadowRadius > 0.2f ||
+            blendEffect != LayerBlendEffect.NORMAL
+}
+
+data class SymbolInstanceKeyframe(
+    val frameIndex: Int = 0,
+    val x: Float = 0f,
+    val y: Float = 0f,
+    val scaleX: Float = 1f,
+    val scaleY: Float = 1f,
+    val rotationZ: Float = 0f,
+    val opacity: Float = 1f,
+    val glowRadius: Float = 0f,
+    val blurRadius: Float = 0f,
+    val easing: CameraEasingCurve = CameraEasingCurve.BEZIER_SUAVE,
+    val bezierP1X: Float = 0.25f,
+    val bezierP1Y: Float = 0.1f,
+    val bezierP2X: Float = 0.25f,
+    val bezierP2Y: Float = 1.0f,
+    val holdTicks: Int = 1
+)
+
+data class TimelineSymbolDefinition(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "Símbolo 1",
+    val type: TimelineSymbolType = TimelineSymbolType.COMMON,
+    val internalFrames: List<Frame> = listOf(Frame()),
+    val totalInternalTicks: Int = 1,
+    val loopInternalAnimation: Boolean = true,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+data class TimelineSymbolInstance(
+    val id: String = UUID.randomUUID().toString(),
+    val symbolId: String = "",
+    val name: String = "Símbolo 1",
+    val startTick: Int = 0,
+    val durationTicks: Int = 1,
+    val autoInterpolate: Boolean = true,
+    val isVisible: Boolean = true,
+    val effects: TimelineSymbolEffectSettings = TimelineSymbolEffectSettings(),
+    val keyframes: List<SymbolInstanceKeyframe> = listOf(SymbolInstanceKeyframe(frameIndex = 0))
+)
+
 data class AnimationProject(
     val id: String = UUID.randomUUID().toString(),
     val name: String = "Nova Animação",
@@ -335,6 +402,8 @@ data class AnimationProject(
     val camera3D: Camera3DSettings = Camera3DSettings(),
     val canvasBackground: CanvasBackgroundSettings = CanvasBackgroundSettings(),
     val lastActiveFrameIndex: Int = 0,
+    val symbols: List<TimelineSymbolDefinition> = emptyList(),
+    val symbolInstances: List<TimelineSymbolInstance> = emptyList(),
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis()
 )
@@ -674,6 +743,7 @@ data class Camera3DSettings(
     val scene3DObjects: List<SceneObject3D> = emptyList(),
     val showFloorGrid: Boolean = true,
     val shadingMode: StageShadingMode = StageShadingMode.RENDERED,
-    val transformSpace: TransformSpaceMode = TransformSpaceMode.GLOBAL
+    val transformSpace: TransformSpaceMode = TransformSpaceMode.GLOBAL,
+    val isDetachedFromLayers: Boolean = false
 )
 

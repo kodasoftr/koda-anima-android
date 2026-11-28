@@ -890,7 +890,9 @@ object KodanimaGraphicsEngine {
         backgroundColor: Int = android.graphics.Color.WHITE,
         clearBitmap: Boolean = true,
         background: CanvasBackgroundSettings? = null,
-        drawSkyWhenTransparent: Boolean = false
+        drawSkyWhenTransparent: Boolean = false,
+        project: AnimationProject? = null,
+        tickFloat: Float = 0f
     ) {
         val canvas = Canvas(targetBitmap)
         val w = targetBitmap.width
@@ -917,6 +919,187 @@ object KodanimaGraphicsEngine {
             targetWidth = w,
             targetHeight = h
         )
+        if (project != null && project.symbolInstances.isNotEmpty()) {
+            drawActiveSymbolsToCanvas(
+                project = project,
+                tickFloat = tickFloat,
+                canvas = canvas,
+                targetWidth = w,
+                targetHeight = h,
+                allowOutOfBounds = false
+            )
+        }
+    }
+
+    /**
+     * Composites all TimelineSymbolInstance blocks active at [tickFloat] with Motion Tween transform
+     * (position X/Y, scale X/Y, rotation Z) and Adobe Flash CS3-style Symbol Effects (Opacity, Glow, Blur, Tint, DropShadow, Blend).
+     */
+    fun drawActiveSymbolsToCanvas(
+        project: AnimationProject,
+        tickFloat: Float,
+        canvas: Canvas,
+        targetWidth: Int,
+        targetHeight: Int,
+        allowOutOfBounds: Boolean = true,
+        viewportMatrix: android.graphics.Matrix? = null,
+        viewportWidth: Int = targetWidth,
+        viewportHeight: Int = targetHeight,
+        excludeSymbolId: String? = null
+    ) {
+        if (project.symbolInstances.isEmpty() || project.symbols.isEmpty()) return
+        val curTick = kotlin.math.floor(tickFloat.toDouble()).toInt().coerceAtLeast(0)
+        val activeInstances = project.symbolInstances.filter { inst ->
+            inst.isVisible &&
+                inst.symbolId != excludeSymbolId &&
+                curTick >= inst.startTick &&
+                curTick < inst.startTick + inst.durationTicks.coerceAtLeast(1)
+        }
+        if (activeInstances.isEmpty()) return
+
+        val symById = project.symbols.associateBy { it.id }
+        val scratch = scratchThreadLocal.get()!!
+        val paint = scratch.layerPaint
+        val cx = targetWidth * 0.5f
+        val cy = targetHeight * 0.5f
+        val bmpW = targetWidth.coerceAtLeast(1)
+        val bmpH = targetHeight.coerceAtLeast(1)
+
+        for (inst in activeInstances) {
+            val sym = symById[inst.symbolId] ?: continue
+            if (sym.frames.isEmpty()) continue
+            val evalTf = TimelineTrackEngine.evaluateSymbolInstanceAtTick(inst, tickFloat)
+            val internalFrame = TimelineTrackEngine.resolveSymbolInternalFrame(sym, inst, tickFloat) ?: continue
+            val internalLayers = composeOrderedFrameLayers(internalFrame)
+            if (internalLayers.isEmpty()) continue
+
+            val fx = sym.effects
+            val effAlpha = (evalTf.opacity * fx.opacity).coerceIn(0f, 1f)
+            if (effAlpha <= 0.005f) continue
+
+            val needsOffscreenBuffer = sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && (
+                fx.glowRadius > 0.5f ||
+                    fx.blurRadius > 0.5f ||
+                    fx.dropShadow ||
+                    fx.tintStrength > 0.02f ||
+                    fx.blendEffect != LayerBlendEffect.NORMAL ||
+                    effAlpha < 0.99f
+                )
+
+            val tfMatrix = android.graphics.Matrix().apply {
+                if (viewportMatrix != null) {
+                    set(viewportMatrix)
+                }
+                preTranslate(cx + evalTf.x, cy + evalTf.y)
+                preRotate(evalTf.rotationZ)
+                preScale(evalTf.scaleX, evalTf.scaleY)
+                preTranslate(-cx, -cy)
+            }
+
+            if (!needsOffscreenBuffer && effAlpha >= 0.99f) {
+                drawLayersStackToCanvas(
+                    layers = internalLayers,
+                    canvas = canvas,
+                    targetWidth = targetWidth,
+                    targetHeight = targetHeight,
+                    allowOutOfBounds = allowOutOfBounds,
+                    viewportMatrix = tfMatrix,
+                    viewportWidth = viewportWidth,
+                    viewportHeight = viewportHeight
+                )
+            } else {
+                val symBmp = KodanimaBitmapPool.acquire(bmpW, bmpH, Bitmap.Config.ARGB_8888, android.graphics.Color.TRANSPARENT)
+                try {
+                    val sc = Canvas(symBmp)
+                    drawLayersStackToCanvas(
+                        layers = internalLayers,
+                        canvas = sc,
+                        targetWidth = targetWidth,
+                        targetHeight = targetHeight,
+                        allowOutOfBounds = false
+                    )
+
+                    val tintFiltered = if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && fx.tintStrength > 0.02f) {
+                        val s = fx.tintStrength.coerceIn(0f, 1f)
+                        val tCol = fx.tintColor.toInt()
+                        val tr = ((tCol ushr 16) and 0xFF) / 255f
+                        val tg = ((tCol ushr 8) and 0xFF) / 255f
+                        val tb = (tCol and 0xFF) / 255f
+                        val cm = android.graphics.ColorMatrix(
+                            floatArrayOf(
+                                1f - s + s * tr, 0f, 0f, 0f, s * tr * 40f,
+                                0f, 1f - s + s * tg, 0f, 0f, s * tg * 40f,
+                                0f, 0f, 1f - s + s * tb, 0f, s * tb * 40f,
+                                0f, 0f, 0f, 1f, 0f
+                            )
+                        )
+                        android.graphics.ColorMatrixColorFilter(cm)
+                    } else null
+
+                    canvas.save()
+                    canvas.concat(tfMatrix)
+
+                    // Optional Drop Shadow behind Symbol
+                    if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && fx.dropShadow) {
+                        paint.reset()
+                        paint.isFilterBitmap = true
+                        paint.alpha = (effAlpha * 140f).roundToInt().coerceIn(0, 255)
+                        paint.colorFilter = android.graphics.PorterDuffColorFilter(fx.dropShadowColor.toInt(), PorterDuff.Mode.SRC_IN)
+                        canvas.drawBitmap(symBmp, fx.shadowOffsetX, fx.shadowOffsetY, paint)
+                    }
+
+                    // Optional Glow Halo behind Symbol
+                    if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && fx.glowRadius > 0.5f) {
+                        val downFactor = (1f + fx.glowRadius * 0.25f).coerceIn(1.5f, 8f)
+                        val dw = (bmpW / downFactor).roundToInt().coerceIn(16, bmpW)
+                        val dh = (bmpH / downFactor).roundToInt().coerceIn(16, bmpH)
+                        val glowBmp = KodanimaBitmapPool.acquire(dw, dh, Bitmap.Config.ARGB_8888, android.graphics.Color.TRANSPARENT)
+                        try {
+                            val gc = Canvas(glowBmp)
+                            paint.reset()
+                            paint.isFilterBitmap = true
+                            paint.colorFilter = android.graphics.PorterDuffColorFilter(fx.glowColor.toInt(), PorterDuff.Mode.SRC_IN)
+                            gc.drawBitmap(symBmp, null, android.graphics.Rect(0, 0, dw, dh), paint)
+                            paint.colorFilter = null
+                            paint.alpha = (effAlpha * 175f).roundToInt().coerceIn(0, 255)
+                            paint.xfermode = android.graphics.PorterDuffXfermode(PorterDuff.Mode.SCREEN)
+                            canvas.drawBitmap(glowBmp, null, android.graphics.RectF(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat()), paint)
+                        } finally {
+                            paint.xfermode = null
+                            KodanimaBitmapPool.release(glowBmp)
+                        }
+                    }
+
+                    // Main Symbol Pass (with optional Blur + Tint + BlendEffect + Opacity)
+                    paint.reset()
+                    paint.isFilterBitmap = true
+                    paint.isAntiAlias = true
+                    paint.alpha = (effAlpha * 255f).roundToInt().coerceIn(0, 255)
+                    paint.colorFilter = tintFiltered
+                    applyLayerBlendMode(paint, if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS) fx.blendEffect else LayerBlendEffect.NORMAL)
+
+                    if (sym.symbolType == com.example.model.TimelineSymbolType.WITH_EFFECTS && fx.blurRadius > 0.5f) {
+                        val downFactor = (1f + fx.blurRadius * 0.35f).coerceIn(1.5f, 10f)
+                        val bw = (bmpW / downFactor).roundToInt().coerceIn(12, bmpW)
+                        val bh = (bmpH / downFactor).roundToInt().coerceIn(12, bmpH)
+                        val blurBmp = KodanimaBitmapPool.acquire(bw, bh, Bitmap.Config.ARGB_8888, android.graphics.Color.TRANSPARENT)
+                        try {
+                            Canvas(blurBmp).drawBitmap(symBmp, null, android.graphics.Rect(0, 0, bw, bh), null)
+                            canvas.drawBitmap(blurBmp, null, android.graphics.RectF(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat()), paint)
+                        } finally {
+                            KodanimaBitmapPool.release(blurBmp)
+                        }
+                    } else {
+                        canvas.drawBitmap(symBmp, 0f, 0f, paint)
+                    }
+                    paint.xfermode = null
+                    paint.colorFilter = null
+                    canvas.restore()
+                } finally {
+                    KodanimaBitmapPool.release(symBmp)
+                }
+            }
+        }
     }
 
     /**

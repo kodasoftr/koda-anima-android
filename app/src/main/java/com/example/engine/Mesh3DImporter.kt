@@ -130,18 +130,25 @@ object Mesh3DImporter {
 
     fun getOrLoadMesh(meshAssetPath: String): Mesh3DSceneData? {
         if (meshAssetPath.isBlank()) return null
+        val normalizedPath = if (meshAssetPath.startsWith("builtin:") && !meshAssetPath.startsWith("builtin://")) {
+            "builtin://" + meshAssetPath.removePrefix("builtin:")
+        } else {
+            meshAssetPath
+        }
         sceneCache[meshAssetPath]?.let { return it }
+        sceneCache[normalizedPath]?.let { return it }
 
         val loaded = when {
-            meshAssetPath.startsWith("builtin://") -> buildBuiltInPrimitive(meshAssetPath)
+            normalizedPath.startsWith("builtin://") -> buildBuiltInPrimitive(normalizedPath)
             else -> {
-                val f = File(meshAssetPath)
+                val f = File(normalizedPath)
                 if (!f.exists()) return null
                 parseSceneFile(f, f.parentFile)
             }
         }
         if (loaded != null) {
             sceneCache[meshAssetPath] = loaded
+            sceneCache[normalizedPath] = loaded
         }
         return loaded
     }

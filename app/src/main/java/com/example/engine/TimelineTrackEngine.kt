@@ -1,10 +1,16 @@
 package com.example.engine
 
 import com.example.model.AnimationProject
+import com.example.model.CameraEasingCurve
 import com.example.model.Frame
 import com.example.model.Layer
+import com.example.model.SymbolInstanceKeyframe
+import com.example.model.TimelineSymbolDefinition
+import com.example.model.TimelineSymbolInstance
 import java.util.UUID
 import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
 
 data class LayerCelSpan(
     val frameIndex: Int,
@@ -67,6 +73,10 @@ object TimelineTrackEngine {
         if (maxTick <= 0) {
             maxTick = MediaAssetManager.computeTotalTicks(frames)
         }
+        val symbolMax = project.symbolInstances.maxOfOrNull { inst ->
+            inst.startTick + max(1, inst.durationTicks)
+        } ?: 0
+        maxTick = max(maxTick, symbolMax)
         if (includeCameraRunway) {
             val cam = project.camera3D
             val camMax = cam.keyframes.maxOfOrNull { it.frameIndex + max(1, it.holdTicks) } ?: 0
@@ -77,6 +87,95 @@ object TimelineTrackEngine {
             maxTick = maxOf(maxTick, camMax, layerTrackMax, objTrackMax)
         }
         return max(1, maxTick)
+    }
+
+    fun evaluateSymbolEasing(rawT: Float, kf: SymbolInstanceKeyframe): Float {
+        val u = rawT.coerceIn(0f, 1f)
+        return when (kf.easing) {
+            CameraEasingCurve.LINEAR -> u
+            CameraEasingCurve.BEZIER_SUAVE -> {
+                val p1y = kf.bezierP1Y.coerceIn(0f, 1.5f)
+                val p2y = kf.bezierP2Y.coerceIn(-0.5f, 1f)
+                val inv = 1f - u
+                (3f * inv * inv * u * p1y + 3f * inv * u * u * p2y + u * u * u).coerceIn(-0.2f, 1.2f)
+            }
+            CameraEasingCurve.ACELERAR -> u * u * u
+            CameraEasingCurve.DESACELERAR -> 1f - (1f - u).pow(3)
+            CameraEasingCurve.DEGRAU -> 0f
+        }
+    }
+
+    /**
+     * Evaluates a Flash CS3-style Symbol instance's Motion Tween transform + effect overrides
+     * at timeline position [tickFloat]. Coordinates are local to [instance.startTick]..endTick.
+     */
+    fun evaluateSymbolInstanceAtTick(
+        instance: TimelineSymbolInstance,
+        tickFloat: Float
+    ): SymbolInstanceKeyframe {
+        val localTick = (tickFloat - instance.startTick).coerceAtLeast(0f)
+        val sorted = instance.keyframes.sortedBy { it.frameIndex }
+        if (sorted.isEmpty()) return SymbolInstanceKeyframe(frameIndex = 0)
+        if (sorted.size == 1 || !instance.autoInterpolate) {
+            val active = sorted.lastOrNull { it.frameIndex.toFloat() <= localTick + 0.001f } ?: sorted.first()
+            return active
+        }
+        if (localTick <= sorted.first().frameIndex) return sorted.first()
+        if (localTick >= sorted.last().frameIndex) return sorted.last()
+
+        var prev = sorted.first()
+        var next = sorted.last()
+        for (i in 0 until sorted.lastIndex) {
+            val a = sorted[i]
+            val b = sorted[i + 1]
+            if (localTick >= a.frameIndex && localTick <= b.frameIndex) {
+                prev = a
+                next = b
+                break
+            }
+        }
+        if (prev.easing == CameraEasingCurve.DEGRAU) return prev
+        val holdOffset = max(0, prev.holdTicks - 1).toFloat()
+        val effStart = min(prev.frameIndex + holdOffset, next.frameIndex.toFloat())
+        val span = (next.frameIndex - effStart).coerceAtLeast(0.001f)
+        if (localTick <= effStart) return prev
+        val rawT = ((localTick - effStart) / span).coerceIn(0f, 1f)
+        val e = evaluateSymbolEasing(rawT, prev)
+        fun lerp(a: Float, b: Float) = a + (b - a) * e
+
+        return SymbolInstanceKeyframe(
+            frameIndex = localTick.toInt(),
+            x = lerp(prev.x, next.x),
+            y = lerp(prev.y, next.y),
+            scaleX = lerp(prev.scaleX, next.scaleX),
+            scaleY = lerp(prev.scaleY, next.scaleY),
+            rotationZ = lerp(prev.rotationZ, next.rotationZ),
+            opacity = lerp(prev.opacity, next.opacity).coerceIn(0f, 1f),
+            glowRadius = lerp(prev.glowRadius, next.glowRadius).coerceAtLeast(0f),
+            blurRadius = lerp(prev.blurRadius, next.blurRadius).coerceAtLeast(0f),
+            easing = prev.easing
+        )
+    }
+
+    /**
+     * Resolves which internal Frame inside [symbol] should display at [timelineTickFloat].
+     */
+    fun resolveSymbolInternalFrame(
+        symbol: TimelineSymbolDefinition,
+        instance: TimelineSymbolInstance,
+        timelineTickFloat: Float
+    ): Frame? {
+        if (symbol.frames.isEmpty()) return null
+        val localTick = (timelineTickFloat - instance.startTick).toInt().coerceAtLeast(0)
+        val symTotalTicks = symbol.frames.sumOf { max(1, it.holdFrames) }.coerceAtLeast(1)
+        val wrappedTick = if (instance.loopPlayback) localTick % symTotalTicks else localTick.coerceAtMost(symTotalTicks - 1)
+        var cursor = 0
+        for (f in symbol.frames) {
+            val dur = max(1, f.holdFrames)
+            if (wrappedTick < cursor + dur) return f
+            cursor += dur
+        }
+        return symbol.frames.last()
     }
 
     fun resolveCelAtTick(project: AnimationProject, layerIndex: Int, tick: Int): LayerCelSpan? {
